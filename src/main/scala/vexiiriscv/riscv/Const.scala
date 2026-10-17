@@ -303,6 +303,9 @@ object CSR {
   val VXSAT = 0x9
   val VXRM = 0xa
   val VCSR = 0xf
+  val VL = 0xC20
+  val VTYPE = 0xC21
+  val VLENB = 0xC22
   val USCRATCH = 0x40
   val UEPC = 0x41
   val UCAUSE = 0x42

@@ -66,6 +66,12 @@ case class Extension(name: String,
 object ExtensionList {
   def E(name: String) = Extension(name)
 
+  // Zvl<N>b implies the smaller ones; only the largest is reported.
+  val zvlSizes = Seq(32, 64, 128, 256, 512, 1024)
+  def zvl(n: Int) = E(s"zvl${n}b")
+    .imply((if (n > 32) Seq(s"zvl${n / 2}b") else Nil): _*)
+    .withCondReport(!_.contains(s"zvl${n * 2}b"))
+
   val supported = Seq(
     /* Base / one-letter extensions and aliases */
     E("i").version(2, 1),
@@ -114,6 +120,8 @@ object ExtensionList {
     E("zknh"),
     E("zksed"),
     E("zksh"),
+    E("zve32x").depend("zicsr").imply("zvl32b"),
+  ) ++ zvlSizes.map(zvl) ++ Seq(
 
     /* Ss* extensions */
     E("ssaia").require("s").depend("smaia", "sscsrind"),

@@ -186,6 +186,8 @@ class ParamSimple() {
   var gshareBytes = 4 KiB
   var recordHtinst = false
   var withImplicitPtwTlb = false
+  var vlen = 128
+  var vectorDlen = 64
   val prefetcherRptParam = new PrefetcherRptParam()
 
   var fetchTsp = MmuStorageParameter(
@@ -574,6 +576,7 @@ class ParamSimple() {
       if(extension.withSupervisor) addISA("ssaia")
     }
     if(!withMmu) removeISA("svade")
+    if(checkISA("zve32x")) addISA(s"zvl${vlen}b")
     extension.finialize(xlen)
     println(s"ISA extensions: ${extension.getIsaNameArray().mkString(", ")}")
 
@@ -612,6 +615,7 @@ class ParamSimple() {
     if (withMmu) r += s"asid$asidWidth"
     if (withIterativeShift) r += "isft"
     if (extension.withDiv) r += s"d${divRadix}${divImpl}${if(divArea)"Area" else ""}"
+    if (extension.withZve32x) r += s"vd${vectorDlen}"
     if (privParam.withImsic) r += s"if${privParam.imsicInterrupts}gf${privParam.guestExternalInterruptFiles}"
     if (privParam.withDebug) r += s"pdbg"
     if (privParam.withExternalInterrupt) r += "nei"
@@ -902,6 +906,10 @@ class ParamSimple() {
       .text("Record the HTINST value.")
     opt[Int]("injected-guest-interrupt-width").action { (v, c) => privParam.injectedInterruptWidth = v }
       .text("Set the injected guest interrupt width; default: 6.")
+    opt[Int]("vlen").action { (v, c) => vlen = v }
+      .text("Set the vector register length VLEN in bits (with zve32x in --with-isa); default: 128.")
+    opt[Int]("vector-dlen").action { (v, c) => vectorDlen = v }
+      .text("Set the vector datapath width DLEN in bits; default: 64.")
     opt[Unit]("dual-issue").action { (v, c) =>
       decoders = 2
       lanes = 2
@@ -945,6 +953,17 @@ class ParamSimple() {
     if(withMmu && fetchL1Enable) assert(fetchL1Sets <= 64, "MMU require not more than 64 sets in the FETCH L1")
 
     val intWritebackAt = 2 + extension.withRvh.toInt //Alias for "trap at" as well
+
+    val zvlActive = ExtensionList.zvlSizes.filter(n => checkISA(s"zvl${n}b"))
+    if(extension.withZve32x) {
+      assert(isPow2(vlen) && vlen >= 128, s"VLEN must be a power of two >= 128, got $vlen")
+      assert(zvlActive.max == vlen, s"zvl${zvlActive.max}b in the ISA disagrees with VLEN = $vlen")
+      assert(vectorDlen == 64, s"only DLEN = 64 is supported, got $vectorDlen")
+      assert(lsuL1Enable, "the vector unit needs the LSU L1 (--lsu-l1)")
+      assert(!extension.withHypervisor, "the vector unit does not support the hypervisor extension")
+    } else {
+      assert(zvlActive.isEmpty, "zvl*b needs a vector extension")
+    }
 
     plugins += new riscv.RiscvPlugin(xlen, hartCount, isa = extension.getIsaNameArray(includeIgnored = true).toSet)
     if (withMmu) plugins += new TranslatedDBusAccessPlugin(withPtwTlb = withImplicitPtwTlb)
@@ -1396,6 +1415,11 @@ class ParamSimple() {
       plugins += new execute.fpu.FpuPackerPlugin(lane0, ignoreSubnormal = fpuIgnoreSubnormal, wbAt = fpuWbAt)
       if (extension.withZfa) plugins += new execute.fpu.FpuFliPlugin(early0)
       if (extension.withZfa) plugins += new execute.fpu.FpuRoundPlugin(early0)
+    }
+
+    // Vector
+    if (extension.withZve32x) {
+      plugins += new execute.vector.VectorCsrPlugin(vlen = vlen)
     }
 
     plugins += new WhiteboxerPlugin(
