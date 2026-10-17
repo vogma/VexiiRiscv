@@ -192,6 +192,10 @@ class WhiteboxerPlugin(withOutputs : Boolean) extends FiberPlugin{
         if(p.logic.fpwb.nonEmpty) when(p.logic.fpwb.get.valid){
           data := p.logic.fpwb.get.payload.asSInt.resize(widthOf(data)).asBits.resized
         }
+        if(p.withVector) when(c(AguPlugin.VECTOR)) {
+          fire := c.down.isFiring && c(AguPlugin.SEL) && c(AguPlugin.LOAD) && c(p.logic.vector.ELEMENT).access && !c(TRAP) && !c(p.logic.onPma.IO)
+          data := c(p.logic.onCtrl.loadData.RESULT).resized
+        }
       })
     }
 
@@ -229,6 +233,9 @@ class WhiteboxerPlugin(withOutputs : Boolean) extends FiberPlugin{
         data := c(LsuL1.WRITE_DATA)
         storeId := c(Decode.STORE_ID)
         amo := False
+        if(p.withVector) when(c(AguPlugin.VECTOR)) {
+          fire := c.storeFire && c(p.logic.vector.ELEMENT).access && !c(TRAP)
+        }
       })
     }
 

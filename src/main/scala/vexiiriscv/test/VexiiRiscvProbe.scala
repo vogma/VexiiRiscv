@@ -93,9 +93,14 @@ class VexiiRiscvProbe(cpu : VexiiRiscv, kb : Option[konata.Backend], var withRvl
   val harts = hartsIds.map(new HartCtx(_)).toArray
   val wbp = cpu.host[WhiteboxerPlugin].logic.get
   val vwb = cpu.host.get[VectorPlugin].map(_.logic.whitebox)
+  val vectorMemoryEnabled = cpu.host.get[VectorPlugin].exists(_.withMemory)
   val vectorBytes = cpu.host.get[VectorPlugin].map(_.regFile.vrf.p.vlen / 8).getOrElse(0)
   val vectorBeatBytes = cpu.host.get[VectorPlugin].map(_.dlen / 8).getOrElse(0)
   val vectorShadow = Array.fill(32, vectorBytes)(0.toByte)
+  val vectorAccessMax = vectorBytes * 8 // LMUL=8, EEW=8
+  val scalarStoreIds = 1 << Decode.STORE_ID_WIDTH
+  // Vector IDs stay owned until the architectural boundary, after the hardware slot can be reused.
+  val vectorStoreIdEnd = scalarStoreIds + (if(vectorAccessMax != 0) vectorAccessMax + scalarStoreIds else 0)
   val vectorCsrs = Set(0x008, 0x009, 0x00A, 0x00F)
 
   // OP-V (including vset*), or a vector load/store (LOAD-FP/STORE-FP with a vector width)
@@ -104,6 +109,8 @@ class VexiiRiscvProbe(cpu : VexiiRiscv, kb : Option[konata.Backend], var withRvl
     val width = (instruction >> 12) & 7
     opcode == 0x57 || (opcode == 0x07 || opcode == 0x27) && (width == 0 || width >= 5)
   }
+  def isVectorMemory(instruction : Long) = vectorMemoryEnabled && isVectorInstruction(instruction) && (instruction & 0x7F) != 0x57
+
   val proxies = new wbp.Proxies(){
     override def interrupt(hartId: Int, intId: Int, value: Boolean): Unit = {
       backends.foreach(_.setInterrupt(hartsIds(hartId), intId, value))
@@ -159,6 +166,11 @@ class VexiiRiscvProbe(cpu : VexiiRiscv, kb : Option[konata.Backend], var withRvl
   def close(): Unit = {
     harts.foreach(_.close())
     if(withRvls) rvls.jni.Frontend.deleteDisassemble(disass)
+  }
+
+  def finish(): Unit = {
+    require(harts.forall(_.vectorRecord == null), "unfinished vector instruction at end of run")
+    backends.foreach(_.finish())
   }
 
   def clearStats(): Unit = {
@@ -244,6 +256,37 @@ class VexiiRiscvProbe(cpu : VexiiRiscv, kb : Option[konata.Backend], var withRvl
     val pendingTraps = mutable.Queue[(Boolean, Int, Int, Long, Long)]()
     var vs = 0 // mstatus.VS reset value
     var lastTrapInstruction = -1l
+    var vectorRecord: VectorRecord = null
+    val vectorStores = mutable.Map[Int, VectorAccess]()
+    val liveVectorStoreIds = mutable.Set[Int]()
+
+    def openVector(uop: MicroOpCtx): VectorRecord = {
+      if(vectorRecord == null) vectorRecord = new VectorRecord(uop.pc, uop.instruction)
+      require(vectorRecord.pc == uop.pc && vectorRecord.instruction == uop.instruction, "vector retry changed instruction identity")
+      vectorRecord
+    }
+
+    def vectorStoreBroadcast(id: Int): Boolean = vectorStores.remove(id) match {
+      case Some(access) =>
+        backends.foreach(_.storeBroadcast(hartId, access.id))
+        access.broadcast = true
+        if(access.checked) liveVectorStoreIds -= access.id
+        true
+      case None => false
+    }
+
+    def emitVector(): Unit = {
+      val record = vectorRecord
+      require(record != null, "no open vector memory instruction")
+      require(record.vstart.nonEmpty, "vector memory boundary has no final vstart")
+      for((reg, mask, data) <- record.writes) backends.foreach(_.writeVrf(hartId, reg, mask, data))
+      record.vstart.foreach(value => backends.foreach(_.writeRf(hartId, 5, 0x008, BigInt(value).toBytes(64))))
+      for(access <- record.stores) {
+        access.checked = true
+        if(access.broadcast) liveVectorStoreIds -= access.id
+      }
+      vectorRecord = null
+    }
 
     val jbStats = mutable.HashMap[Long, JbStats]()
     val branchStats = new JbStats()
@@ -258,7 +301,7 @@ class VexiiRiscvProbe(cpu : VexiiRiscv, kb : Option[konata.Backend], var withRvl
         }
         val riscvPlugin = cpu.host[RiscvPlugin]
         val isa = s"RV${xlen}${ExtensionManager.getIsaStr(riscvPlugin.isa)}"
-        tracer.newCpuMemoryView(hartId, 16, 1 << Decode.STORE_ID_WIDTH)
+        tracer.newCpuMemoryView(hartId, 16 + vectorAccessMax, vectorStoreIdEnd)
         tracer.newCpu(
           hartId = hartId,
           isa = isa,
@@ -291,7 +334,21 @@ class VexiiRiscvProbe(cpu : VexiiRiscv, kb : Option[konata.Backend], var withRvl
   }
 
 
+  class VectorAccess(val id: Int, val address: Long, val data: Array[Byte]) {
+    val length = data.length
+    val mask = Array.fill((length + 7) / 8)(0.toByte)
+    for(i <- 0 until length) mask(i / 8) = (mask(i / 8) | (1 << (i % 8))).toByte
+    var broadcast, checked = false
+  }
+
+  class VectorRecord(val pc: Long, val instruction: Long) {
+    val loads, stores = ArrayBuffer[VectorAccess]()
+    val writes = ArrayBuffer[(Int, Array[Byte], Array[Byte])]()
+    var vstart = Option.empty[Long]
+  }
+
   class MicroOpCtx() {
+    var pc = 0l
     var fetchId = -1
     var decodeId = -1
     var spawnAt = -1l
@@ -472,6 +529,7 @@ class VexiiRiscvProbe(cpu : VexiiRiscv, kb : Option[konata.Backend], var withRvl
       ctx.fetchId = decodeCtx.fetchId
       ctx.decodeId = decodeId
       ctx.instruction = serialized.microOp.toLong
+      ctx.pc = decodeCtx.pc
       ctx.spawnAt = cycle
       hart.microOpAllocPtr = (microOpId+1) & microOpIdMask
     }
@@ -491,6 +549,11 @@ class VexiiRiscvProbe(cpu : VexiiRiscv, kb : Option[konata.Backend], var withRvl
       if (ctx.spawned) assert(ctx.executeLaneId == execute.laneId)
     }
 
+    for(v <- vwb if v.memoryIssue.toBoolean) {
+      val hart = harts(0)
+      hart.openVector(hart.microOp(v.uopId.toInt))
+    }
+
     if (loadExecute.fire.toBoolean) {
       val hartId = loadExecute.hartId.toInt
       val hart = harts(hartId)
@@ -498,10 +561,17 @@ class VexiiRiscvProbe(cpu : VexiiRiscv, kb : Option[konata.Backend], var withRvl
       val uop = hart.microOp(uopId)
       val address = loadExecute.address.toLong
       val bytes = 1 << loadExecute.size.toInt
-      uop.loadValid = true
+      uop.loadValid = !isVectorMemory(uop.instruction)
       uop.loadData = (loadExecute.data.toBigInt & ((BigInt(1) << bytes*8)-1)).toBytes(bytes*8)
       uop.loadLqId = uopId & 0xF
-      if(!nativeCacheless) backends.foreach(_.loadExecute(hart.hartId, uop.loadLqId, address, bytes, uop.loadData))
+      if(isVectorMemory(uop.instruction)) {
+        val record = hart.openVector(uop)
+        require(record.loads.size < vectorAccessMax, "too many vector load accesses")
+        val access = new VectorAccess(16 + record.loads.size, address, uop.loadData.clone())
+        record.loads += access
+        backends.foreach(_.loadExecute(hart.hartId, access.id, access.address, access.length, access.data))
+        backends.foreach(_.loadCommit(hart.hartId, access.id))
+      } else if(!nativeCacheless) backends.foreach(_.loadExecute(hart.hartId, uop.loadLqId, address, bytes, uop.loadData))
     }
 
     if (storeCommit.fire.toBoolean) {
@@ -511,13 +581,23 @@ class VexiiRiscvProbe(cpu : VexiiRiscv, kb : Option[konata.Backend], var withRvl
       val uop = hart.microOp(uopId)
       val address = storeCommit.address.toLong
       val bytes = 1 << storeCommit.size.toInt
-      uop.storeValid = true
+      uop.storeValid = !isVectorMemory(uop.instruction)
       uop.storeData = (storeCommit.data.toBigInt & ((BigInt(1) << bytes*8)-1)).toBytes(bytes*8)
       uop.storeSqId = storeCommit.storeId.toInt
       uop.lsuAddress = address
       uop.lsuLen = bytes
       uop.lsuAmo = storeCommit.amo.toBoolean
-      if(!uop.lsuAmo) {
+      if(isVectorMemory(uop.instruction)) {
+        val record = hart.openVector(uop)
+        require(!hart.vectorStores.contains(uop.storeSqId), "vector store ID reused before broadcast")
+        val id = (scalarStoreIds until vectorStoreIdEnd).find(!hart.liveVectorStoreIds.contains(_)).get
+        val access = new VectorAccess(id, address, uop.storeData.clone())
+        record.stores += access
+        hart.vectorStores(uop.storeSqId) = access
+        hart.liveVectorStoreIds += id
+        backends.foreach(_.storeExecute(hart.hartId, id, access.address, access.length, access.data, access.mask))
+        backends.foreach(_.storeCommit(hart.hartId, id))
+      } else if(!uop.lsuAmo) {
         backends.foreach(_.storeExecute(hart.hartId, uop.storeSqId, address, bytes, uop.storeData))
       }
     }
@@ -571,7 +651,9 @@ class VexiiRiscvProbe(cpu : VexiiRiscv, kb : Option[konata.Backend], var withRvl
           val index = offset + b
           mask(index / 8) = (mask(index / 8) | (1 << (index % 8))).toByte
         }
-        harts(0).microOp(v.uopId.toInt).vectorWrites += ((reg, mask, vectorShadow(reg).clone()))
+        val write = (reg, mask, vectorShadow(reg).clone())
+        if(v.memoryComplete.toBoolean) harts(0).openVector(harts(0).microOp(v.memoryUopId.toInt)).writes += write
+        else harts(0).microOp(v.uopId.toInt).vectorWrites += write
       }
       if (v.fire.toBoolean) {
         val uop = harts(0).microOp(v.uopId.toInt)
@@ -580,7 +662,11 @@ class VexiiRiscvProbe(cpu : VexiiRiscv, kb : Option[konata.Backend], var withRvl
           uop.vectorCsrWrites += 0xC20 -> v.configVl.toLong
           uop.vectorCsrWrites += 0xC21 -> v.configVtype.toLong
         }
-        if (v.vstartValid.toBoolean) uop.vectorCsrWrites += 0x008 -> v.vstartValue.toLong
+        if (v.vstartValid.toBoolean && !v.memoryComplete.toBoolean) uop.vectorCsrWrites += 0x008 -> v.vstartValue.toLong
+      }
+      if(v.memoryComplete.toBoolean && v.vstartValid.toBoolean) {
+        val hart = harts(0)
+        hart.openVector(hart.microOp(v.memoryUopId.toInt)).vstart = Some(v.vstartValue.toLong)
       }
       // VS only changes under the oldest instruction in flight, before its commit
       val hart = harts(0)
@@ -639,6 +725,7 @@ class VexiiRiscvProbe(cpu : VexiiRiscv, kb : Option[konata.Backend], var withRvl
             trace.data = bus.rsp.data.toBigInt.toBytes(bus.p.dataWidth).slice(offset, offset + trace.size)
           }
           trace.error = bus.rsp.error.toBoolean
+          if(isVectorMemory(harts(trace.threadId).microOp(trace.uopId).instruction)) trace.mask = (1 << trace.size) - 1
           backends.foreach(_.ioAccess(trace.hartId, trace))
         } else if(nativeCacheless && trace.fromHart && !bus.rsp.error.toBoolean) {
           import LsuCachelessBusAmo._
@@ -693,7 +780,8 @@ class VexiiRiscvProbe(cpu : VexiiRiscv, kb : Option[konata.Backend], var withRvl
       val hart = harts(port.hartId.toInt)
       val microOpId = port.uopId.toInt
       val microOp = hart.microOp(microOpId)
-      if(microOp.spawned) {
+      // Intermediate elements complete without retiring the shared uop context; retries retire only their pass.
+      if(microOp.spawned && (!isVectorMemory(microOp.instruction) || port.commit.toBoolean || port.trap.toBoolean)) {
         microOp.completionAt = cycle
         microOp.retireAt = cycle + 1
         microOp.trap = port.trap.toBoolean
@@ -754,6 +842,7 @@ class VexiiRiscvProbe(cpu : VexiiRiscv, kb : Option[konata.Backend], var withRvl
           if (uop.trap && uop.flushAt == -1) hart.lastTrapInstruction = uop.instruction
           if (uop.didCommit) {
             lastCommitAt = cycle
+            if(isVectorMemory(uop.instruction)) hart.emitVector()
             hart.commits += 1
             if (uop.loadValid) {
               backends.foreach(_.loadCommit(hartId, uop.loadLqId))
@@ -779,11 +868,11 @@ class VexiiRiscvProbe(cpu : VexiiRiscv, kb : Option[konata.Backend], var withRvl
             }
             for ((address, value) <- uop.vectorCsrWrites) backends.foreach(_.writeRf(hartId, 5, address, BigInt(value).toBytes(64)))
             for ((reg, mask, data) <- uop.vectorWrites) backends.foreach(_.writeVrf(hartId, reg, mask, data))
-            if(uop.commit) backends.foreach(_.commit(hartId, decode.pc, uop.instruction))
+            if(uop.commit) backends.foreach(_.commit(hartId, uop.pc, uop.instruction))
             if (autoStoreBroadcast && !nativeCacheless && uop.storeValid) {
               backends.foreach(_.storeBroadcast(hartId, uop.storeSqId))
             }
-            if(!uop.trap) commitsCallbacks.foreach(_(hartId, decode.pc))
+            if(!uop.trap) commitsCallbacks.foreach(_(hartId, uop.pc))
           }
           uop.clear()
         }
@@ -799,12 +888,16 @@ class VexiiRiscvProbe(cpu : VexiiRiscv, kb : Option[konata.Backend], var withRvl
       val hartId = storeBroadcast.hartId.toInt
       val hart = harts(hartId)
       val sqId = storeBroadcast.storeId.toInt
-      backends.foreach(_.storeBroadcast(hart.hartId, sqId))
+      if(!hart.vectorStoreBroadcast(sqId)) backends.foreach(_.storeBroadcast(hart.hartId, sqId))
     }
   }
 
   // Synchronous traps of vector instructions also report the written xepc/xtval
   def emitTrap(hart : HartCtx, interrupt : Boolean, cause : Int, epc : Long, tval : Long): Unit = {
+    if(hart.vectorRecord != null) {
+      require(!interrupt && pcExtends(epc) == pcExtends(hart.vectorRecord.pc), "trap changed open vector identity")
+      hart.emitVector()
+    }
     if (vwb.nonEmpty && !interrupt && isVectorInstruction(hart.lastTrapInstruction)) {
       backends.foreach(_.trap(hart.hartId, interrupt, cause, epc, tval))
     } else {

@@ -28,7 +28,7 @@ import vexiiriscv.misc.{EmbeddedRiscvJtag, ImsicPlugin, PrivilegedPlugin}
 import vexiiriscv.regfile.RegFilePlugin
 import vexiiriscv.riscv.{IntRegFile, Riscv}
 import vexiiriscv.test.konata.Backend
-import vexiiriscv.test.{ImsicPeripheralEmulator, IoDeviceManager, PeripheralEmulator, VexiiRiscvProbe}
+import vexiiriscv.test.{EmulatedDevice, ImsicPeripheralEmulator, IoDeviceManager, PeripheralEmulator, VexiiRiscvProbe}
 
 import java.io.{File, IOException, PrintWriter}
 import java.net.{ServerSocket, Socket}
@@ -342,7 +342,6 @@ class TestOptions {
     simSpeedPrinter.foreach(cd.forkSimSpeedPrinter)
 
     failAfter.foreach(delayed(_)(simFailure("Reached Timeout")))
-    passAfter.foreach(delayed(_)(simSuccess()))
 
 //    fork{
 //      while(true){
@@ -426,6 +425,11 @@ class TestOptions {
       }
     }
     val probe = probes.head
+    def checkedSuccess(): Unit = {
+      probes.foreach(_.finish())
+      simSuccess()
+    }
+    passAfter.foreach(delayed(_)(checkedSuccess()))
 
     duts.cores.zip(probes).foreach { case (dut, dutProbe) =>
       val regions = dut.host.services.collectFirst {
@@ -520,7 +524,7 @@ class TestOptions {
               val failed = hartIds.filter(states(_) == -1).map(hartId => s"$hartId=${failSymbols(hartId)}").mkString(", ")
               simFailure(s"Software reached the fail symbol on hart(s): $failed")
             } else if(passReached) {
-              simSuccess()
+              checkedSuccess()
             }
           }
         }
@@ -556,6 +560,15 @@ class TestOptions {
 
     val manager = IoDeviceManager()
 
+    // A RAM-backed IO window at 0x10020000, beyond the CLINT register range.
+    manager.registerDevice(SizeMapping(0x10020000L, 0x2000L), new EmulatedDevice {
+      override def access(write: Boolean, address: BigInt, data: Array[Byte]): Boolean = {
+        if(write) {
+          for(i <- data.indices) mem.write(0x10020000L + address.toLong + i, data(i))
+        } else mem.readBytes(0x10020000L + address.toLong, data.length, data, 0)
+        false
+      }
+    })
     manager.registerDevice(SizeMapping(0x10000000L, 0x10000000L), peripheral)
 
     val imsics = duts.cores.map{ v =>
@@ -1080,7 +1093,7 @@ class TestOptions {
         periodicaly(10*1000) {
           if (!p.isAlive()) {
             p.exitValue() match {
-              case 0 => simSuccess()
+              case 0 => checkedSuccess()
               case _ => simFailure()
             }
           }
