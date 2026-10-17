@@ -9,6 +9,7 @@ import vexiiriscv.Global.PC_WIDTH
 import vexiiriscv._
 import vexiiriscv.decode.Decode
 import vexiiriscv.execute.lsu._
+import vexiiriscv.execute.vector.VectorPlugin
 import vexiiriscv.fetch.FetchPipelinePlugin
 import vexiiriscv.memory.{MmuPlugin, PmpPlugin, PmpService}
 import vexiiriscv.misc.{PerformanceCounterPlugin, PrivilegedPlugin}
@@ -91,6 +92,15 @@ class VexiiRiscvProbe(cpu : VexiiRiscv, kb : Option[konata.Backend], var withRvl
 
   val harts = hartsIds.map(new HartCtx(_)).toArray
   val wbp = cpu.host[WhiteboxerPlugin].logic.get
+  val vwb = cpu.host.get[VectorPlugin].map(_.logic.whitebox)
+  val vectorCsrs = Set(0x008, 0x009, 0x00A, 0x00F)
+
+  // OP-V (including vset*), or a vector load/store (LOAD-FP/STORE-FP with a vector width)
+  def isVectorInstruction(instruction : Long) : Boolean = {
+    val opcode = instruction & 0x7F
+    val width = (instruction >> 12) & 7
+    opcode == 0x57 || (opcode == 0x07 || opcode == 0x27) && (width == 0 || width >= 5)
+  }
   val proxies = new wbp.Proxies(){
     override def interrupt(hartId: Int, intId: Int, value: Boolean): Unit = {
       backends.foreach(_.setInterrupt(hartsIds(hartId), intId, value))
@@ -228,7 +238,9 @@ class VexiiRiscvProbe(cpu : VexiiRiscv, kb : Option[konata.Backend], var withRvl
 
     var commits = 0l
 
-    val pendingTraps = mutable.Queue[(Boolean, Int, Int)]()
+    val pendingTraps = mutable.Queue[(Boolean, Int, Int, Long, Long)]()
+    var vs = 0 // mstatus.VS reset value
+    var lastTrapInstruction = -1l
 
     val jbStats = mutable.HashMap[Long, JbStats]()
     val branchStats = new JbStats()
@@ -320,6 +332,9 @@ class VexiiRiscvProbe(cpu : VexiiRiscv, kb : Option[konata.Backend], var withRvl
     var isSc = false
     var scFailure = false
 
+    var vectorValid = false
+    val vectorCsrWrites = ArrayBuffer[(Int, Long)]() // Implicit vl, vtype, vstart updates
+
 
     def traceT2s(cycle : Long) = cycle match {
       case 0l => ""
@@ -395,6 +410,8 @@ class VexiiRiscvProbe(cpu : VexiiRiscv, kb : Option[konata.Backend], var withRvl
       storeValid = false
       isSc = false
       lsuAmo = false
+      vectorValid = false
+      vectorCsrWrites.clear()
     }
 
     clear()
@@ -525,7 +542,36 @@ class VexiiRiscvProbe(cpu : VexiiRiscv, kb : Option[konata.Backend], var withRvl
       uop.csrReadDone = csr.readDone.toBoolean
       uop.csrWriteData = csr.write.toBigInt.toBytes(64)
       uop.csrReadData = csr.read.toBigInt.toBytes(64)
+      // Vector CSRs report the stored value, after the write
+      for (v <- vwb if vectorCsrs.contains(uop.csrAddress)) {
+        val stored = uop.csrAddress match {
+          case 0x008 => v.vstart.toLong
+          case 0x009 => v.vxsat.toBoolean.toInt.toLong
+          case 0x00A => v.vxrm.toLong
+          case 0x00F => v.vxrm.toLong << 1 | v.vxsat.toBoolean.toInt
+        }
+        uop.csrWriteData = BigInt(stored).toBytes(64)
+      }
     })
+
+    for (v <- vwb) {
+      if (v.fire.toBoolean) {
+        val uop = harts(0).microOp(v.uopId.toInt)
+        uop.vectorValid = true
+        if (v.configValid.toBoolean) {
+          uop.vectorCsrWrites += 0xC20 -> v.configVl.toLong
+          uop.vectorCsrWrites += 0xC21 -> v.configVtype.toLong
+        }
+        if (v.vstartValid.toBoolean) uop.vectorCsrWrites += 0x008 -> v.vstartValue.toLong
+      }
+      // VS only changes under the oldest instruction in flight, before its commit
+      val hart = harts(0)
+      val vs = v.vs.toInt
+      if (vs != hart.vs) {
+        hart.vs = vs
+        backends.foreach(_.writeVs(hart.hartId, vs))
+      }
+    }
 
     for (port <- rfWrites) if (port.valid.toBoolean) {
       val hart = harts(port.hartId.toInt)
@@ -669,8 +715,8 @@ class VexiiRiscvProbe(cpu : VexiiRiscv, kb : Option[konata.Backend], var withRvl
 
       def flushDueTraps(): Unit = {
         while (hart.pendingTraps.nonEmpty && hart.pendingTraps.head._3 == hart.microOpRetirePtr) {
-          val (interrupt, cause, _) = hart.pendingTraps.dequeue()
-          backends.foreach(_.trap(hart.hartId, interrupt, cause))
+          val (interrupt, cause, _, epc, tval) = hart.pendingTraps.dequeue()
+          emitTrap(hart, interrupt, cause, epc, tval)
         }
       }
       flushDueTraps()
@@ -686,6 +732,8 @@ class VexiiRiscvProbe(cpu : VexiiRiscv, kb : Option[konata.Backend], var withRvl
           hart.konataThread.foreach(_.cycleLock = fetch.spawnAts(0))
 
           uop.toKonata(hart)
+          // A younger uop can complete with TRAP before the older trap flushes it
+          if (uop.trap && uop.flushAt == -1) hart.lastTrapInstruction = uop.instruction
           if (uop.didCommit) {
             lastCommitAt = cycle
             hart.commits += 1
@@ -711,6 +759,7 @@ class VexiiRiscvProbe(cpu : VexiiRiscv, kb : Option[konata.Backend], var withRvl
               if (uop.csrReadDone) backends.foreach(_.readRf(hartId, 4, uop.csrAddress, uop.csrReadData))
               if (uop.csrWriteDone) backends.foreach(_.writeRf(hartId, 4, uop.csrAddress, uop.csrWriteData))
             }
+            for ((address, value) <- uop.vectorCsrWrites) backends.foreach(_.writeRf(hartId, 5, address, BigInt(value).toBytes(64)))
             if(uop.commit) backends.foreach(_.commit(hartId, decode.pc, uop.instruction))
             if (autoStoreBroadcast && !nativeCacheless && uop.storeValid) {
               backends.foreach(_.storeBroadcast(hartId, uop.storeSqId))
@@ -735,13 +784,24 @@ class VexiiRiscvProbe(cpu : VexiiRiscv, kb : Option[konata.Backend], var withRvl
     }
   }
 
+  // Synchronous traps of vector instructions also report the written xepc/xtval
+  def emitTrap(hart : HartCtx, interrupt : Boolean, cause : Int, epc : Long, tval : Long): Unit = {
+    if (vwb.nonEmpty && !interrupt && isVectorInstruction(hart.lastTrapInstruction)) {
+      backends.foreach(_.trap(hart.hartId, interrupt, cause, epc, tval))
+    } else {
+      backends.foreach(_.trap(hart.hartId, interrupt, cause))
+    }
+  }
+
   def checkTraps(): Unit = {
     for(trap <- proxies.trap) if(trap.fire.toBoolean){
       val hart = harts(trap.hartId)
+      val epc = vwb.map(_.trapEpc.toLong).getOrElse(0l)
+      val tval = vwb.map(_.trapTval.toLong).getOrElse(0l)
       if (hart.microOpRetirePtr == hart.microOpAllocPtr && hart.pendingTraps.isEmpty) {
-        backends.foreach(_.trap(hartsIds(trap.hartId), trap.interrupt.toBoolean, trap.cause.toInt))
+        emitTrap(hart, trap.interrupt.toBoolean, trap.cause.toInt, epc, tval)
       } else {
-        hart.pendingTraps.enqueue((trap.interrupt.toBoolean, trap.cause.toInt, hart.microOpAllocPtr))
+        hart.pendingTraps.enqueue((trap.interrupt.toBoolean, trap.cause.toInt, hart.microOpAllocPtr, epc, tval))
       }
     }
   }

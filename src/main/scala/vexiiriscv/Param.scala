@@ -1420,6 +1420,7 @@ class ParamSimple() {
     // Vector
     if (extension.withZve32x) {
       plugins += new execute.vector.VectorCsrPlugin(vlen = vlen)
+      plugins += new execute.vector.VectorPlugin(early0)
     }
 
     plugins += new WhiteboxerPlugin(
