@@ -93,6 +93,7 @@ class VectorLsuHookTest extends AnyFunSuite {
     val param = fixtureParam(xlen)
     val compiled = SimConfig.compile {
       val plugins = TestBench.paramToPlugins(param)
+      plugins.foreach { case v: VectorPlugin => v.withMemory = false; case _ => }
       plugins += new VectorLsuHookDriver
       new TestBenchDut(Seq(plugins))
     }
@@ -119,7 +120,11 @@ class VectorLsuHookTest extends AnyFunSuite {
 
   test("unattached vector LSU rejects memory instructions") {
     val param = fixtureParam(32)
-    val compiled = SimConfig.compile(TestBench.makeDut(param, 1))
+    val compiled = SimConfig.compile {
+      val plugins = TestBench.paramToPlugins(param)
+      plugins.foreach { case v: VectorPlugin => v.withMemory = false; case _ => }
+      new TestBenchDut(Seq(plugins))
+    }
     val options = new TestOptions
     options.withRvls = false
     options.withRvlsCheck = false

@@ -15,6 +15,7 @@ case class DispatchSequencerPort() extends Bundle {
   val ready = Bool() // from the sequencer: a micro-op may be inserted
   val last = Bool() // from the sequencer: the micro-op inserted now is the last one
   val fire = Bool() // a micro-op is inserted this cycle
+  val cancel = Bool() // the candidate is flushed this cycle
 }
 
 trait DispatchSequencerService { this: DispatchPlugin =>

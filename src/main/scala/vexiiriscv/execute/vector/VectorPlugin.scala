@@ -9,16 +9,24 @@ import vexiiriscv.fetch.InitService
 import vexiiriscv.Global
 import vexiiriscv.decode.{Decode, DecoderService}
 import vexiiriscv.execute._
-import vexiiriscv.misc.{TrapPlugin, TrapService}
+import vexiiriscv.execute.lsu.LsuPlugin
+import vexiiriscv.misc.{InflightService, PrivilegedPlugin, TrapPlugin, TrapReason, TrapService}
 import vexiiriscv.riscv.Riscv._
 import vexiiriscv.riscv._
 import vexiiriscv.schedule.{DispatchPlugin, ReschedulePlugin}
 
+case class VectorMemoryDescriptor(indexWidth : Int) extends Bundle {
+  val index = UInt(indexWidth bits)
+  val last, access = Bool()
+}
+
 /**
  * Vector instructions on one lane layer. Each one waits until every older instruction left the pipeline, is checked
  * against vtype/vstart at E0 and then does all its work there; vset* complete in that cycle.
+ * Unit-stride loads and stores instead issue one LSU micro-op per active element and complete with the last one.
+ * withMemory = false leaves the LSU element port to another sequencer.
  */
-class VectorPlugin(val layer : LaneLayer, val dlen : Int = 64) extends FiberPlugin with InitService {
+class VectorPlugin(val layer : LaneLayer, val dlen : Int = 64, var withMemory : Boolean = true) extends FiberPlugin with InitService {
   override def initHold(): Bool = regFile.vrf.io.initHold
 
   // Initialization must be available before the trap controller finishes building.
@@ -40,7 +48,7 @@ class VectorPlugin(val layer : LaneLayer, val dlen : Int = 64) extends FiberPlug
   val CHECK_VSTART = Payload(Bool())
   val ALIGN_VD, ALIGN_VS1, ALIGN_VS2 = Payload(Bool()) // register group aligned to LMUL
   val MASK_NOT_V0 = Payload(Bool()) // vm = 0 with vd = v0 is reserved
-  val MEM = Payload(Bool()) // EMUL = EEW / SEW * LMUL in [1/8, 8], vd/vs3 aligned to it
+  val MEM = Payload(Bool()) // Memory micro-op: EMUL = EEW / SEW * LMUL in [1/8, 8], vd/vs3 aligned to it
 
   val logic = during setup new Area {
     val elp = layer.lane
@@ -50,9 +58,13 @@ class VectorPlugin(val layer : LaneLayer, val dlen : Int = 64) extends FiberPlug
     val sp = host[ReschedulePlugin]
     val ts = host[TrapService]
     val vcs = host[VectorCsrService]
+    val lsu = host[LsuPlugin]
     val ioRetainer = retains(elp.uopLock, ifp.elaborationLock, dp.elaborationLock, ds.elaborationLock, sp.elaborationLock, ts.trapLock)
+    val lsuRetainer = withMemory generate retains(lsu.vectorLsuLock)
     val buildBefore = retains(elp.pipelineLock)
     awaitBuild()
+    val lsuPort = withMemory generate lsu.newVectorLsuPort()
+    if (withMemory) lsuRetainer.release()
 
     val checks = List(VSET, VSET_IMM, VSET_REG, CHECK_VILL, CHECK_VSTART, ALIGN_VD, ALIGN_VS1, ALIGN_VS2, MASK_NOT_V0, MEM,
       ARITH, SCALAR_OPERAND, IMMEDIATE, SCALAR_READ, SCALAR_WRITE)
@@ -96,6 +108,13 @@ class VectorPlugin(val layer : LaneLayer, val dlen : Int = 64) extends FiberPlug
     add(Rvv.all("vmv.s.x"), ARITH -> True, ALU_OP -> U(VectorAluOp.MOVE, 3 bits),
       SCALAR_OPERAND -> True, SCALAR_WRITE -> True, CHECK_VILL -> True, CHECK_VSTART -> True)
 
+    // The LSU frontend owns these uops (completion, flushes, rs1); masked loads must not overwrite v0
+    val memoryOps = for (width <- Seq(8, 16, 32); load <- Seq(true, false)) yield Rvv.all(s"${if (load) "vle" else "vse"}$width.v") -> load
+    if (withMemory) {
+      for ((op, load) <- memoryOps) layer.add(op).addDecoding(SEL -> True, MEM -> True, CHECK_VILL -> True, MASK_NOT_V0 -> Bool(load))
+      dp.sequence(memoryOps.map(_._1))
+    }
+
     ds.addIllegalCheck(ctrl => ctrl(VECTOR) && !vcs.vectorEnable)
 
     val age = elp.getExecuteAge(0)
@@ -113,7 +132,7 @@ class VectorPlugin(val layer : LaneLayer, val dlen : Int = 64) extends FiberPlug
       vrf.io.reads(i).cmd := arithmetic.io.reads(i).cmd
       arithmetic.io.reads(i).rsp := vrf.io.reads(i).rsp
     }
-    for (port <- vrf.io.reads.drop(2)) {
+    for (port <- vrf.io.reads.drop(3)) {
       port.cmd.valid := False
       port.cmd.payload.assignDontCare()
     }
@@ -123,6 +142,14 @@ class VectorPlugin(val layer : LaneLayer, val dlen : Int = 64) extends FiberPlug
       val shift = S(log2Up(vlen) - 3, 5 bits) + vlmul.asSInt.resize(5) - vsew.resize(5).asSInt
       (U(1, vlWidth bits) << shift.asUInt.resize(log2Up(vlWidth))).resize(vlWidth)
     }
+    // Element size from the memory width code: 8, 16 or 32 bits
+    def sizeOf(uop : Bits) : UInt = uop(Const.funct3Range).mux(B"000" -> U(0, 2 bits), B"101" -> U(1, 2 bits), default -> U(2, 2 bits))
+    // Byte offset of an element in its register group, and the VRF word holding it; a group has at most 8 registers
+    def groupOffset(index : UInt, size : UInt) : UInt = (index.resize(log2Up(vlen)) << size).resize(log2Up(vlen))
+    def wordOf(vreg : UInt, offset : UInt) : UInt =
+      ((vreg.resize(vrf.p.addressWidth) << vrf.p.beatWidth) + (offset >> log2Up(vrf.p.beatBytes)).resized).resize(vrf.p.addressWidth)
+    val DESCRIPTOR = Payload(VectorMemoryDescriptor(vcs.vstartWidth))
+
     // A register group of 2^log2 registers starts at a multiple of 2^log2
     def aligned(reg : UInt, log2 : SInt) : Bool = {
       val mask = ((U(1, 4 bits) << log2.asUInt.resize(2)) - 1).resize(3)
@@ -246,10 +273,109 @@ class VectorPlugin(val layer : LaneLayer, val dlen : Int = 64) extends FiberPlug
     }
 
     val e1 = new layer.Execute(1) {
-      wb.valid := SEL
+      wb.valid := SEL && !MEM
       wb.payload := RESULT
     }
+
+    // One LSU micro-op per active element; the descriptor travels with it from the dispatch insert node.
+    val memory = withMemory generate new Area {
+      val port = lsuPort
+      val seq = dp.logic.sequencer.port
+      val walker = new VectorElementWalker(vlen)
+      val inflight = host.list[InflightService].map(_.hasInflight(0)).orR
+      // Older instructions have left, so vl, vstart and v0 are final; the first micro-op uses that sample
+      walker.io.start := seq.valid && seq.first && !inflight && !seq.fire
+      walker.io.advance := seq.fire
+      walker.io.vl := vcs.vl
+      walker.io.vstart := vcs.vstart
+      walker.io.unmasked := seq.uop(25)
+      walker.io.v0 := vrf.io.v0
+      // A candidate leaves only by fire or cancel, so an uncancelled sample belongs to the current candidate
+      val prepared = RegNext(walker.io.start && !seq.cancel) init(False)
+      seq.ready := !seq.first || prepared && port.storeBufferEmpty
+      seq.last := walker.io.last
+
+      val descriptor = VectorMemoryDescriptor(vcs.vstartWidth)
+      descriptor.index := walker.io.index
+      descriptor.last := walker.io.last
+      descriptor.access := walker.io.any // otherwise a single finish micro-op
+      elp.ctrl(0).up(DESCRIPTOR) := descriptor
+
+      // Store data: read the element's word one stage before the LSU captures it; the response holds over freezes
+      val read = new layer.Execute(-1) {
+        val offset = groupOffset(apply(DESCRIPTOR).index, sizeOf(Decode.UOP))
+        vrf.io.reads(2).cmd.valid := !elp.isFreezed()
+        vrf.io.reads(2).cmd.payload := wordOf(Decode.UOP(Const.rdRange).asUInt, offset)
+      }
+
+      val issue = new layer.Execute(0) {
+        val d = apply(DESCRIPTOR)
+        val size = sizeOf(Decode.UOP)
+        val offset = groupOffset(d.index, size)
+        val illegal = e0.legality.illegal
+        val word = vrf.io.reads(2).rsp
+        port.cmd.valid := isValid && MEM
+        port.cmd.address := (up(elp(IntRegFile, RS1)).asUInt + (d.index << size).resize(XLEN)).resized
+        port.cmd.size := size.resized
+        port.cmd.storeData := (word >> (offset.resize(log2Up(vrf.p.beatBytes)) << 3)).resize(LSLEN)
+        port.cmd.access := d.access && !illegal // an illegal micro-op only carries its trap
+        port.cmd.last := d.last || illegal
+        val ILLEGAL = insert(illegal)
+      }
+
+      val resume = RegInit(False) // an element retries after REDO or a TLB refill
+      val complete = new layer.Execute(lsu.timingParameter.ctrlAt) {
+        val d = apply(DESCRIPTOR)
+        val size = sizeOf(Decode.UOP)
+        val offset = groupOffset(d.index, size)
+        val rsp = port.rsp
+        val legal = !apply(issue.ILLEGAL)
+
+        val write = Flow(VrfWriteCmd(vrf.p))
+        write.valid := rsp.valid && rsp.access && rsp.load && !rsp.trap.valid
+        write.address := wordOf(Decode.UOP(Const.rdRange).asUInt, offset)
+        write.data := size.mux(
+          U(0) -> (rsp.data(7 downto 0) #* 8),
+          U(1) -> (rsp.data(15 downto 0) #* 4),
+          default -> (rsp.data(31 downto 0) #* 2)
+        )
+        val bytes = size.mux(U(0) -> B"0001", U(1) -> B"0011", default -> B"1111")
+        write.mask := (bytes.resize(vrf.p.beatBytes) << offset.resize(log2Up(vrf.p.beatBytes))).resize(vrf.p.beatBytes)
+
+        // Any element trap restarts at that element (norm:vector_ls_vstart); the last one completes the instruction
+        when(rsp.valid && legal) {
+          when(rsp.trap.valid) {
+            vcs.vstartWrite.valid := True
+            vcs.vstartWrite.payload := d.index
+            resume := !rsp.trap.exception && (rsp.trap.code === TrapReason.REDO || rsp.trap.code === TrapReason.MMU_REFILL)
+          } elsewhen(rsp.last) {
+            vcs.vstartWrite.valid := True
+            vcs.vstartWrite.payload := 0
+            resume := False
+          }
+        }
+        when(write.valid) {
+          vrf.io.write := write
+        }
+      }
+    }
+    if (!withMemory) {
+      vrf.io.reads(2).cmd.valid := False
+      vrf.io.reads(2).cmd.payload.assignDontCare()
+    }
     buildBefore.release()
+
+    // Interrupts and debug halts wait until the retried instruction commits or traps
+    val interruptHold = withMemory generate new Area {
+      val tp = host[TrapPlugin]
+      val pp = host[PrivilegedPlugin]
+      when(tp.api.harts(0).rvTrap) { memory.resume := False }
+      if (pp.p.withDebug) {
+        val fsm = tp.logic.harts(0).trap.fsm
+        when(fsm.isActive(fsm.ENTER_DEBUG)) { memory.resume := False }
+      }
+      when(memory.resume) { pp.inhibateInterrupts(0) }
+    }
 
     // Simulation taps for the probe
     val whitebox = new Area {

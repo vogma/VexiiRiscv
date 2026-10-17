@@ -484,8 +484,9 @@ class DispatchPlugin(var dispatchAt : Int,
       port.uop := OHMux.or(onCandidates.map(_.oldest).asBits(), candidates.map(_.ctx.uop), true)
       port.first := !active
       port.fire := onCandidates.map(_.insert).orR
+      port.cancel := onCandidates.map(_.cancel).orR
       when(port.fire) { active := !port.last }
-      when(!port.valid || onCandidates.map(_.cancel).orR) { active := False }
+      when(!port.valid || port.cancel) { active := False }
     }
 
     buildBefore.release()

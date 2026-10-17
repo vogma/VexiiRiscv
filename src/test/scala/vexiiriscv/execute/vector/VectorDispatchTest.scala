@@ -169,6 +169,7 @@ class VectorDispatchTest extends AnyFunSuite {
     val param = fixtureParam(xlen)
     val compiled = SimConfig.compile {
       val plugins = TestBench.paramToPlugins(param)
+      plugins.foreach { case v: VectorPlugin => v.withMemory = false; case _ => }
       plugins += new VectorSequenceDriver
       new TestBenchDut(Seq(plugins))
     }
