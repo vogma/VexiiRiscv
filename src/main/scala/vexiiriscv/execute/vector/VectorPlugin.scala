@@ -5,6 +5,7 @@ import spinal.core.sim._
 import spinal.lib._
 import spinal.lib.misc.pipeline._
 import spinal.lib.misc.plugin.FiberPlugin
+import vexiiriscv.fetch.InitService
 import vexiiriscv.Global
 import vexiiriscv.decode.{Decode, DecoderService}
 import vexiiriscv.execute._
@@ -17,7 +18,14 @@ import vexiiriscv.schedule.{DispatchPlugin, ReschedulePlugin}
  * Vector instructions on one lane layer. Each one waits until every older instruction left the pipeline, is checked
  * against vtype/vstart at E0 and then does all its work there; vset* complete in that cycle.
  */
-class VectorPlugin(val layer : LaneLayer) extends FiberPlugin {
+class VectorPlugin(val layer : LaneLayer, val dlen : Int = 64) extends FiberPlugin with InitService {
+  override def initHold(): Bool = regFile.vrf.io.initHold
+
+  // Initialization must be available before the trap controller finishes building.
+  val regFile = during build new Area {
+    val vrf = new VectorRegFile(VectorRegFileParam(vlen = host[VectorCsrService].vlen, dlen = dlen))
+  }
+
   val SEL = Payload(Bool())
   val VECTOR = Payload(Bool()) // Decode stage, illegal while mstatus.VS is Off
   val VSET = Payload(Bool())
@@ -79,6 +87,13 @@ class VectorPlugin(val layer : LaneLayer) extends FiberPlugin {
 
     val vlen = vcs.vlen
     val vlWidth = vcs.vlWidth
+    val vrf = regFile.vrf
+    vrf.io.write.valid := False
+    vrf.io.write.payload.assignDontCare()
+    for (port <- vrf.io.reads) {
+      port.cmd.valid := False
+      port.cmd.payload.assignDontCare()
+    }
 
     // log2(VLMAX) = log2(VLEN) - log2(SEW) + log2(LMUL), only meaningful for a legal vtype
     def vlmaxOf(vsew : UInt, vlmul : Bits) : UInt = {
