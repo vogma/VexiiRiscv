@@ -1216,6 +1216,7 @@ class ParamSimple() {
     if(lsuL1Enable){
       val needLlc = extension.withZicbom && (withRvcbmLlc || lsuL1Coherency)
       plugins += new LsuPlugin(
+        withVector = extension.withZve32x,
         timingParameter = extension.withRvh match {
           case true => lsuHypervisorTiming
           case false => lsuTiming

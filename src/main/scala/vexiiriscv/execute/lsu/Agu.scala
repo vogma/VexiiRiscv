@@ -5,7 +5,7 @@ import spinal.lib.misc.pipeline._
 import spinal.lib.misc.plugin.{FiberPlugin, PluginHost}
 import vexiiriscv.Global
 import vexiiriscv.decode.Decode
-import vexiiriscv.riscv.{Const, MicroOp, Riscv, Rvfd, Rvi, Rvh}
+import vexiiriscv.riscv.{Const, MicroOp, Riscv, Rvfd, Rvi, Rvh, Rvv}
 import vexiiriscv.riscv.Riscv._
 import vexiiriscv.execute._
 
@@ -22,6 +22,7 @@ object AguPlugin extends AreaObject {
   val FLOAT = Payload(Bool())
   val CLEAN, INVALIDATE = Payload(Bool())
   val GUEST = Payload(Bool())
+  val VECTOR = Payload(Bool())
 }
 
 /** The AguFrontend provide an Area which define all RISC-V memory load/store/atomic
@@ -31,7 +32,8 @@ object AguPlugin extends AreaObject {
 class AguFrontend(
     layer: LaneLayer,
     host: PluginHost,
-    withRvcbm : Boolean = false
+    withRvcbm : Boolean = false,
+    withVector : Boolean = false
   ) extends ExecuteUnitElementSimple.Api(
     layer,
     host.find[SrcPlugin](_.layer == layer),
@@ -41,6 +43,7 @@ class AguFrontend(
   val sk = SrcKeys
 
   val defaultsDecodings = mutable.LinkedHashMap(LOAD -> False, STORE -> False, EXECUTE -> False, ATOMIC -> False, FLOAT -> False, CLEAN -> False, INVALIDATE -> False, GUEST -> False)
+  if (withVector) defaultsDecodings(VECTOR) = False
   def dec(changed : (Payload[_ <: BaseType], Any)*) = {
     val ret =  mutable.LinkedHashMap[Payload[_ <: BaseType], Any]()
     ret ++= defaultsDecodings
@@ -67,6 +70,16 @@ class AguFrontend(
   for (op <- writeRfGuest) writingRf += add(op).srcs(sk.Op.SRC1, sk.SRC1.RF).decode(dec(LOAD -> True, GUEST -> True)).uop
   val writeRfGuestExecute = ArrayBuffer[MicroOp](Rvh.HLVX_HU, Rvh.HLVX_WU)
   if (RVH) for (op <- writeRfGuestExecute) writingRf += add(op).srcs(sk.Op.SRC1, sk.SRC1.RF).decode(dec(EXECUTE -> True, GUEST -> True)).uop
+
+  val vectorOps = ArrayBuffer[MicroOp]()
+  if (withVector) {
+    layer.lane.setDecodingDefault(VECTOR, False)
+    for (width <- Seq(8, 16, 32); load <- Seq(true, false)) {
+      val op = Rvv.all(s"${if (load) "vle" else "vse"}$width.v")
+      add(op).srcs(sk.Op.SRC1, sk.SRC1.RF).decode(dec(VECTOR -> True, LOAD -> Bool(load), STORE -> Bool(!load)))
+      vectorOps += op
+    }
+  }
 
   // Store stuff
   val storeOps = List(sk.Op.ADD, sk.SRC1.RF, sk.SRC2.S)

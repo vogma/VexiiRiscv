@@ -24,7 +24,7 @@ import vexiiriscv.execute.lsu.AguPlugin._
 import vexiiriscv.execute.lsu.LsuL1.{HAZARD}
 
 import scala.collection.mutable.ArrayBuffer
-
+import vexiiriscv.execute.vector.VectorLsuService
 object LsuL1CmdOpcode extends SpinalEnum{
   val LSU, ACCESS, STORE_BUFFER, FLUSH, PREFETCH = newElement()
 }
@@ -80,7 +80,7 @@ class LsuPlugin(var layer : LaneLayer,
                 var withLlcFlush : Boolean = false,
                 var storeRs2At : Int = 0, //Note that currently, it only apply for integer store (not float store)
                 var storeBufferSlots : Int = 0,
-                var storeBufferOps : Int = 0) extends FiberPlugin with DBusAccessService with LsuCachelessBusProvider with LsuService with CmoService{
+                var storeBufferOps : Int = 0, val withVector : Boolean = false) extends FiberPlugin with DBusAccessService with LsuCachelessBusProvider with LsuService with CmoService with VectorLsuService{
   import timingParameter._
 
   if(withLlcFlush) assert(withCbm)
@@ -156,9 +156,9 @@ class LsuPlugin(var layer : LaneLayer,
 
     val trapPort = ts.newTrap(layer.lane.getExecuteAge(ctrlAt), Execute.LANE_AGE_WIDTH)
     val flushPort = ss.newFlushPort(layer.lane.getExecuteAge(ctrlAt), laneAgeWidth = Execute.LANE_AGE_WIDTH, withUopId = true)
-    val frontend = new AguFrontend(layer, host, withRvcbm = withCbm)
+    val frontend = new AguFrontend(layer, host, withRvcbm = withCbm, withVector = withVector)
     val commitProbe = Flow(LsuCommitProbe()) // Used by the hardware prefetching plugin to learn about the software behavior
-
+    val vector = withVector generate new VectorLsuHooks(LsuPlugin.this, frontend, ds)
     // Extends the instruction specifications done by the AGU with sign extensions and flush behavior
     val iwb = ifp.access(wbAt)
     val amos = frontend.amoUops
@@ -472,9 +472,9 @@ class LsuPlugin(var layer : LaneLayer,
       val ls = new Area {
         val prefetchOp = Decode.UOP(24 downto 20)
         val port = ports.addRet(Stream(LsuL1Cmd()))
-        port.valid := isValid && SEL
-        port.address := srcp.ADD_SUB.asUInt.resized
-        port.size := SIZE
+        port.valid := (if (withVector) isValid && SEL && vector.access(this) else isValid && SEL)
+        port.address := (if (withVector) vector.address(this, srcp.ADD_SUB.asUInt) else srcp.ADD_SUB.asUInt).resized
+        port.size := (if (withVector) vector.size(this) else apply(SIZE))
         port.load := LOAD
         port.store := STORE
         port.execute := EXECUTE
@@ -671,7 +671,7 @@ class LsuPlugin(var layer : LaneLayer,
       val IO_RSP = insert(io.rsp)
       IO_RSP.fault.setWhen(l1.ATOMIC || FROM_ACCESS)
       val IO = insert(CACHED_RSP.fault && !IO_RSP.fault && !FENCE && !FROM_PREFETCH)
-      val FROM_LSU_MSB_FAILED = insert(FROM_LSU && srcp.ADD_SUB.dropLow(Global.MIXED_WIDTH).asBools.map(_ =/= tpk.ADDRESS_EXTENSION).orR)
+      val FROM_LSU_MSB_FAILED = insert(FROM_LSU && (if (withVector) vector.msbFailed(this, srcp.ADD_SUB.asUInt, tpk.ADDRESS_EXTENSION) else srcp.ADD_SUB.dropLow(Global.MIXED_WIDTH).asBools.map(_ =/= tpk.ADDRESS_EXTENSION).orR))
       MMU_PAGE_FAULT := tpk.PAGE_FAULT
       MMU_FAILURE := MMU_PAGE_FAULT || tpk.ACCESS_FAULT || tpk.REFILL || tpk.HAZARD || FROM_LSU_MSB_FAILED
       GUEST_MMU_PAGE_FAULT := stpk.PAGE_FAULT
@@ -691,8 +691,8 @@ class LsuPlugin(var layer : LaneLayer,
         writeData(0, FLEN bits) := up(elp(FloatRegFile, riscv.RS2))
       }
 
+      if (withVector) vector.storeData(this, writeData)
       val scMiss = Bool() // (Store Conditional miss)
-
       // Little state machine which handle IO accesses. Pipelined on all sides to avoid putting pressure on the FMax
       val io = new Area {
         // Give one cycle delay, allowing trap to happen before the IO access is emitted.
@@ -1032,7 +1032,7 @@ class LsuPlugin(var layer : LaneLayer,
           fenceTrap.doIt := True
         }
       }
-
+      if (withVector) vector.complete(this, lsuTrap, trapPort, loadData.RESULT, if (withStoreBuffer) storeBuffer.empty else True)
       when(isValid && SEL) {
         val t = when(lsuTrap) {
           trapPort.valid := True
@@ -1140,7 +1140,7 @@ class LsuPlugin(var layer : LaneLayer,
 
     // Drive the write back interface
     val onWb = new elp.Execute(wbAt){
-      iwb.valid := SEL && !FLOAT
+      iwb.valid := (if (withVector) SEL && !FLOAT && !VECTOR else SEL && !FLOAT)
       iwb.payload := onCtrl.loadData.RESULT.resized
 
       if (withZalrsc) when(l1.ATOMIC && !(l1.LOAD || l1.EXECUTE)) {
