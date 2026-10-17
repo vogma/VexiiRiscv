@@ -40,7 +40,7 @@ import scala.collection.mutable.ArrayBuffer
 
 class DispatchPlugin(var dispatchAt : Int,
                      var trapLayer : LaneLayer,
-                     var withBuffer : Boolean) extends FiberPlugin{
+                     var withBuffer : Boolean) extends FiberPlugin with DispatchSequencerService{
   val elaborationLock = Retainer()
 
   val MAY_FLUSH = Payload(Bool())
@@ -462,6 +462,31 @@ class DispatchPlugin(var dispatchAt : Int,
       val frontendStall = pcs.createEventPort(PerformanceCounterService.STALLED_CYCLES_FRONTEND, candidates.map(_.ctx.valid).norR)
       val backendStall = pcs.createEventPort(PerformanceCounterService.STALLED_CYCLES_BACKEND, candidates.map(_.ctx.valid).orR && candidates.map(_.fire).norR)
     })
+
+    // The oldest sequenced candidate re-fires once per micro-op and holds every younger candidate until its last one.
+    val sequencer = sequencedOps.nonEmpty generate new Area {
+      val port = DispatchSequencerPort()
+      val active = RegInit(False) // some of its micro-ops were inserted
+      val inserting = !eupp.isFreezed() && !api.haltDispatch
+      val onCandidates = for ((c, id) <- candidates.zipWithIndex) yield new Area {
+        val older = candidates.take(id).map(o => o.ctx.valid && o.ctx.hartId === c.ctx.hartId).orR
+        val oldest = c.ctx.valid && c.ctx.hm(SEQUENCED) && !c.ctx.hm(TRAP) && !older
+        val insert = oldest && scheduler.arbiters(id).doIt && !c.cancel && inserting
+        val cancel = oldest && c.cancel
+        // Once active, the in-flight uops are its own micro-ops
+        when(oldest) { c.fenceOlderHazards := !active && fenceChecker.olderInflights(c.ctx.hartId) || !port.ready }
+        when(oldest && !port.last) {
+          c.fire := False
+          scheduler.hartFree(id + 1)(c.ctx.hartId) := False
+        }
+      }
+      port.valid := onCandidates.map(_.oldest).orR
+      port.uop := OHMux.or(onCandidates.map(_.oldest).asBits(), candidates.map(_.ctx.uop), true)
+      port.first := !active
+      port.fire := onCandidates.map(_.insert).orR
+      when(port.fire) { active := !port.last }
+      when(!port.valid || onCandidates.map(_.cancel).orR) { active := False }
+    }
 
     buildBefore.release()
   }
