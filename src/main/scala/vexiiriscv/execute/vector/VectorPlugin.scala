@@ -31,6 +31,8 @@ class VectorPlugin(val layer : LaneLayer, val dlen : Int = 64) extends FiberPlug
   val VSET = Payload(Bool())
   val VSET_IMM = Payload(Bool()) // vsetivli: AVL from uimm, vtype from zimm10
   val VSET_REG = Payload(Bool()) // vsetvl: vtype from rs2
+  val ARITH, SCALAR_OPERAND, IMMEDIATE, SCALAR_READ, SCALAR_WRITE = Payload(Bool())
+  val ALU_OP = Payload(UInt(3 bits))
   val RESULT = Payload(Bits(XLEN bits))
 
   // E0 legality checks, each enabled per uop
@@ -52,8 +54,10 @@ class VectorPlugin(val layer : LaneLayer, val dlen : Int = 64) extends FiberPlug
     val buildBefore = retains(elp.pipelineLock)
     awaitBuild()
 
-    val checks = List(VSET, VSET_IMM, VSET_REG, CHECK_VILL, CHECK_VSTART, ALIGN_VD, ALIGN_VS1, ALIGN_VS2, MASK_NOT_V0, MEM)
+    val checks = List(VSET, VSET_IMM, VSET_REG, CHECK_VILL, CHECK_VSTART, ALIGN_VD, ALIGN_VS1, ALIGN_VS2, MASK_NOT_V0, MEM,
+      ARITH, SCALAR_OPERAND, IMMEDIATE, SCALAR_READ, SCALAR_WRITE)
     elp.setDecodingDefault(SEL, False)
+    elp.setDecodingDefault(ALU_OP, U(VectorAluOp.ADD, 3 bits))
     for (key <- checks) elp.setDecodingDefault(key, False)
     ds.addMicroOpDecodingDefault(VECTOR, False)
 
@@ -78,6 +82,20 @@ class VectorPlugin(val layer : LaneLayer, val dlen : Int = 64) extends FiberPlug
     add(Rvv.VSETIVLI, VSET -> True, VSET_IMM -> True)
     add(Rvv.VSETVL, VSET -> True, VSET_REG -> True)
 
+    for ((name, alu) <- Seq("vadd" -> VectorAluOp.ADD, "vsub" -> VectorAluOp.SUB,
+      "vrsub" -> VectorAluOp.RSUB, "vand" -> VectorAluOp.AND, "vor" -> VectorAluOp.OR, "vxor" -> VectorAluOp.XOR,
+      "vmv.v" -> VectorAluOp.MOVE); form <- Seq("vv", "vx", "vi") if Rvv.all.contains(s"$name.$form") || name == "vmv.v") {
+      val mnemonic = if (name == "vmv.v") s"vmv.v.${form.last}" else s"$name.$form"
+      val vector = form == "vv"
+      add(Rvv.all(mnemonic), ARITH -> True, ALU_OP -> U(alu, 3 bits),
+        SCALAR_OPERAND -> Bool(!vector), IMMEDIATE -> Bool(form == "vi"),
+        CHECK_VILL -> True, CHECK_VSTART -> True, ALIGN_VD -> True,
+        ALIGN_VS1 -> Bool(vector), ALIGN_VS2 -> Bool(name != "vmv.v"), MASK_NOT_V0 -> Bool(name != "vmv.v"))
+    }
+    add(Rvv.all("vmv.x.s"), ARITH -> True, SCALAR_READ -> True, CHECK_VILL -> True, CHECK_VSTART -> True)
+    add(Rvv.all("vmv.s.x"), ARITH -> True, ALU_OP -> U(VectorAluOp.MOVE, 3 bits),
+      SCALAR_OPERAND -> True, SCALAR_WRITE -> True, CHECK_VILL -> True, CHECK_VSTART -> True)
+
     ds.addIllegalCheck(ctrl => ctrl(VECTOR) && !vcs.vectorEnable)
 
     val age = elp.getExecuteAge(0)
@@ -88,9 +106,14 @@ class VectorPlugin(val layer : LaneLayer, val dlen : Int = 64) extends FiberPlug
     val vlen = vcs.vlen
     val vlWidth = vcs.vlWidth
     val vrf = regFile.vrf
-    vrf.io.write.valid := False
-    vrf.io.write.payload.assignDontCare()
-    for (port <- vrf.io.reads) {
+    val arithmetic = new VectorArithmetic(vrf.p, XLEN)
+    vrf.io.write := arithmetic.io.write
+    arithmetic.io.v0 := vrf.io.v0
+    for (i <- 0 until 2) {
+      vrf.io.reads(i).cmd := arithmetic.io.reads(i).cmd
+      arithmetic.io.reads(i).rsp := vrf.io.reads(i).rsp
+    }
+    for (port <- vrf.io.reads.drop(2)) {
       port.cmd.valid := False
       port.cmd.payload.assignDontCare()
     }
@@ -192,7 +215,33 @@ class VectorPlugin(val layer : LaneLayer, val dlen : Int = 64) extends FiberPlug
           vcs.vstartWrite.valid := True
           vcs.vstartWrite.payload := 0
         }
-        RESULT := vl.resize(XLEN).asBits
+        RESULT := SCALAR_READ ? arithmetic.io.result | vl.resize(XLEN).asBits
+      }
+
+      val sequencer = new Area {
+        val started, completed = RegInit(False)
+        arithmetic.io.cmd.valid := sel && ARITH && !legality.illegal && !started
+        arithmetic.io.cmd.vd := vd
+        arithmetic.io.cmd.vs1 := vs1
+        arithmetic.io.cmd.vs2 := vs2
+        arithmetic.io.cmd.vl := vcs.vl
+        arithmetic.io.cmd.vstart := vcs.vstart
+        arithmetic.io.cmd.sew := vtype.vsew.resized
+        arithmetic.io.cmd.op := ALU_OP
+        arithmetic.io.cmd.scalar := IMMEDIATE ? Decode.UOP(Const.rs1Range).asSInt.resize(XLEN).asBits | up(elp(IntRegFile, RS1))
+        arithmetic.io.cmd.scalarOperand := SCALAR_OPERAND
+        arithmetic.io.cmd.unmasked := vm
+        arithmetic.io.cmd.scalarRead := SCALAR_READ
+        arithmetic.io.cmd.scalarWrite := SCALAR_WRITE
+        elp.freezeWhen(sel && ARITH && !legality.illegal && !completed)
+        when(arithmetic.io.cmd.valid) { started := True }
+        when(arithmetic.io.done) { completed := True }
+        when(fire && ARITH) {
+          started := False
+          completed := False
+          vcs.vstartWrite.valid := True
+          vcs.vstartWrite.payload := 0
+        }
       }
     }
 
@@ -211,6 +260,10 @@ class VectorPlugin(val layer : LaneLayer, val dlen : Int = 64) extends FiberPlug
       val configVtype = CombInit(vtypeBits(vcs.configWrite.vtype)).simPublic()
       val vstartValid = CombInit(vcs.vstartWrite.valid).simPublic()
       val vstartValue = CombInit(vcs.vstartWrite.payload).simPublic()
+      val vrfWriteValid = CombInit(vrf.io.writeEvent.valid && !vrf.io.initHold).simPublic()
+      val vrfWriteAddress = CombInit(vrf.io.writeEvent.address).simPublic()
+      val vrfWriteData = CombInit(vrf.io.writeEvent.data).simPublic()
+      val vrfWriteMask = CombInit(vrf.io.writeEvent.mask).simPublic()
 
       val vs = CombInit(vcs.vs).simPublic()
       val vstart = CombInit(vcs.vstart).simPublic()

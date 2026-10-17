@@ -617,6 +617,8 @@ object RegressionSingle extends App{
   try {
     test(args)
   }catch {
-    case e : Throwable => System.exit(1)
+    case e : Throwable =>
+      e.printStackTrace()
+      System.exit(1)
   }
 }

@@ -93,6 +93,9 @@ class VexiiRiscvProbe(cpu : VexiiRiscv, kb : Option[konata.Backend], var withRvl
   val harts = hartsIds.map(new HartCtx(_)).toArray
   val wbp = cpu.host[WhiteboxerPlugin].logic.get
   val vwb = cpu.host.get[VectorPlugin].map(_.logic.whitebox)
+  val vectorBytes = cpu.host.get[VectorPlugin].map(_.regFile.vrf.p.vlen / 8).getOrElse(0)
+  val vectorBeatBytes = cpu.host.get[VectorPlugin].map(_.dlen / 8).getOrElse(0)
+  val vectorShadow = Array.fill(32, vectorBytes)(0.toByte)
   val vectorCsrs = Set(0x008, 0x009, 0x00A, 0x00F)
 
   // OP-V (including vset*), or a vector load/store (LOAD-FP/STORE-FP with a vector width)
@@ -334,6 +337,7 @@ class VexiiRiscvProbe(cpu : VexiiRiscv, kb : Option[konata.Backend], var withRvl
 
     var vectorValid = false
     val vectorCsrWrites = ArrayBuffer[(Int, Long)]() // Implicit vl, vtype, vstart updates
+    val vectorWrites = ArrayBuffer[(Int, Array[Byte], Array[Byte])]()
 
 
     def traceT2s(cycle : Long) = cycle match {
@@ -412,6 +416,7 @@ class VexiiRiscvProbe(cpu : VexiiRiscv, kb : Option[konata.Backend], var withRvl
       lsuAmo = false
       vectorValid = false
       vectorCsrWrites.clear()
+      vectorWrites.clear()
     }
 
     clear()
@@ -555,6 +560,19 @@ class VexiiRiscvProbe(cpu : VexiiRiscv, kb : Option[konata.Backend], var withRvl
     })
 
     for (v <- vwb) {
+      if (v.vrfWriteValid.toBoolean) {
+        val address = v.vrfWriteAddress.toInt
+        val reg = address * vectorBeatBytes / vectorBytes
+        val offset = address * vectorBeatBytes % vectorBytes
+        val mask = Array.fill((vectorBytes + 7) / 8)(0.toByte)
+        val data = v.vrfWriteData.toBigInt
+        for (b <- 0 until vectorBeatBytes if v.vrfWriteMask.toBigInt.testBit(b)) {
+          vectorShadow(reg)(offset + b) = (data >> (8 * b)).toByte
+          val index = offset + b
+          mask(index / 8) = (mask(index / 8) | (1 << (index % 8))).toByte
+        }
+        harts(0).microOp(v.uopId.toInt).vectorWrites += ((reg, mask, vectorShadow(reg).clone()))
+      }
       if (v.fire.toBoolean) {
         val uop = harts(0).microOp(v.uopId.toInt)
         uop.vectorValid = true
@@ -760,6 +778,7 @@ class VexiiRiscvProbe(cpu : VexiiRiscv, kb : Option[konata.Backend], var withRvl
               if (uop.csrWriteDone) backends.foreach(_.writeRf(hartId, 4, uop.csrAddress, uop.csrWriteData))
             }
             for ((address, value) <- uop.vectorCsrWrites) backends.foreach(_.writeRf(hartId, 5, address, BigInt(value).toBytes(64)))
+            for ((reg, mask, data) <- uop.vectorWrites) backends.foreach(_.writeVrf(hartId, reg, mask, data))
             if(uop.commit) backends.foreach(_.commit(hartId, decode.pc, uop.instruction))
             if (autoStoreBroadcast && !nativeCacheless && uop.storeValid) {
               backends.foreach(_.storeBroadcast(hartId, uop.storeSqId))
