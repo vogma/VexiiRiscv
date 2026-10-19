@@ -57,15 +57,31 @@ class VectorArithmeticTest extends AnyFunSuite {
     ("vmax", VectorAluOp.MAX, false), ("vsll", VectorAluOp.SLL, false), ("vsrl", VectorAluOp.SRL, false),
     ("vsra", VectorAluOp.SRL, false), ("vadc", VectorAluOp.ADD, false), ("vsbc", VectorAluOp.SUB, false),
     ("vmerge", VectorAluOp.MERGE, false), ("vzext2", VectorAluOp.ADD, false), ("vsext2", VectorAluOp.ADD, false),
-    ("vzext4", VectorAluOp.ADD, false), ("vsext4", VectorAluOp.ADD, false))
+    ("vzext4", VectorAluOp.ADD, false), ("vsext4", VectorAluOp.ADD, false),
+    ("vmseq", VectorAluOp.SEQ, false), ("vmsne", VectorAluOp.SNE, false), ("vmsltu", VectorAluOp.SLT, false),
+    ("vmslt", VectorAluOp.SLT, false), ("vmsleu", VectorAluOp.SLE, false), ("vmsle", VectorAluOp.SLE, false),
+    ("vmsgtu", VectorAluOp.SGT, false), ("vmsgt", VectorAluOp.SGT, false), ("vmadc", VectorAluOp.ADD, false),
+    ("vmadcm", VectorAluOp.ADD, false), ("vmsbc", VectorAluOp.SUB, false), ("vmsbcm", VectorAluOp.SUB, false),
+    ("vmand", VectorAluOp.AND, false), ("vmnand", VectorAluOp.NAND, false), ("vmandn", VectorAluOp.ANDN, false),
+    ("vmxor", VectorAluOp.XOR, false), ("vmor", VectorAluOp.OR, false), ("vmnor", VectorAluOp.NOR, false),
+    ("vmorn", VectorAluOp.ORN, false), ("vmxnor", VectorAluOp.XNOR, false))
+  val compares = Seq("vmseq", "vmsne", "vmsltu", "vmslt", "vmsleu", "vmsle", "vmsgtu", "vmsgt")
+  val carries = Seq("vmadc", "vmadcm", "vmsbc", "vmsbcm")
+  val logicals = Seq("vmand", "vmnand", "vmandn", "vmxor", "vmor", "vmnor", "vmorn", "vmxnor")
   // Operations whose signedness the command must carry; the others get a random value
-  def isSigned(name: String) = Seq("vsadd", "vssub", "vmin", "vmax", "vsra", "vsext2", "vsext4").contains(name)
-  def signedMatters(name: String) = isSigned(name) || Seq("vsaddu", "vssubu", "vminu", "vmaxu", "vsrl", "vzext2", "vzext4").contains(name)
+  def isSigned(name: String) = Seq("vsadd", "vssub", "vmin", "vmax", "vsra", "vsext2", "vsext4", "vmslt", "vmsle", "vmsgt").contains(name)
+  def signedMatters(name: String) = isSigned(name) || carries.contains(name) ||
+    Seq("vsaddu", "vssubu", "vminu", "vmaxu", "vsrl", "vzext2", "vzext4", "vmsltu", "vmsleu", "vmsgtu").contains(name)
   // v0 as carry or merge select: encoded masked, every body element written
-  def withV0(name: String) = Seq("vadc", "vsbc", "vmerge").contains(name)
+  def withV0(name: String) = Seq("vadc", "vsbc", "vmerge", "vmadcm", "vmsbcm").contains(name)
+  // Encoded unmasked
+  def unmaskedOnly(name: String) = Seq("vmadc", "vmsbc").contains(name) || logicals.contains(name)
   // log2 of the extension factor, 0 for single width
   def extLog2(name: String) = if (name.endsWith("ext2")) 1 else if (name.endsWith("ext4")) 2 else 0
-  def shapeOf(name: String) = extLog2(name) match { case 1 => VectorShape.EXT2; case 2 => VectorShape.EXT4; case _ => VectorShape.SINGLE }
+  def shapeOf(name: String) =
+    if (compares.contains(name) || carries.contains(name)) VectorShape.MASK_DST
+    else if (logicals.contains(name)) VectorShape.MASK_MM
+    else extLog2(name) match { case 1 => VectorShape.EXT2; case 2 => VectorShape.EXT4; case _ => VectorShape.SINGLE }
 
   def run(vlen: Int, xlen: Int): Unit = {
     val p = VectorRegFileParam(vlen = vlen)
@@ -108,14 +124,18 @@ class VectorArithmeticTest extends AnyFunSuite {
       var writes = 0
       var sourceInVd = 0
       val saturations = scala.collection.mutable.Map[(String, Boolean), Int]().withDefaultValue(0)
+      // Mask results seen per operation: active bits 0 and 1, and equal active operands of a compare
+      val outcomes = scala.collection.mutable.Map[(String, String), Int]().withDefaultValue(0)
       def execute(name: String, sew: Int, lmul: Int, vl: Int, start: Int, masked0: Boolean,
                   scalarOperand0: Boolean, shape0: Int = VectorShape.SINGLE): Unit = {
         val (_, op, saturate) = ops.find(_._1 == name).get
         val signed = if (signedMatters(name)) isSigned(name) else random.nextBoolean()
         val ext = extLog2(name)
-        val shape = if (ext != 0) shapeOf(name) else shape0
-        val masked = masked0 || withV0(name)
-        val scalarOperand = scalarOperand0 && ext == 0
+        val shape = if (shapeOf(name) != VectorShape.SINGLE) shapeOf(name) else shape0
+        val maskDst = shape == VectorShape.MASK_DST
+        val maskMm = shape == VectorShape.MASK_MM
+        val masked = (masked0 || withV0(name)) && !unmaskedOnly(name)
+        val scalarOperand = scalarOperand0 && ext == 0 && !maskMm
         val scalarRead = shape == VectorShape.SCALAR_READ
         val scalarWrite = shape == VectorShape.SCALAR_WRITE
         val width = 8 << sew
@@ -125,23 +145,35 @@ class VectorArithmeticTest extends AnyFunSuite {
         val group = 1 << scala.math.max(lmul, 0)
         def pick(): Int = random.nextInt(32 / group) * group
         var vd = pick()
-        while (masked && vd == 0) vd = pick()
-        val vs1 = if (scalarRead || scalarWrite) 11 else pick()
+        while (masked && vd == 0 && !maskDst) vd = pick()
+        val vs1 = if (scalarRead || scalarWrite) 11 else if (maskMm) random.nextInt(32) else pick()
         // An extension source group overlaps vd only in its highest part, and only with EMUL >= 1 (norm:vreg_overlap_legal)
         val sourceGroup = 1 << scala.math.max(lmul - ext, 0)
         def legalSource(r: Int) = r + sourceGroup <= vd || r >= vd + group || lmul - ext >= 0 && r == vd + group - sourceGroup
-        val vs2 = if (scalarRead) 13 else if (ext == 0) pick() else {
+        val vs2 = if (scalarRead) 13 else if (maskMm) random.nextInt(32) else if (ext == 0) pick() else {
           if (lmul - ext >= 0 && random.nextInt(3) == 0) vd + group - sourceGroup
           else Iterator.continually(random.nextInt(32 / sourceGroup) * sourceGroup).find(legalSource).get
         }
         if (ext != 0 && vs2 < vd + group && vs2 >= vd) sourceInVd += 1
-        val scalar = BigInt(xlen, random)
+        // A mask vd is one register anywhere: on a source base, or outside both source groups (norm:vreg_overlap_legal)
+        if (maskMm) vd = random.nextInt(32)
+        if (maskDst) {
+          def outside(r: Int, base: Int) = r < base || r >= base + group
+          vd = random.nextInt(4) match {
+            case 0 => vs2
+            case 1 if !scalarOperand => vs1
+            case _ => Iterator.continually(random.nextInt(32)).find(r => outside(r, vs2) && (scalarOperand || outside(r, vs1))).get
+          }
+        }
         def element(reg: Int, i: Int, size: Int = size): BigInt = {
           val index = i * size
           val r = reg + index / (vlen / 8)
           val offset = index % (vlen / 8)
           (0 until size).map(b => BigInt(bytes(r)(offset + b)) << (8 * b)).reduce(_ | _)
         }
+        // Equal scalar and vector elements are rare with random data
+        val scalar = if (vl > 0 && ext == 0 && !maskMm && random.nextInt(4) == 0) (BigInt(xlen, random) >> width << width) | element(vs2, random.nextInt(vl))
+          else BigInt(xlen, random)
         def sextFrom(v: BigInt, bits: Int): BigInt = if (v.testBit(bits - 1)) v - (BigInt(1) << bits) else v
         def sext(v: BigInt): BigInt = sextFrom(v, width)
         // Clamp to the SEW range (norm:vsaddu_vsadd_vssubu_vssub_op_overflow_vxsat_op_vsaddsub)
@@ -151,9 +183,52 @@ class VectorArithmeticTest extends AnyFunSuite {
         var expectedSaturation = false
         val expected = ArrayBuffer[(Int, BigInt, Int)]()
         val expectedReads = ArrayBuffer[Int]()
-        if (!scalarRead) {
+        def maskBit(i: Int) = ((bytes(0)(i / 8) >> (i % 8)) & 1) != 0
+        def bitOf(reg: Int, i: Int) = ((bytes(reg)(i / 8) >> (i % 8)) & 1) != 0
+        if (maskDst || maskMm) {
+          // Mask results: bits below vl, active ones only for compares; every other bit of vd is kept
+          val results = for (i <- 0 until vl if maskMm || i >= start && (!masked || withV0(name) || maskBit(i))) yield {
+            lazy val a = element(vs2, i)
+            lazy val b = if (scalarOperand) scalar & mask else element(vs1, i)
+            val c = if (withV0(name) && maskBit(i)) 1 else 0
+            val (x, y) = (bitOf(vs2, i), bitOf(vs1, i))
+            val bit = name match {
+              case "vmseq" => a == b
+              case "vmsne" => a != b
+              case "vmsltu" => a < b
+              case "vmslt" => sext(a) < sext(b)
+              case "vmsleu" => a <= b
+              case "vmsle" => sext(a) <= sext(b)
+              case "vmsgtu" => a > b
+              case "vmsgt" => sext(a) > sext(b)
+              case "vmadc" | "vmadcm" => (a + b + c) > mask
+              case "vmsbc" | "vmsbcm" => a - b - c < 0
+              case "vmand" => x && y
+              case "vmnand" => !(x && y)
+              case "vmandn" => x && !y
+              case "vmxor" => x != y
+              case "vmor" => x || y
+              case "vmnor" => !(x || y)
+              case "vmorn" => x || !y
+              case "vmxnor" => x == y
+            }
+            if (maskDst) {
+              outcomes((name, bit.toString)) += 1
+              if (compares.contains(name) && a == b) outcomes((name, "equal")) += 1
+            }
+            i -> bit
+          }
+          for ((i, bit) <- results) {
+            val byte = bytes(vd)(i / 8)
+            bytes(vd)(i / 8) = if (bit) byte | (1 << (i % 8)) else byte & ~(1 << (i % 8))
+          }
+          if (vl > 0) for (w <- 0 to (vl - 1) / 64) {
+            expected += ((vd * p.beatsPerReg + w, word(vd, w * 8), 255))
+          }
+          val steps = if (vl == 0) 0 else if (maskMm) (vl - 1) / 64 + 1 else (vl - 1) * size / 8 + 1
+          expectedReads ++= 0 until steps
+        } else if (!scalarRead) {
           val updates = ArrayBuffer[(Int, BigInt)]()
-          def maskBit(i: Int) = ((bytes(0)(i / 8) >> (i % 8)) & 1) != 0
           for (i <- 0 until vl if i >= start && (!scalarWrite || i == 0) && (!masked || withV0(name) || maskBit(i))) {
             val a = element(vs2, i, size >> ext)
             val b = if (scalarOperand) scalar & mask else element(vs1, i)
@@ -227,15 +302,20 @@ class VectorArithmeticTest extends AnyFunSuite {
           val rv = dut.io.readValid.toInt
           val readVs2 = scalarRead || !scalarWrite && op != VectorAluOp.MOVE
           val readVs1 = !scalarOperand && !scalarRead && ext == 0
-          val expectedValid = (if (readVs2) 1 else 0) | (if (readVs1) 2 else 0)
           if (rv != 0) {
-            assert(rv == expectedValid, s"read ports case $cases") // port C is idle in these shapes
             val port = if (readVs2) 0 else 1
             val base = if (readVs2) vs2 else vs1
             val beat = dut.io.readAddresses(port).toInt - base * p.beatsPerReg
+            // Port C reads the old mask word: every step of MASK_MM, the first step of each word of MASK_DST
+            val wordStep = beat * (8 >> sew) % 64 == 0
+            val readVd = maskMm || maskDst && wordStep
+            val expectedValid = (if (readVs2) 1 else 0) | (if (readVs1) 2 else 0) | (if (readVd) 4 else 0)
+            assert(rv == expectedValid, s"read ports case $cases")
             actualReads += beat
             readCycles += cycles
             if (readVs2 && readVs1) assert(dut.io.readAddresses(1).toInt == vs1 * p.beatsPerReg + beat)
+            val vdWord = if (maskDst) beat * (8 >> sew) / 64 else beat
+            if (readVd) assert(dut.io.readAddresses(2).toInt == vd * p.beatsPerReg + vdWord, s"old mask word case $cases")
           }
           if (dut.io.write.valid.toBoolean) {
             assert(writeIndex < expected.size, s"unexpected write in case $cases")
@@ -244,7 +324,7 @@ class VectorArithmeticTest extends AnyFunSuite {
             assert(dut.io.write.mask.toInt == byteMask, s"byte enables case $cases")
             val bitMask = (0 until 8).filter(b => (byteMask & (1 << b)) != 0).map(b => BigInt(255) << (8 * b)).reduce(_ | _)
             assert((dut.io.write.data.toBigInt & bitMask) == data, s"data case $cases $name sew $sew lmul $lmul vd $vd vs2 $vs2")
-            if (!masked && writeCycles.nonEmpty) assert(cycles == writeCycles.last + 1, "active beats must stream every cycle")
+            if (!masked && !maskDst && writeCycles.nonEmpty) assert(cycles == writeCycles.last + 1, "active beats must stream every cycle")
             writeCycles += cycles
             writeIndex += 1; writes += 1
           }
@@ -253,8 +333,10 @@ class VectorArithmeticTest extends AnyFunSuite {
         assert(dut.io.done.toBoolean, s"timeout case $cases")
         assert(writeIndex == expected.size)
         // Each write lands three cycles after its reads; done follows the last write
+        // MASK_DST writes a mask word after the last step that produces its bits
+        val writingSteps = actualReads.indices.filter(k => !maskDst || k == actualReads.size - 1 || (k + 1) * (8 >> sew) % 64 == 0)
         if (!scalarRead && readCycles.nonEmpty)
-          assert(writeCycles.toSeq == readCycles.map(_ + 3).toSeq, s"write latency case $cases")
+          assert(writeCycles.toSeq == writingSteps.map(readCycles(_) + 3), s"write latency case $cases")
         assert(dut.io.saturated.toBoolean == expectedSaturation, s"saturation case $cases $name sew $sew vl $vl")
         if (scalarRead) assert(dut.io.result.toBigInt == expectedResult)
         if (!scalarOperand || scalarRead || op != VectorAluOp.MOVE)
@@ -280,7 +362,7 @@ class VectorArithmeticTest extends AnyFunSuite {
       }
       // Operands at the limits: random elements rarely reach them exactly, nor equal each other or shift by 0
       for (sew <- 0 to 2; (name, _, saturate) <- ops if sew >= extLog2(name) && name != "vmv";
-           _ <- 0 until (if (saturate) 4 else 2)) {
+           _ <- 0 until (if (saturate || compares.contains(name) || carries.contains(name)) 4 else 2)) {
         val size = 1 << sew
         for (reg <- 0 until 32; e <- 0 until vlen / 8 / size) {
           val limit = Seq(0, 1, (1 << (8 * size - 1)) - 1, 1 << (8 * size - 1), (1L << (8 * size)) - 1).map(BigInt(_))
@@ -302,9 +384,12 @@ class VectorArithmeticTest extends AnyFunSuite {
         execute("vmv", sew, 3, vl, 0, false, true, if (read) VectorShape.SCALAR_READ else VectorShape.SCALAR_WRITE)
       for ((name, _, saturate) <- ops if saturate; outcome <- Seq(false, true))
         assert(saturations((name, outcome)) > 0, s"$name never had saturated = $outcome")
+      for (name <- compares ++ carries; outcome <- Seq("true", "false") ++ (if (compares.contains(name)) Seq("equal") else Nil))
+        assert(outcomes((name, outcome)) > 0, s"$name never had an active result $outcome")
       println(s"VectorArithmetic VLEN=$vlen XLEN=$xlen: $cases cases, $writes writes, saturation outcomes " +
         saturations.toSeq.sorted.map { case ((n, o), c) => s"$n/$o=$c" }.mkString(" ") +
-        s", $sourceInVd extensions with vs2 in the highest part of vd, full physical readback after every case")
+        s", $sourceInVd extensions with vs2 in the highest part of vd, mask outcomes " +
+        outcomes.toSeq.sorted.map { case ((n, o), c) => s"$n/$o=$c" }.mkString(" ") + ", full physical readback after every case")
     }
   }
   test("64-bit beats and byte preservation on RV32") { run(128, 32) }
