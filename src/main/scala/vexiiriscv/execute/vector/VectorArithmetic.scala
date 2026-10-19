@@ -30,7 +30,21 @@ object VectorAluOp {
   val NOR = 19
   val ORN = 20
   val XNOR = 21
+  // Fixed point, rounded by vxrm: averaging (vs2 +/- vs1) >> 1, and scaling right shifts that shift in the sign bit when signed
+  val AADD = 22
+  val ASUB = 23
+  val SSRL = 24
   def width = 5
+}
+
+object VectorFixedPoint {
+  // Increment after a right shift from the kept lsb, the first dropped bit and the OR of the others (norm:vxrm_op)
+  def roundIncrement(lsb: Bool, half: Bool, sticky: Bool, vxrm: Bits): Bool = vxrm.mux(
+    B"00" -> half,                         // rnu
+    B"01" -> (half && (sticky || lsb)),    // rne
+    B"10" -> False,                        // rdn
+    B"11" -> (!lsb && (half || sticky))    // rod
+  )
 }
 
 // Step function of a command: which word of each operand a step reads and which destination word it writes
@@ -82,8 +96,11 @@ class VectorArithmetic(val p: VectorRegFileParam, val xlen: Int) extends Compone
   val maskMm = command.shape === VectorShape.MASK_MM
   val subtract = command.op === VectorAluOp.SUB || command.op === VectorAluOp.RSUB ||
     command.op === VectorAluOp.MIN || command.op === VectorAluOp.MAX ||
-    command.op === VectorAluOp.SLT || command.op === VectorAluOp.SLE || command.op === VectorAluOp.SGT
-  val shift = command.op === VectorAluOp.SLL || command.op === VectorAluOp.SRL
+    command.op === VectorAluOp.SLT || command.op === VectorAluOp.SLE || command.op === VectorAluOp.SGT ||
+    command.op === VectorAluOp.ASUB
+  val average = command.op === VectorAluOp.AADD || command.op === VectorAluOp.ASUB
+  val rounding = average || command.op === VectorAluOp.SSRL
+  val shift = command.op === VectorAluOp.SLL || command.op === VectorAluOp.SRL || rounding
   val running = RegInit(False)
   val busy = RegInit(False)
   val saturated = RegInit(False)
@@ -96,6 +113,8 @@ class VectorArithmetic(val p: VectorRegFileParam, val xlen: Int) extends Compone
   def word(reg: UInt, index: UInt): UInt = ((reg.resize(p.addressWidth) << p.beatWidth) + index).resize(p.addressWidth)
   // Most significant byte of the element holding byte j
   def topOf(j: Int): UInt = command.sew.mux(U(0) -> U(j, 3 bits), U(1) -> U(j | 1, 3 bits), default -> U(j | 3, 3 bits))
+  // Byte j is the least significant byte of its element
+  def boundary(j: Int): Bool = if (j % 4 == 0) True else if (j % 2 == 0) command.sew =/= 2 else command.sew === 0
 
   when(io.cmd.valid) {
     command := io.cmd.payload
@@ -171,11 +190,12 @@ class VectorArithmetic(val p: VectorRegFileParam, val xlen: Int) extends Compone
     val overflow = Bits(8 bits)
     // Unsigned or signed vs2 < vs1, meaningful at the most significant byte of each element
     val less = Bits(8 bits)
+    // Bit SEW of the exact sum or difference, meaningful at the most significant byte of each element
+    val upper = Bits(8 bits)
     carries(0) := subtract
     for (j <- 0 until 8) {
-      val boundary = if (j % 4 == 0) True else if (j % 2 == 0) command.sew =/= 2 else command.sew === 0
       // Carry-in, or borrow-in for subtraction, from v0 (norm:vadc_vsbc_op)
-      val carry = boundary ? (subtract ^ (command.maskData && selects(j))) | carries(j)
+      val carry = boundary(j) ? (subtract ^ (command.maskData && selects(j))) | carries(j)
       val rhs = right(j * 8, 8 bits) ^ B(8 bits, default -> subtract)
       val value = left(j * 8, 8 bits).asUInt.resize(9) + rhs.asUInt.resize(9) + carry.asUInt
       sum(j * 8, 8 bits) := value(7 downto 0).asBits
@@ -183,7 +203,12 @@ class VectorArithmetic(val p: VectorRegFileParam, val xlen: Int) extends Compone
       val leftSign = left(j * 8 + 7)
       overflow(j) := command.signed ? (leftSign === rhs.msb && value(7) =/= leftSign) | (value.msb ^ subtract)
       less(j) := command.signed ? (value(7) ^ overflow(j)) | overflow(j)
+      upper(j) := command.signed ? (leftSign ^ rhs.msb ^ value.msb) | (value.msb ^ subtract)
     }
+    // Averaging shifts every element right by one
+    val one = command.sew.mux(U(0) -> B(BigInt("0101010101010101", 16), 64 bits),
+      U(1) -> B(BigInt("0001000100010001", 16), 64 bits), default -> B(BigInt("0000000100000001", 16), 64 bits))
+    val amounts = average ? one | b
     val selected = Bits(64 bits)
     for (j <- 0 until 8) {
       val takeA = (command.op === VectorAluOp.MIN) === less(topOf(j))
@@ -240,6 +265,7 @@ class VectorArithmetic(val p: VectorRegFileParam, val xlen: Int) extends Compone
       U(VectorAluOp.MERGE) -> selected,
       U(VectorAluOp.SLL) -> a,
       U(VectorAluOp.SRL) -> a,
+      U(VectorAluOp.SSRL) -> a,
       default -> sum
     )
     val output = (ext2 || ext4) ? extended | data
@@ -255,7 +281,7 @@ class VectorArithmetic(val p: VectorRegFileParam, val xlen: Int) extends Compone
     }
   }
 
-  // Shifts and saturation of whole elements (norm:vsaddu_vsadd_vssubu_vssub_op_overflow_vxsat_op_vsaddsub), mask merging
+  // Shifts with rounding (norm:vssrl_vssra_op), saturation (norm:vsaddu_vsadd_vssubu_vssub_op_overflow_vxsat_op_vsaddsub), mask merging
   val x2 = new Area {
     val valid = RegNext(x1.valid) init(False)
     val last = RegNext(x1.last) init(False)
@@ -268,15 +294,17 @@ class VectorArithmetic(val p: VectorRegFileParam, val xlen: Int) extends Compone
     val bits = RegNext(x1.bits)
     val actives = RegNext(x1.actives)
     val data = RegNext(x1.output)
-    val amounts = RegNext(x1.b)
+    val amounts = RegNext(x1.amounts)
     val overflow = RegNext(x1.overflow)
+    val upper = RegNext(x1.upper)
     val negative = RegNext(x1.negative)
 
     // Segmented shifter, one stage per amount bit; only the low lg2(SEW) bits count (norm:vsll_vsrl_vsra_shamt)
     val left = command.op === VectorAluOp.SLL
     def lane(i: Int, w: Int) = i - i % w
+    // Averaging shifts in bit SEW of the exact result (norm:vaaddu_vaadd_vasubu_vasub_op)
     val fill = Bits(64 bits)
-    for (i <- 0 until 64) fill(i) := command.signed && command.sew.mux(
+    for (i <- 0 until 64) fill(i) := average ? upper(topOf(i / 8)) | command.signed && command.sew.mux(
       U(0) -> data(lane(i, 8) + 7), U(1) -> data(lane(i, 16) + 15), default -> data(lane(i, 32) + 31))
     val stages = ArrayBuffer(data)
     for (k <- 0 until 5) {
@@ -297,7 +325,32 @@ class VectorArithmetic(val p: VectorRegFileParam, val xlen: Int) extends Compone
       }
       stages += out
     }
-    val base = shift ? stages.last | data
+    // Rounding increment of each element from the bits the shift drops, added at the element's least significant byte
+    def increments(w: Int): Bits = {
+      val out = B(0, 8 bits)
+      for (l <- 0 until 64 / w) {
+        val d = amounts(l * w, log2Up(w) bits).asUInt
+        val v = data(l * w, w bits)
+        val lsb, half, sticky = Bits(w bits)
+        for (i <- 0 until w) {
+          lsb(i) := v(i) && d === i
+          half(i) := (if (i + 1 < w) v(i) && d === i + 1 else False)
+          sticky(i) := (if (i + 2 < w) v(i) && d > i + 1 else False)
+        }
+        out(l * w / 8) := VectorFixedPoint.roundIncrement(lsb.orR, half.orR, sticky.orR, command.vxrm)
+      }
+      out
+    }
+    val increment = rounding ? command.sew.mux(U(0) -> increments(8), U(1) -> increments(16), default -> increments(32)) | B(0, 8 bits)
+    val rounded = Bits(64 bits)
+    val roundCarries = Vec(Bool(), 9)
+    roundCarries(0) := False
+    for (j <- 0 until 8) {
+      val sum = stages.last(j * 8, 8 bits).asUInt.resize(9) + (boundary(j) ? increment(j) | roundCarries(j)).asUInt
+      rounded(j * 8, 8 bits) := sum(7 downto 0).asBits
+      roundCarries(j + 1) := sum.msb
+    }
+    val base = shift ? rounded | data
 
     val clipped = Bits(8 bits)
     val value = Bits(64 bits)

@@ -139,7 +139,10 @@ class VectorPlugin(val layer : LaneLayer, val dlen : Int = 64, var withMemory : 
       ("vminu", VectorAluOp.MIN, false, false), ("vmin", VectorAluOp.MIN, false, true),
       ("vmaxu", VectorAluOp.MAX, false, false), ("vmax", VectorAluOp.MAX, false, true),
       ("vsll", VectorAluOp.SLL, false, false), ("vsrl", VectorAluOp.SRL, false, false), ("vsra", VectorAluOp.SRL, false, true),
-      ("vadc", VectorAluOp.ADD, false, false), ("vsbc", VectorAluOp.SUB, false, false), ("vmerge", VectorAluOp.MERGE, false, false))
+      ("vadc", VectorAluOp.ADD, false, false), ("vsbc", VectorAluOp.SUB, false, false), ("vmerge", VectorAluOp.MERGE, false, false),
+      ("vaaddu", VectorAluOp.AADD, false, false), ("vaadd", VectorAluOp.AADD, false, true),
+      ("vasubu", VectorAluOp.ASUB, false, false), ("vasub", VectorAluOp.ASUB, false, true),
+      ("vssrl", VectorAluOp.SSRL, false, false), ("vssra", VectorAluOp.SSRL, false, true))
     for ((name, op, saturate, signed) <- single; form <- Seq("vv", "vx", "vi", "vvm", "vxm", "vim")
          if Rvv.all.contains(s"$name.$form") || name == "vmv.v" && form.length == 2) {
       val mnemonic = if (name == "vmv.v") s"vmv.v.${form.last}" else s"$name.$form"
