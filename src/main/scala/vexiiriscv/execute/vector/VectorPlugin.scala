@@ -43,13 +43,14 @@ object VectorRange {
 
 case class VectorMemoryDescriptor(indexWidth : Int) extends Bundle {
   val index = UInt(indexWidth bits)
+  val field = UInt(3 bits)
   val last, access = Bool()
 }
 
 /**
  * Vector instructions on one lane layer. Each one waits until every older instruction left the pipeline, is checked
  * against vtype/vstart at E0 and then does all its work there; vset* complete in that cycle.
- * Loads and stores instead issue one LSU micro-op per active element and complete with the last one.
+ * Loads and stores instead issue one LSU micro-op per field of each active element and complete with the last one.
  * withMemory = false leaves the LSU element port to another sequencer.
  */
 class VectorPlugin(val layer : LaneLayer, val dlen : Int = 64, var withMemory : Boolean = true) extends FiberPlugin with InitService {
@@ -241,6 +242,20 @@ class VectorPlugin(val layer : LaneLayer, val dlen : Int = 64, var withMemory : 
     def whole(uop : Bits) : Bool = uop(27 downto 26) === 0 && uop(Const.rs2Range) === 8
     def maskMemory(uop : Bits) : Bool = uop(27 downto 26) === 0 && uop(Const.rs2Range) === 11
     def dataSize(uop : Bits) : UInt = indexed(uop) ? vcs.vtype.vsew.resize(2) | sizeOf(uop)
+    // Fields per element minus one; whole-register transfers use nf as the register count
+    def fieldsOf(uop : Bits) : UInt = whole(uop) ? U(0, 3 bits) | uop(31 downto 29).asUInt
+    // log2 of the data EMUL: LMUL for indexed, EEW / SEW * LMUL otherwise (norm:vector_ls_indexed_op)
+    def dataLog2Of(uop : Bits) : SInt = {
+      val lmul = vcs.vtype.vlmul.asSInt.resize(5)
+      val eewLog2 = uop(Const.funct3Range).mux(B"101" -> S(4, 5 bits), B"110" -> S(5, 5 bits), default -> S(3, 5 bits))
+      indexed(uop) ? lmul | (eewLog2 - S(3, 5 bits) - vcs.vtype.vsew.resize(5).asSInt + lmul)
+    }
+    // Field f of a segment lives in register vd + f * max(EMUL, 1)
+    def fieldReg(uop : Bits, field : UInt) : UInt = {
+      val log2 = dataLog2Of(uop)
+      val shift = (log2 <= S(0)) ? U(0, 2 bits) | log2.asUInt.resize(2)
+      (uop(Const.rdRange).asUInt.resize(6) + (field.resize(6) << shift).resize(6)).resize(5)
+    }
     // Byte offset of an element in its register group, and the VRF word holding it; a group has at most 8 registers
     def groupOffset(index : UInt, size : UInt) : UInt = (index.resize(log2Up(vlen)) << size).resize(log2Up(vlen))
     def wordOf(vreg : UInt, offset : UInt) : UInt =
@@ -290,8 +305,13 @@ class VectorPlugin(val layer : LaneLayer, val dlen : Int = 64, var withMemory : 
         val group = !aligned(vd, emulOf(EMUL_VD, lmul, nreg)) || !aligned(vs1, emulOf(EMUL_VS1, lmul, nreg)) || !aligned(vs2, emulOf(EMUL_VS2, lmul, nreg))
         val maskOverlap = MASK_NOT_V0 && !vm && vd === 0
         val wholeLog2 = Decode.UOP(31) ? S(3, 4 bits) | (Decode.UOP(30) ? S(2, 4 bits) | (Decode.UOP(29) ? S(1, 4 bits) | S(0, 4 bits)))
-        val dataLog2 = indexed(Decode.UOP) ? lmul.resize(4) | emul.resize(4)
+        val dataLog2 = dataLog2Of(Decode.UOP).resize(4)
         val indexLog2 = emul.resize(4)
+        // Segments: nf groups of max(EMUL, 1) registers, at most 8 and within v31 (norm:vector_ls_seg_op)
+        val segment = Decode.UOP(31 downto 29) =/= 0
+        val span = ((Decode.UOP(31 downto 29).asUInt.resize(4) + 1) * groupSize(dataLog2)).resize(7)
+        val segmentRange = span > 8 || vd.resize(7) + span > 32
+        val segmentOverlap = vd.resize(7) < vs2.resize(7) + groupSize(indexLog2) && vs2.resize(7) < vd.resize(7) + span
         val memoryOverlap = overlapped(vd, dataLog2, vs2, indexLog2)
         val indexHighest = indexLog2 >= 0 && vs2.resize(6) + groupSize(indexLog2) === vd.resize(6) + groupSize(dataLog2)
         val badIndexOverlap = memoryOverlap && (
@@ -299,7 +319,8 @@ class VectorPlugin(val layer : LaneLayer, val dlen : Int = 64, var withMemory : 
           (sizeOf(Decode.UOP) < vtype.vsew && !indexHighest))
         val mem = MEM && (whole(Decode.UOP) ? !aligned(vd, wholeLog2) |
           (!maskMemory(Decode.UOP) && (!emulOk || !aligned(vd, dataLog2) ||
-            (indexed(Decode.UOP) && (!aligned(vs2, indexLog2) || (!Decode.UOP(5) && badIndexOverlap))))))
+            segmentRange || (indexed(Decode.UOP) && (!aligned(vs2, indexLog2) ||
+              (!Decode.UOP(5) && (segment ? segmentOverlap | badIndexOverlap)))))))
         // A smaller source may overlap vd only in its highest part, and only with EMUL >= 1 (norm:vreg_overlap_legal)
         val vdLog2 = emulOf(EMUL_VD, lmul, nreg)
         val vs2Log2 = emulOf(EMUL_VS2, lmul, nreg)
@@ -421,11 +442,13 @@ class VectorPlugin(val layer : LaneLayer, val dlen : Int = 64, var withMemory : 
       wb.payload := RESULT
     }
 
-    // One LSU micro-op per active element; the descriptor travels with it from the dispatch insert node.
+    // One LSU micro-op per field of each active element; the descriptor travels with it from the dispatch insert node.
     val memory = withMemory generate new Area {
       val port = lsuPort
       val seq = dp.logic.sequencer.port
       val walker = new VectorElementWalker(vlen)
+      val resume = RegInit(False) // an element retries after REDO or a TLB refill
+      val resumeField = Reg(UInt(3 bits)) init(0) // the field it retries from
       val inflight = host.list[InflightService].map(_.hasInflight(0)).orR
       // Older instructions have left, so vl, vstart and v0 are final; the first micro-op uses that sample
       walker.io.start := seq.valid && seq.first && !inflight && !seq.fire
@@ -439,6 +462,8 @@ class VectorPlugin(val layer : LaneLayer, val dlen : Int = 64, var withMemory : 
       walker.io.vstart := vcs.vstart
       walker.io.unmasked := seq.uop(25)
       walker.io.v0 := vrf.io.v0
+      walker.io.fields := fieldsOf(seq.uop)
+      walker.io.startField := resumeField
       // A candidate leaves only by fire or cancel, so an uncancelled sample belongs to the current candidate
       val prepared = RegNext(walker.io.start && !seq.cancel) init(False)
       seq.ready := !seq.first || prepared && port.storeBufferEmpty
@@ -446,6 +471,7 @@ class VectorPlugin(val layer : LaneLayer, val dlen : Int = 64, var withMemory : 
 
       val descriptor = VectorMemoryDescriptor(vcs.vstartWidth)
       descriptor.index := walker.io.index
+      descriptor.field := walker.io.field
       descriptor.last := walker.io.last
       descriptor.access := walker.io.any // otherwise a single finish micro-op
       elp.ctrl(0).up(DESCRIPTOR) := descriptor
@@ -453,17 +479,19 @@ class VectorPlugin(val layer : LaneLayer, val dlen : Int = 64, var withMemory : 
       // Store data: read the element's word one stage before the LSU captures it; the response holds over freezes
       val read = new layer.Execute(-1) {
         val index = apply(DESCRIPTOR).index
+        val field = apply(DESCRIPTOR).field
         val size = dataSize(Decode.UOP)
         val offset = groupOffset(index, size)
+        val fieldTerm = (field.resize(XLEN) << size).resize(XLEN)
         val term = UInt(XLEN bits)
-        term := (index.resize(XLEN) << size).resized
-        when(strided(Decode.UOP)) { term := (index * apply(elp(IntRegFile, RS2)).asUInt).resized }
-        when(indexed(Decode.UOP)) { term := 0 }
+        term := ((index * (fieldsOf(Decode.UOP).resize(4) + 1) + field).resize(XLEN) << size).resized
+        when(strided(Decode.UOP)) { term := ((index * apply(elp(IntRegFile, RS2)).asUInt).resize(XLEN) + fieldTerm).resized }
+        when(indexed(Decode.UOP)) { term := fieldTerm }
         val OFFSET = insert(term)
         indexRead.valid := !elp.isFreezed() && isValid && MEM && indexed(Decode.UOP)
         indexRead.payload := wordOf(Decode.UOP(Const.rs2Range).asUInt, groupOffset(index, sizeOf(Decode.UOP)))
         storeRead.valid := !elp.isFreezed()
-        storeRead.payload := wordOf(Decode.UOP(Const.rdRange).asUInt, offset)
+        storeRead.payload := wordOf(fieldReg(Decode.UOP, field), offset)
       }
 
       val issue = new layer.Execute(0) {
@@ -487,7 +515,6 @@ class VectorPlugin(val layer : LaneLayer, val dlen : Int = 64, var withMemory : 
         val ILLEGAL = insert(illegal)
       }
 
-      val resume = RegInit(False) // an element retries after REDO or a TLB refill
       val complete = new layer.Execute(lsu.timingParameter.ctrlAt) {
         val d = apply(DESCRIPTOR)
         val size = dataSize(Decode.UOP)
@@ -497,7 +524,7 @@ class VectorPlugin(val layer : LaneLayer, val dlen : Int = 64, var withMemory : 
 
         val write = Flow(VrfWriteCmd(vrf.p))
         write.valid := rsp.valid && rsp.access && rsp.load && !rsp.trap.valid
-        write.address := wordOf(Decode.UOP(Const.rdRange).asUInt, offset)
+        write.address := wordOf(fieldReg(Decode.UOP, d.field), offset)
         write.data := size.mux(
           U(0) -> (rsp.data(7 downto 0) #* 8),
           U(1) -> (rsp.data(15 downto 0) #* 4),
@@ -511,11 +538,15 @@ class VectorPlugin(val layer : LaneLayer, val dlen : Int = 64, var withMemory : 
           when(rsp.trap.valid) {
             vcs.vstartWrite.valid := True
             vcs.vstartWrite.payload := d.index
-            resume := !rsp.trap.exception && (rsp.trap.code === TrapReason.REDO || rsp.trap.code === TrapReason.MMU_REFILL)
+            val retry = !rsp.trap.exception && (rsp.trap.code === TrapReason.REDO || rsp.trap.code === TrapReason.MMU_REFILL)
+            resume := retry
+            // A retry continues at the faulting field; an architectural trap restarts the element from its first field
+            resumeField := retry ? d.field | U(0, 3 bits)
           } elsewhen(rsp.last) {
             vcs.vstartWrite.valid := True
             vcs.vstartWrite.payload := 0
             resume := False
+            resumeField := 0
           }
         }
         when(write.valid) {
@@ -530,10 +561,16 @@ class VectorPlugin(val layer : LaneLayer, val dlen : Int = 64, var withMemory : 
     val interruptHold = withMemory generate new Area {
       val tp = host[TrapPlugin]
       val pp = host[PrivilegedPlugin]
-      when(tp.api.harts(0).rvTrap) { memory.resume := False }
+      when(tp.api.harts(0).rvTrap) {
+        memory.resume := False
+        memory.resumeField := 0
+      }
       if (pp.p.withDebug) {
         val fsm = tp.logic.harts(0).trap.fsm
-        when(fsm.isActive(fsm.ENTER_DEBUG)) { memory.resume := False }
+        when(fsm.isActive(fsm.ENTER_DEBUG)) {
+          memory.resume := False
+          memory.resumeField := 0
+        }
       }
       when(memory.resume) { pp.inhibateInterrupts(0) }
     }
