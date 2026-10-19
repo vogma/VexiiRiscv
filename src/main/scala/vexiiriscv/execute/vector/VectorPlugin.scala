@@ -21,6 +21,7 @@ object VectorEmul {
   val L = 1    // EMUL = LMUL
   val L2 = 2   // EMUL = LMUL / 2
   val L4 = 3   // EMUL = LMUL / 4
+  val N = 4    // EMUL = NREG of vmv<nr>r.v
   def width = 3
 }
 
@@ -181,6 +182,12 @@ class VectorPlugin(val layer : LaneLayer, val dlen : Int = 64, var withMemory : 
       ("vmxnor", VectorAluOp.XNOR))
     for ((name, op) <- logicals)
       add(Rvv.all(s"$name.mm"), ARITH -> True, SHAPE -> shape(VectorShape.MASK_MM), ALU_OP -> alu(op), CHECK_VILL -> True, CHECK_VSTART -> True)
+    // Whole-register moves ignore vtype except vill (norm:vmv-nr-r_op); vid.v reads no register
+    for ((_, op) <- Rvv.VMVR)
+      add(op, ARITH -> True, SHAPE -> shape(VectorShape.WHOLE), CHECK_VILL -> True, CHECK_VSTART -> True,
+        EMUL_VD -> emul(VectorEmul.N), EMUL_VS2 -> emul(VectorEmul.N))
+    add(Rvv.all("vid.v"), ARITH -> True, ALU_OP -> alu(VectorAluOp.INDEX), CHECK_VILL -> True, CHECK_VSTART -> True,
+      EMUL_VD -> emul(VectorEmul.L), MASK_NOT_V0 -> True)
     add(Rvv.all("vmv.x.s"), ARITH -> True, SHAPE -> shape(VectorShape.SCALAR_READ), CHECK_VILL -> True, CHECK_VSTART -> True)
     add(Rvv.all("vmv.s.x"), ARITH -> True, ALU_OP -> alu(VectorAluOp.MOVE),
       SCALAR_OPERAND -> True, SHAPE -> shape(VectorShape.SCALAR_WRITE), CHECK_VILL -> True, CHECK_VSTART -> True)
@@ -231,10 +238,11 @@ class VectorPlugin(val layer : LaneLayer, val dlen : Int = 64, var withMemory : 
     val DESCRIPTOR = Payload(VectorMemoryDescriptor(vcs.vstartWidth))
 
     // log2 EMUL of an operand class; classes without a group check as one register
-    def emulOf(cls : UInt, lmul : SInt) : SInt = cls.mux(
+    def emulOf(cls : UInt, lmul : SInt, nreg : SInt) : SInt = cls.mux(
       U(VectorEmul.L) -> lmul.resize(4),
       U(VectorEmul.L2) -> (lmul.resize(4) - 1),
       U(VectorEmul.L4) -> (lmul.resize(4) - 2),
+      U(VectorEmul.N) -> nreg,
       default -> S(0, 4 bits)
     )
     // A register group of 2^log2 registers starts at a multiple of 2^log2
@@ -259,6 +267,9 @@ class VectorPlugin(val layer : LaneLayer, val dlen : Int = 64, var withMemory : 
 
       val legality = new Area {
         val lmul = vtype.vlmul.asSInt
+        // imm[2:0] = NREG - 1 is 0, 1, 3 or 7 (norm:vmv-nr-r_enc)
+        val imm = Decode.UOP(17 downto 15)
+        val nreg = imm(2) ? S(3, 4 bits) | (imm(1) ? S(2, 4 bits) | (imm(0) ? S(1, 4 bits) | S(0, 4 bits)))
         val width = Decode.UOP(Const.funct3Range)
         val eewLog2 = width.mux(B"101" -> S(4, 5 bits), B"110" -> S(5, 5 bits), default -> S(3, 5 bits))
         val emul = eewLog2 - S(3, 5 bits) - vtype.vsew.resize(5).asSInt + lmul.resize(5)
@@ -266,16 +277,16 @@ class VectorPlugin(val layer : LaneLayer, val dlen : Int = 64, var withMemory : 
 
         val vill = CHECK_VILL && vtype.vill
         val vstart = CHECK_VSTART && vcs.vstart =/= 0
-        val group = !aligned(vd, emulOf(EMUL_VD, lmul)) || !aligned(vs1, emulOf(EMUL_VS1, lmul)) || !aligned(vs2, emulOf(EMUL_VS2, lmul))
+        val group = !aligned(vd, emulOf(EMUL_VD, lmul, nreg)) || !aligned(vs1, emulOf(EMUL_VS1, lmul, nreg)) || !aligned(vs2, emulOf(EMUL_VS2, lmul, nreg))
         val maskOverlap = MASK_NOT_V0 && !vm && vd === 0
         val mem = MEM && (!emulOk || !aligned(vd, emul.resize(4)))
         // A smaller source may overlap vd only in its highest part, and only with EMUL >= 1 (norm:vreg_overlap_legal)
-        val vdLog2 = emulOf(EMUL_VD, lmul)
-        val vs2Log2 = emulOf(EMUL_VS2, lmul)
+        val vdLog2 = emulOf(EMUL_VD, lmul, nreg)
+        val vs2Log2 = emulOf(EMUL_VS2, lmul, nreg)
         val highest = vs2Log2 >= S(0) && vs2.resize(6) + groupSize(vs2Log2) === vd.resize(6) + groupSize(vdLog2)
         val widen = OVERLAP_VS2 === VectorOverlap.WIDEN && overlapped(vd, vdLog2, vs2, vs2Log2) && !highest
         // A mask vd may overlap a source group only at its base (norm:vreg_overlap_legal)
-        val vs1Log2 = emulOf(EMUL_VS1, lmul)
+        val vs1Log2 = emulOf(EMUL_VS1, lmul, nreg)
         val maskVs2 = OVERLAP_VS2 === VectorOverlap.MASK && overlapped(vd, vdLog2, vs2, vs2Log2) && vd =/= vs2
         val maskVs1 = OVERLAP_VS1 === VectorOverlap.MASK && overlapped(vd, vdLog2, vs1, vs1Log2) && vd =/= vs1
         val range = RANGE.mux(
@@ -371,6 +382,7 @@ class VectorPlugin(val layer : LaneLayer, val dlen : Int = 64, var withMemory : 
         arithmetic.io.cmd.signed := SIGNED
         arithmetic.io.cmd.saturate := SATURATE
         arithmetic.io.cmd.vxrm := vcs.vxrm
+        arithmetic.io.cmd.nreg := Decode.UOP(17 downto 15).asUInt.resize(4) + 1
         elp.freezeWhen(sel && ARITH && !legality.illegal && !completed)
         when(arithmetic.io.cmd.valid) { started := True }
         when(arithmetic.io.done) { completed := True }

@@ -34,6 +34,7 @@ object VectorAluOp {
   val AADD = 22
   val ASUB = 23
   val SSRL = 24
+  val INDEX = 25 // the element index, without operands (norm:vid_op)
   def width = 5
 }
 
@@ -56,6 +57,7 @@ object VectorShape {
   val EXT4 = 4         // vs2 at SEW/4: step k reads quarter k mod 4 of word k/4
   val MASK_DST = 5     // one result bit per vs2/vs1 element, gathered into mask word k*SEW/64 of vd
   val MASK_MM = 6      // vd, vs2 and vs1 are masks: step k on word k, bits below vl only
+  val WHOLE = 7        // word k of vs2 to word k of vd for nreg registers, whatever vl, vstart, SEW and v0
   def width = 4
 }
 
@@ -71,6 +73,7 @@ case class VectorArithmeticCmd(p: VectorRegFileParam, xlen: Int) extends Bundle 
   val maskData = Bool() // v0 is a carry or merge select; every body element is written
   val signed, saturate = Bool()
   val vxrm = Bits(2 bits)
+  val nreg = UInt(4 bits) // WHOLE: 1, 2, 4 or 8 registers
 }
 
 // One step per cycle: issue synchronous reads, compute in X1 and X2, then write the destination word with byte enables.
@@ -94,6 +97,8 @@ class VectorArithmetic(val p: VectorRegFileParam, val xlen: Int) extends Compone
   val ext4 = command.shape === VectorShape.EXT4
   val maskDst = command.shape === VectorShape.MASK_DST
   val maskMm = command.shape === VectorShape.MASK_MM
+  val whole = command.shape === VectorShape.WHOLE
+  val index = command.op === VectorAluOp.INDEX
   val subtract = command.op === VectorAluOp.SUB || command.op === VectorAluOp.RSUB ||
     command.op === VectorAluOp.MIN || command.op === VectorAluOp.MAX ||
     command.op === VectorAluOp.SLT || command.op === VectorAluOp.SLE || command.op === VectorAluOp.SGT ||
@@ -129,7 +134,7 @@ class VectorArithmetic(val p: VectorRegFileParam, val xlen: Int) extends Compone
     for (j <- 0 until 8) {
       val element = (((step.resize(log2Up(p.vlen) + 3) << 3) + j) >> command.sew).resize(command.vl.getWidth)
       selects(j) := io.v0(element.resize(log2Up(p.vlen)))
-      enables(j) := element >= command.vstart.resize(element.getWidth) && element < command.vl &&
+      enables(j) := whole || element >= command.vstart.resize(element.getWidth) && element < command.vl &&
         (command.unmasked || command.maskData || selects(j)) &&
         (!scalarWrite || element === 0)
     }
@@ -137,7 +142,8 @@ class VectorArithmetic(val p: VectorRegFileParam, val xlen: Int) extends Compone
     val nextElement = (maskMm ? ((wide + 1) << 6) | (((wide + 1) << 3) >> command.sew)).resize(log2Up(p.vlen) + 7)
     // Mask shapes issue every step up to the last one, so the old destination word is always read
     val active = running && (enables.orR || scalarRead || (maskDst || maskMm) && command.vl =/= 0)
-    val last = running && (scalarRead || scalarWrite || nextElement >= command.vl)
+    val wholeLast = (wide + 1) === (command.nreg.resize(wide.getWidth) << p.beatWidth)
+    val last = running && (scalarRead || scalarWrite || (whole ? wholeLast | nextElement >= command.vl))
     // MASK_DST: position of this step's result bits in the destination mask word, and that word
     val offset = ((wide << 3) >> command.sew).resize(6)
     val nextOffset = (((wide + 1) << 3) >> command.sew).resize(6)
@@ -148,9 +154,9 @@ class VectorArithmetic(val p: VectorRegFileParam, val xlen: Int) extends Compone
     val bodyBits = (rest >= 64) ? U(64, 7 bits) | rest.resize(7)
 
     // Ports A, B and C; scalar reads always use vs2, including when vl is zero
-    io.reads(0).cmd.valid := active && (scalarRead || !scalarWrite && command.op =/= VectorAluOp.MOVE)
+    io.reads(0).cmd.valid := active && (scalarRead || !scalarWrite && command.op =/= VectorAluOp.MOVE && !index)
     io.reads(0).cmd.payload := word(command.vs2, ext4 ? (step >> 2) | (ext2 ? (step >> 1) | step))
-    io.reads(1).cmd.valid := active && !command.scalarOperand && !scalarRead && !ext2 && !ext4
+    io.reads(1).cmd.valid := active && !command.scalarOperand && !scalarRead && !ext2 && !ext4 && !whole && !index
     io.reads(1).cmd.payload := word(command.vs1, step)
     // The old destination word, whose bits outside the result are kept (norm:vreg_mask_tail_agn, P3)
     io.reads(2).cmd.valid := active && (maskMm || maskDst && offset === 0)
@@ -170,6 +176,7 @@ class VectorArithmetic(val p: VectorRegFileParam, val xlen: Int) extends Compone
     val mask = RegNext(issue.enables)
     val selects = RegNext(issue.selects)
     val part = RegNext(step(1 downto 0))
+    val position = RegNext(step)
     val offset = RegNext(issue.offset)
     val wordLast = RegNext(issue.wordLast)
     val bodyBits = RegNext(issue.bodyBits)
@@ -250,6 +257,9 @@ class VectorArithmetic(val p: VectorRegFileParam, val xlen: Int) extends Compone
       out
     }
     val extended = (command.sew === 1) ? extend(1, 2) | (ext4 ? extend(1, 4) | extend(2, 4))
+    // Element indices of the word, truncated to SEW (norm:vid_op_overflow)
+    def indices(bytes: Int): Bits = Cat((0 until 8 / bytes).map(e => (position @@ U(e, log2Up(8 / bytes) bits)).resize(bytes * 8)))
+    val ids = command.sew.mux(U(0) -> indices(1), U(1) -> indices(2), default -> indices(4))
     val data = command.op.mux(
       U(VectorAluOp.AND) -> (a & b),
       U(VectorAluOp.OR) -> (a | b),
@@ -266,9 +276,10 @@ class VectorArithmetic(val p: VectorRegFileParam, val xlen: Int) extends Compone
       U(VectorAluOp.SLL) -> a,
       U(VectorAluOp.SRL) -> a,
       U(VectorAluOp.SSRL) -> a,
+      U(VectorAluOp.INDEX) -> ids,
       default -> sum
     )
-    val output = (ext2 || ext4) ? extended | data
+    val output = whole ? a | ((ext2 || ext4) ? extended | data)
     val negative = Bits(8 bits)
     for (j <- 0 until 8) negative(j) := a(j * 8 + 7)
 
