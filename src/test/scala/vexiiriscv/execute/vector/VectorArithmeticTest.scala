@@ -47,13 +47,25 @@ class VectorArithmeticHarness(p: VectorRegFileParam, xlen: Int) extends Componen
 }
 
 class VectorArithmeticTest extends AnyFunSuite {
-  // name, ALU operation, saturating, signed
+  // name, ALU operation, saturating
   val ops = Seq(
     ("vadd", VectorAluOp.ADD, false), ("vsub", VectorAluOp.SUB, false), ("vrsub", VectorAluOp.RSUB, false),
     ("vand", VectorAluOp.AND, false), ("vor", VectorAluOp.OR, false), ("vxor", VectorAluOp.XOR, false),
     ("vmv", VectorAluOp.MOVE, false), ("vsaddu", VectorAluOp.ADD, true), ("vsadd", VectorAluOp.ADD, true),
-    ("vssubu", VectorAluOp.SUB, true), ("vssub", VectorAluOp.SUB, true))
-  def isSigned(name: String) = name == "vsadd" || name == "vssub"
+    ("vssubu", VectorAluOp.SUB, true), ("vssub", VectorAluOp.SUB, true),
+    ("vminu", VectorAluOp.MIN, false), ("vmin", VectorAluOp.MIN, false), ("vmaxu", VectorAluOp.MAX, false),
+    ("vmax", VectorAluOp.MAX, false), ("vsll", VectorAluOp.SLL, false), ("vsrl", VectorAluOp.SRL, false),
+    ("vsra", VectorAluOp.SRL, false), ("vadc", VectorAluOp.ADD, false), ("vsbc", VectorAluOp.SUB, false),
+    ("vmerge", VectorAluOp.MERGE, false), ("vzext2", VectorAluOp.ADD, false), ("vsext2", VectorAluOp.ADD, false),
+    ("vzext4", VectorAluOp.ADD, false), ("vsext4", VectorAluOp.ADD, false))
+  // Operations whose signedness the command must carry; the others get a random value
+  def isSigned(name: String) = Seq("vsadd", "vssub", "vmin", "vmax", "vsra", "vsext2", "vsext4").contains(name)
+  def signedMatters(name: String) = isSigned(name) || Seq("vsaddu", "vssubu", "vminu", "vmaxu", "vsrl", "vzext2", "vzext4").contains(name)
+  // v0 as carry or merge select: encoded masked, every body element written
+  def withV0(name: String) = Seq("vadc", "vsbc", "vmerge").contains(name)
+  // log2 of the extension factor, 0 for single width
+  def extLog2(name: String) = if (name.endsWith("ext2")) 1 else if (name.endsWith("ext4")) 2 else 0
+  def shapeOf(name: String) = extLog2(name) match { case 1 => VectorShape.EXT2; case 2 => VectorShape.EXT4; case _ => VectorShape.SINGLE }
 
   def run(vlen: Int, xlen: Int): Unit = {
     val p = VectorRegFileParam(vlen = vlen)
@@ -73,7 +85,7 @@ class VectorArithmeticTest extends AnyFunSuite {
       dut.io.cmd.vl #= 0; dut.io.cmd.vstart #= 0; dut.io.cmd.sew #= 0; dut.io.cmd.op #= 0
       dut.io.cmd.shape #= VectorShape.SINGLE; dut.io.cmd.vxrm #= 0
       dut.io.cmd.scalar #= 0; dut.io.cmd.scalarOperand #= false; dut.io.cmd.unmasked #= true
-      dut.io.cmd.signed #= false; dut.io.cmd.saturate #= false
+      dut.io.cmd.signed #= false; dut.io.cmd.saturate #= false; dut.io.cmd.maskData #= false
       dut.io.debug #= true
       dut.io.access.valid #= false
       dut.io.access.address #= 0; dut.io.access.data #= 0; dut.io.access.mask #= 0
@@ -94,11 +106,16 @@ class VectorArithmeticTest extends AnyFunSuite {
       dut.io.access.valid #= false
       var cases = 0
       var writes = 0
+      var sourceInVd = 0
       val saturations = scala.collection.mutable.Map[(String, Boolean), Int]().withDefaultValue(0)
-      def execute(name: String, sew: Int, lmul: Int, vl: Int, start: Int, masked: Boolean,
-                  scalarOperand: Boolean, shape: Int = VectorShape.SINGLE): Unit = {
+      def execute(name: String, sew: Int, lmul: Int, vl: Int, start: Int, masked0: Boolean,
+                  scalarOperand0: Boolean, shape0: Int = VectorShape.SINGLE): Unit = {
         val (_, op, saturate) = ops.find(_._1 == name).get
-        val signed = if (saturate) isSigned(name) else random.nextBoolean() // ignored without saturation
+        val signed = if (signedMatters(name)) isSigned(name) else random.nextBoolean()
+        val ext = extLog2(name)
+        val shape = if (ext != 0) shapeOf(name) else shape0
+        val masked = masked0 || withV0(name)
+        val scalarOperand = scalarOperand0 && ext == 0
         val scalarRead = shape == VectorShape.SCALAR_READ
         val scalarWrite = shape == VectorShape.SCALAR_WRITE
         val width = 8 << sew
@@ -110,15 +127,23 @@ class VectorArithmeticTest extends AnyFunSuite {
         var vd = pick()
         while (masked && vd == 0) vd = pick()
         val vs1 = if (scalarRead || scalarWrite) 11 else pick()
-        val vs2 = if (scalarRead) 13 else pick()
+        // An extension source group overlaps vd only in its highest part, and only with EMUL >= 1 (norm:vreg_overlap_legal)
+        val sourceGroup = 1 << scala.math.max(lmul - ext, 0)
+        def legalSource(r: Int) = r + sourceGroup <= vd || r >= vd + group || lmul - ext >= 0 && r == vd + group - sourceGroup
+        val vs2 = if (scalarRead) 13 else if (ext == 0) pick() else {
+          if (lmul - ext >= 0 && random.nextInt(3) == 0) vd + group - sourceGroup
+          else Iterator.continually(random.nextInt(32 / sourceGroup) * sourceGroup).find(legalSource).get
+        }
+        if (ext != 0 && vs2 < vd + group && vs2 >= vd) sourceInVd += 1
         val scalar = BigInt(xlen, random)
-        def element(reg: Int, i: Int): BigInt = {
+        def element(reg: Int, i: Int, size: Int = size): BigInt = {
           val index = i * size
           val r = reg + index / (vlen / 8)
           val offset = index % (vlen / 8)
           (0 until size).map(b => BigInt(bytes(r)(offset + b)) << (8 * b)).reduce(_ | _)
         }
-        def sext(v: BigInt): BigInt = if (v.testBit(width - 1)) v - (BigInt(1) << width) else v
+        def sextFrom(v: BigInt, bits: Int): BigInt = if (v.testBit(bits - 1)) v - (BigInt(1) << bits) else v
+        def sext(v: BigInt): BigInt = sextFrom(v, width)
         // Clamp to the SEW range (norm:vsaddu_vsadd_vssubu_vssub_op_overflow_vxsat_op_vsaddsub)
         def clamp(v: BigInt, low: BigInt, high: BigInt): (BigInt, Boolean) =
           if (v > high) (high, true) else if (v < low) (low, true) else (v, false)
@@ -128,11 +153,13 @@ class VectorArithmeticTest extends AnyFunSuite {
         val expectedReads = ArrayBuffer[Int]()
         if (!scalarRead) {
           val updates = ArrayBuffer[(Int, BigInt)]()
-          for (i <- 0 until vl if i >= start && (!scalarWrite || i == 0) &&
-            (!masked || ((bytes(0)(i / 8) >> (i % 8)) & 1) != 0)) {
-            val a = element(vs2, i)
+          def maskBit(i: Int) = ((bytes(0)(i / 8) >> (i % 8)) & 1) != 0
+          for (i <- 0 until vl if i >= start && (!scalarWrite || i == 0) && (!masked || withV0(name) || maskBit(i))) {
+            val a = element(vs2, i, size >> ext)
             val b = if (scalarOperand) scalar & mask else element(vs1, i)
             val half = BigInt(1) << (width - 1)
+            val amount = (b & (width - 1)).toInt
+            val m = if (maskBit(i)) 1 else 0
             val (value, saturated) = name match {
               case "vadd" => (a + b, false)
               case "vsub" => (a - b, false)
@@ -145,6 +172,18 @@ class VectorArithmeticTest extends AnyFunSuite {
               case "vsadd" => clamp(sext(a) + sext(b), -half, half - 1)
               case "vssubu" => clamp(a - b, 0, mask)
               case "vssub" => clamp(sext(a) - sext(b), -half, half - 1)
+              case "vminu" => (a.min(b), false)
+              case "vmin" => (sext(a).min(sext(b)), false)
+              case "vmaxu" => (a.max(b), false)
+              case "vmax" => (sext(a).max(sext(b)), false)
+              case "vsll" => (a << amount, false)
+              case "vsrl" => (a >> amount, false)
+              case "vsra" => (sext(a) >> amount, false)
+              case "vadc" => (a + b + m, false)
+              case "vsbc" => (a - b - m, false)
+              case "vmerge" => (if (m == 1) b else a, false)
+              case "vzext2" | "vzext4" => (a, false)
+              case "vsext2" | "vsext4" => (sextFrom(a, width >> ext), false)
             }
             expectedSaturation |= saturated
             updates += i -> (value & mask)
@@ -163,7 +202,7 @@ class VectorArithmeticTest extends AnyFunSuite {
               bytes(vd + byte / (vlen / 8))(byte % (vlen / 8)) = valueByte
             }
             expected += ((address, data, byteMask))
-            expectedReads += beat
+            expectedReads += beat >> ext
           }
         } else expectedReads += 0
         if (saturate) saturations((name, expectedSaturation)) += 1
@@ -174,7 +213,7 @@ class VectorArithmeticTest extends AnyFunSuite {
         cmd.vl #= vl; cmd.vstart #= start; cmd.sew #= sew; cmd.op #= op
         cmd.shape #= shape; cmd.vxrm #= random.nextInt(4)
         cmd.scalar #= scalar; cmd.scalarOperand #= scalarOperand
-        cmd.unmasked #= !masked; cmd.signed #= signed; cmd.saturate #= saturate
+        cmd.unmasked #= !masked; cmd.signed #= signed; cmd.saturate #= saturate; cmd.maskData #= withV0(name)
         tick()
         cmd.valid #= false
         var cycles = 0
@@ -187,7 +226,7 @@ class VectorArithmeticTest extends AnyFunSuite {
           assert(dut.io.busy.toBoolean, s"busy before done case $cases")
           val rv = dut.io.readValid.toInt
           val readVs2 = scalarRead || !scalarWrite && op != VectorAluOp.MOVE
-          val readVs1 = !scalarOperand && !scalarRead
+          val readVs1 = !scalarOperand && !scalarRead && ext == 0
           val expectedValid = (if (readVs2) 1 else 0) | (if (readVs1) 2 else 0)
           if (rv != 0) {
             assert(rv == expectedValid, s"read ports case $cases") // port C is idle in these shapes
@@ -204,7 +243,7 @@ class VectorArithmeticTest extends AnyFunSuite {
             assert(dut.io.write.address.toInt == address, s"address case $cases")
             assert(dut.io.write.mask.toInt == byteMask, s"byte enables case $cases")
             val bitMask = (0 until 8).filter(b => (byteMask & (1 << b)) != 0).map(b => BigInt(255) << (8 * b)).reduce(_ | _)
-            assert((dut.io.write.data.toBigInt & bitMask) == data, s"data case $cases $name sew $sew")
+            assert((dut.io.write.data.toBigInt & bitMask) == data, s"data case $cases $name sew $sew lmul $lmul vd $vd vs2 $vs2")
             if (!masked && writeCycles.nonEmpty) assert(cycles == writeCycles.last + 1, "active beats must stream every cycle")
             writeCycles += cycles
             writeIndex += 1; writes += 1
@@ -232,13 +271,16 @@ class VectorArithmeticTest extends AnyFunSuite {
       }
       for (sew <- 0 to 2; lmul <- -2 to 3 if (8 << sew) <= 32 * scala.math.pow(2, lmul)) {
         val vlmax = ((vlen / (8 << sew)) * scala.math.pow(2, lmul)).toInt
-        for ((name, _, _) <- ops; scalar <- Seq(false, true); vl <- Seq(0, 1, vlmax - 1, vlmax).distinct; masked <- Seq(false, true))
+        // Extensions need a source EEW of at least 8 bits
+        for ((name, _, _) <- ops if sew >= extLog2(name); scalar <- Seq(false, true); vl <- Seq(0, 1, vlmax - 1, vlmax).distinct;
+             masked <- Seq(false, true))
           execute(name, sew, lmul, vl, 0, masked, scalar)
         for (start <- Seq(1, vlmax - 1, vlmax, scala.math.min(vlen - 1, vlmax + 3)).distinct.filter(_ < vlen))
           execute("vadd", sew, lmul, vlmax, start, true, false)
       }
-      // Operands at the saturation limits: random elements rarely reach them exactly
-      for (sew <- 0 to 2; (name, _, saturate) <- ops if saturate; _ <- 0 until 4) {
+      // Operands at the limits: random elements rarely reach them exactly, nor equal each other or shift by 0
+      for (sew <- 0 to 2; (name, _, saturate) <- ops if sew >= extLog2(name) && name != "vmv";
+           _ <- 0 until (if (saturate) 4 else 2)) {
         val size = 1 << sew
         for (reg <- 0 until 32; e <- 0 until vlen / 8 / size) {
           val limit = Seq(0, 1, (1 << (8 * size - 1)) - 1, 1 << (8 * size - 1), (1L << (8 * size)) - 1).map(BigInt(_))
@@ -254,14 +296,15 @@ class VectorArithmeticTest extends AnyFunSuite {
           tick()
         }
         dut.io.access.valid #= false
-        execute(name, sew, 0, vlen / (8 << sew), 0, random.nextBoolean(), false)
+        execute(name, sew, random.nextInt(2), vlen / (8 << sew), 0, random.nextBoolean(), random.nextInt(4) == 0)
       }
       for (sew <- 0 to 2; vl <- Seq(0, 1, 3); read <- Seq(false, true))
         execute("vmv", sew, 3, vl, 0, false, true, if (read) VectorShape.SCALAR_READ else VectorShape.SCALAR_WRITE)
       for ((name, _, saturate) <- ops if saturate; outcome <- Seq(false, true))
         assert(saturations((name, outcome)) > 0, s"$name never had saturated = $outcome")
       println(s"VectorArithmetic VLEN=$vlen XLEN=$xlen: $cases cases, $writes writes, saturation outcomes " +
-        saturations.toSeq.sorted.map { case ((n, o), c) => s"$n/$o=$c" }.mkString(" ") + ", full physical readback after every case")
+        saturations.toSeq.sorted.map { case ((n, o), c) => s"$n/$o=$c" }.mkString(" ") +
+        s", $sourceInVd extensions with vs2 in the highest part of vd, full physical readback after every case")
     }
   }
   test("64-bit beats and byte preservation on RV32") { run(128, 32) }

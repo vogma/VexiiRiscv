@@ -19,7 +19,24 @@ import vexiiriscv.schedule.{DispatchPlugin, ReschedulePlugin}
 object VectorEmul {
   val NONE = 0 // scalar, single register or no operand
   val L = 1    // EMUL = LMUL
+  val L2 = 2   // EMUL = LMUL / 2
+  val L4 = 3   // EMUL = LMUL / 4
   def width = 3
+}
+
+// Allowed overlap of vd with vs2, checked at E0
+object VectorOverlap {
+  val ANY = 0
+  val WIDEN = 1 // a smaller vs2 group overlaps vd only in its highest part; a fractional one not at all
+  def width = 2
+}
+
+// SEW range of an instruction, checked at E0
+object VectorRange {
+  val ANY = 0
+  val EXT2 = 1 // SEW >= 16; the source EMUL is always legal for a legal vtype
+  val EXT4 = 2 // SEW >= 32
+  def width = 2
 }
 
 case class VectorMemoryDescriptor(indexWidth : Int) extends Bundle {
@@ -46,9 +63,9 @@ class VectorPlugin(val layer : LaneLayer, val dlen : Int = 64, var withMemory : 
   val VSET = Payload(Bool())
   val VSET_IMM = Payload(Bool()) // vsetivli: AVL from uimm, vtype from zimm10
   val VSET_REG = Payload(Bool()) // vsetvl: vtype from rs2
-  val ARITH, SCALAR_OPERAND, IMMEDIATE, SIGNED, SATURATE = Payload(Bool())
+  val ARITH, SCALAR_OPERAND, IMMEDIATE, SIGNED, SATURATE, MASK_DATA = Payload(Bool())
   val SHAPE = Payload(UInt(VectorShape.width bits))
-  val ALU_OP = Payload(UInt(3 bits))
+  val ALU_OP = Payload(UInt(VectorAluOp.width bits))
   val RESULT = Payload(Bits(XLEN bits))
 
   // E0 legality checks, each enabled per uop
@@ -56,6 +73,8 @@ class VectorPlugin(val layer : LaneLayer, val dlen : Int = 64, var withMemory : 
   val CHECK_VSTART = Payload(Bool())
   val EMUL_VD, EMUL_VS1, EMUL_VS2 = Payload(UInt(VectorEmul.width bits)) // register group aligned to its EMUL
   val MASK_NOT_V0 = Payload(Bool()) // vm = 0 with vd = v0 is reserved
+  val OVERLAP_VS2 = Payload(UInt(VectorOverlap.width bits))
+  val RANGE = Payload(UInt(VectorRange.width bits))
   val MEM = Payload(Bool()) // Memory micro-op: EMUL = EEW / SEW * LMUL in [1/8, 8], vd/vs3 aligned to it
 
   val logic = during setup new Area {
@@ -75,10 +94,12 @@ class VectorPlugin(val layer : LaneLayer, val dlen : Int = 64, var withMemory : 
     if (withMemory) lsuRetainer.release()
 
     val checks = List(VSET, VSET_IMM, VSET_REG, CHECK_VILL, CHECK_VSTART, MASK_NOT_V0, MEM,
-      ARITH, SCALAR_OPERAND, IMMEDIATE, SIGNED, SATURATE)
+      ARITH, SCALAR_OPERAND, IMMEDIATE, SIGNED, SATURATE, MASK_DATA)
     elp.setDecodingDefault(SEL, False)
-    elp.setDecodingDefault(ALU_OP, U(VectorAluOp.ADD, 3 bits))
+    elp.setDecodingDefault(ALU_OP, U(VectorAluOp.ADD, VectorAluOp.width bits))
     elp.setDecodingDefault(SHAPE, U(VectorShape.SINGLE, VectorShape.width bits))
+    elp.setDecodingDefault(OVERLAP_VS2, U(VectorOverlap.ANY, VectorOverlap.width bits))
+    elp.setDecodingDefault(RANGE, U(VectorRange.ANY, VectorRange.width bits))
     for (key <- List(EMUL_VD, EMUL_VS1, EMUL_VS2)) elp.setDecodingDefault(key, U(VectorEmul.NONE, VectorEmul.width bits))
     for (key <- checks) elp.setDecodingDefault(key, False)
     ds.addMicroOpDecodingDefault(VECTOR, False)
@@ -106,24 +127,37 @@ class VectorPlugin(val layer : LaneLayer, val dlen : Int = 64, var withMemory : 
 
     def emul(cls : Int) = U(cls, VectorEmul.width bits)
     def shape(s : Int) = U(s, VectorShape.width bits)
-    // Single-width forms: name, ALU operation, saturating, signed
+    def alu(op : Int) = U(op, VectorAluOp.width bits)
+    // Single-width forms: name, ALU operation, saturating, signed; the vvm/vxm/vim forms take v0 as carry or select
     val single = Seq(
       ("vadd", VectorAluOp.ADD, false, false), ("vsub", VectorAluOp.SUB, false, false), ("vrsub", VectorAluOp.RSUB, false, false),
       ("vand", VectorAluOp.AND, false, false), ("vor", VectorAluOp.OR, false, false), ("vxor", VectorAluOp.XOR, false, false),
       ("vmv.v", VectorAluOp.MOVE, false, false),
       ("vsaddu", VectorAluOp.ADD, true, false), ("vsadd", VectorAluOp.ADD, true, true),
-      ("vssubu", VectorAluOp.SUB, true, false), ("vssub", VectorAluOp.SUB, true, true))
-    for ((name, alu, saturate, signed) <- single; form <- Seq("vv", "vx", "vi") if Rvv.all.contains(s"$name.$form") || name == "vmv.v") {
+      ("vssubu", VectorAluOp.SUB, true, false), ("vssub", VectorAluOp.SUB, true, true),
+      ("vminu", VectorAluOp.MIN, false, false), ("vmin", VectorAluOp.MIN, false, true),
+      ("vmaxu", VectorAluOp.MAX, false, false), ("vmax", VectorAluOp.MAX, false, true),
+      ("vsll", VectorAluOp.SLL, false, false), ("vsrl", VectorAluOp.SRL, false, false), ("vsra", VectorAluOp.SRL, false, true),
+      ("vadc", VectorAluOp.ADD, false, false), ("vsbc", VectorAluOp.SUB, false, false), ("vmerge", VectorAluOp.MERGE, false, false))
+    for ((name, op, saturate, signed) <- single; form <- Seq("vv", "vx", "vi", "vvm", "vxm", "vim")
+         if Rvv.all.contains(s"$name.$form") || name == "vmv.v" && form.length == 2) {
       val mnemonic = if (name == "vmv.v") s"vmv.v.${form.last}" else s"$name.$form"
-      val vector = form == "vv"
-      add(Rvv.all(mnemonic), ARITH -> True, ALU_OP -> U(alu, 3 bits), SATURATE -> Bool(saturate), SIGNED -> Bool(signed),
-        SCALAR_OPERAND -> Bool(!vector), IMMEDIATE -> Bool(form == "vi"),
+      val vector = form.startsWith("vv")
+      add(Rvv.all(mnemonic), ARITH -> True, ALU_OP -> alu(op), SATURATE -> Bool(saturate), SIGNED -> Bool(signed),
+        SCALAR_OPERAND -> Bool(!vector), IMMEDIATE -> Bool(form.startsWith("vi")), MASK_DATA -> Bool(form.length == 3),
         CHECK_VILL -> True, CHECK_VSTART -> True, EMUL_VD -> emul(VectorEmul.L),
         EMUL_VS1 -> emul(if (vector) VectorEmul.L else VectorEmul.NONE),
         EMUL_VS2 -> emul(if (name != "vmv.v") VectorEmul.L else VectorEmul.NONE), MASK_NOT_V0 -> Bool(name != "vmv.v"))
     }
+    // Extensions: vs2 at SEW / f and EMUL = LMUL / f (norm:vsext_vzext_vs_eew_emul)
+    for (f <- Seq(2, 4); signed <- Seq(false, true)) {
+      val (s, cls, range) = if (f == 2) (VectorShape.EXT2, VectorEmul.L2, VectorRange.EXT2) else (VectorShape.EXT4, VectorEmul.L4, VectorRange.EXT4)
+      add(Rvv.all(s"v${if (signed) "s" else "z"}ext.vf$f"), ARITH -> True, SHAPE -> shape(s), SIGNED -> Bool(signed),
+        CHECK_VILL -> True, CHECK_VSTART -> True, EMUL_VD -> emul(VectorEmul.L), EMUL_VS2 -> emul(cls), MASK_NOT_V0 -> True,
+        OVERLAP_VS2 -> U(VectorOverlap.WIDEN, VectorOverlap.width bits), RANGE -> U(range, VectorRange.width bits))
+    }
     add(Rvv.all("vmv.x.s"), ARITH -> True, SHAPE -> shape(VectorShape.SCALAR_READ), CHECK_VILL -> True, CHECK_VSTART -> True)
-    add(Rvv.all("vmv.s.x"), ARITH -> True, ALU_OP -> U(VectorAluOp.MOVE, 3 bits),
+    add(Rvv.all("vmv.s.x"), ARITH -> True, ALU_OP -> alu(VectorAluOp.MOVE),
       SCALAR_OPERAND -> True, SHAPE -> shape(VectorShape.SCALAR_WRITE), CHECK_VILL -> True, CHECK_VSTART -> True)
 
     // The LSU frontend owns these uops (completion, flushes, rs1); masked loads must not overwrite v0
@@ -174,12 +208,21 @@ class VectorPlugin(val layer : LaneLayer, val dlen : Int = 64, var withMemory : 
     // log2 EMUL of an operand class; classes without a group check as one register
     def emulOf(cls : UInt, lmul : SInt) : SInt = cls.mux(
       U(VectorEmul.L) -> lmul.resize(4),
+      U(VectorEmul.L2) -> (lmul.resize(4) - 1),
+      U(VectorEmul.L4) -> (lmul.resize(4) - 2),
       default -> S(0, 4 bits)
     )
     // A register group of 2^log2 registers starts at a multiple of 2^log2
     def aligned(reg : UInt, log2 : SInt) : Bool = {
       val mask = ((U(1, 4 bits) << log2.asUInt.resize(2)) - 1).resize(3)
       log2 <= S(0) || (reg(2 downto 0) & mask) === 0
+    }
+    // Registers occupied by a group: 2^log2, at least one
+    def groupSize(log2 : SInt) : UInt = (log2 <= S(0)) ? U(1, 4 bits) | (U(1, 4 bits) << log2.asUInt.resize(2))
+    // Overlap of two aligned groups; a misaligned group is illegal anyway
+    def overlapped(a : UInt, aLog2 : SInt, b : UInt, bLog2 : SInt) : Bool = {
+      val span = ((aLog2 > bLog2) ? groupSize(aLog2) | groupSize(bLog2)).resize(5)
+      (a & ~(span - 1)) === (b & ~(span - 1))
     }
 
     val e0 = new layer.Execute(0) {
@@ -201,7 +244,17 @@ class VectorPlugin(val layer : LaneLayer, val dlen : Int = 64, var withMemory : 
         val group = !aligned(vd, emulOf(EMUL_VD, lmul)) || !aligned(vs1, emulOf(EMUL_VS1, lmul)) || !aligned(vs2, emulOf(EMUL_VS2, lmul))
         val maskOverlap = MASK_NOT_V0 && !vm && vd === 0
         val mem = MEM && (!emulOk || !aligned(vd, emul.resize(4)))
-        val illegal = vill || vstart || group || maskOverlap || mem
+        // A smaller source may overlap vd only in its highest part, and only with EMUL >= 1 (norm:vreg_overlap_legal)
+        val vdLog2 = emulOf(EMUL_VD, lmul)
+        val vs2Log2 = emulOf(EMUL_VS2, lmul)
+        val highest = vs2Log2 >= S(0) && vs2.resize(6) + groupSize(vs2Log2) === vd.resize(6) + groupSize(vdLog2)
+        val widen = OVERLAP_VS2 === VectorOverlap.WIDEN && overlapped(vd, vdLog2, vs2, vs2Log2) && !highest
+        val range = RANGE.mux(
+          U(VectorRange.EXT2) -> (vtype.vsew === 0),
+          U(VectorRange.EXT4) -> (vtype.vsew < 2),
+          default -> False
+        )
+        val illegal = vill || vstart || group || maskOverlap || mem || widen || range
       }
 
       val sel = isValid && SEL
@@ -285,6 +338,7 @@ class VectorPlugin(val layer : LaneLayer, val dlen : Int = 64, var withMemory : 
         arithmetic.io.cmd.scalar := IMMEDIATE ? Decode.UOP(Const.rs1Range).asSInt.resize(XLEN).asBits | up(elp(IntRegFile, RS1))
         arithmetic.io.cmd.scalarOperand := SCALAR_OPERAND
         arithmetic.io.cmd.unmasked := vm
+        arithmetic.io.cmd.maskData := MASK_DATA
         arithmetic.io.cmd.signed := SIGNED
         arithmetic.io.cmd.saturate := SATURATE
         arithmetic.io.cmd.vxrm := vcs.vxrm
