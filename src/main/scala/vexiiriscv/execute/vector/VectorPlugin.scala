@@ -15,6 +15,13 @@ import vexiiriscv.riscv.Riscv._
 import vexiiriscv.riscv._
 import vexiiriscv.schedule.{DispatchPlugin, ReschedulePlugin}
 
+// EMUL class of a register operand, checked for group alignment at E0
+object VectorEmul {
+  val NONE = 0 // scalar, single register or no operand
+  val L = 1    // EMUL = LMUL
+  def width = 3
+}
+
 case class VectorMemoryDescriptor(indexWidth : Int) extends Bundle {
   val index = UInt(indexWidth bits)
   val last, access = Bool()
@@ -39,14 +46,15 @@ class VectorPlugin(val layer : LaneLayer, val dlen : Int = 64, var withMemory : 
   val VSET = Payload(Bool())
   val VSET_IMM = Payload(Bool()) // vsetivli: AVL from uimm, vtype from zimm10
   val VSET_REG = Payload(Bool()) // vsetvl: vtype from rs2
-  val ARITH, SCALAR_OPERAND, IMMEDIATE, SCALAR_READ, SCALAR_WRITE = Payload(Bool())
+  val ARITH, SCALAR_OPERAND, IMMEDIATE, SIGNED, SATURATE = Payload(Bool())
+  val SHAPE = Payload(UInt(VectorShape.width bits))
   val ALU_OP = Payload(UInt(3 bits))
   val RESULT = Payload(Bits(XLEN bits))
 
   // E0 legality checks, each enabled per uop
   val CHECK_VILL = Payload(Bool())
   val CHECK_VSTART = Payload(Bool())
-  val ALIGN_VD, ALIGN_VS1, ALIGN_VS2 = Payload(Bool()) // register group aligned to LMUL
+  val EMUL_VD, EMUL_VS1, EMUL_VS2 = Payload(UInt(VectorEmul.width bits)) // register group aligned to its EMUL
   val MASK_NOT_V0 = Payload(Bool()) // vm = 0 with vd = v0 is reserved
   val MEM = Payload(Bool()) // Memory micro-op: EMUL = EEW / SEW * LMUL in [1/8, 8], vd/vs3 aligned to it
 
@@ -66,10 +74,12 @@ class VectorPlugin(val layer : LaneLayer, val dlen : Int = 64, var withMemory : 
     val lsuPort = withMemory generate lsu.newVectorLsuPort()
     if (withMemory) lsuRetainer.release()
 
-    val checks = List(VSET, VSET_IMM, VSET_REG, CHECK_VILL, CHECK_VSTART, ALIGN_VD, ALIGN_VS1, ALIGN_VS2, MASK_NOT_V0, MEM,
-      ARITH, SCALAR_OPERAND, IMMEDIATE, SCALAR_READ, SCALAR_WRITE)
+    val checks = List(VSET, VSET_IMM, VSET_REG, CHECK_VILL, CHECK_VSTART, MASK_NOT_V0, MEM,
+      ARITH, SCALAR_OPERAND, IMMEDIATE, SIGNED, SATURATE)
     elp.setDecodingDefault(SEL, False)
     elp.setDecodingDefault(ALU_OP, U(VectorAluOp.ADD, 3 bits))
+    elp.setDecodingDefault(SHAPE, U(VectorShape.SINGLE, VectorShape.width bits))
+    for (key <- List(EMUL_VD, EMUL_VS1, EMUL_VS2)) elp.setDecodingDefault(key, U(VectorEmul.NONE, VectorEmul.width bits))
     for (key <- checks) elp.setDecodingDefault(key, False)
     ds.addMicroOpDecodingDefault(VECTOR, False)
 
@@ -94,19 +104,27 @@ class VectorPlugin(val layer : LaneLayer, val dlen : Int = 64, var withMemory : 
     add(Rvv.VSETIVLI, VSET -> True, VSET_IMM -> True)
     add(Rvv.VSETVL, VSET -> True, VSET_REG -> True)
 
-    for ((name, alu) <- Seq("vadd" -> VectorAluOp.ADD, "vsub" -> VectorAluOp.SUB,
-      "vrsub" -> VectorAluOp.RSUB, "vand" -> VectorAluOp.AND, "vor" -> VectorAluOp.OR, "vxor" -> VectorAluOp.XOR,
-      "vmv.v" -> VectorAluOp.MOVE); form <- Seq("vv", "vx", "vi") if Rvv.all.contains(s"$name.$form") || name == "vmv.v") {
+    def emul(cls : Int) = U(cls, VectorEmul.width bits)
+    def shape(s : Int) = U(s, VectorShape.width bits)
+    // Single-width forms: name, ALU operation, saturating, signed
+    val single = Seq(
+      ("vadd", VectorAluOp.ADD, false, false), ("vsub", VectorAluOp.SUB, false, false), ("vrsub", VectorAluOp.RSUB, false, false),
+      ("vand", VectorAluOp.AND, false, false), ("vor", VectorAluOp.OR, false, false), ("vxor", VectorAluOp.XOR, false, false),
+      ("vmv.v", VectorAluOp.MOVE, false, false),
+      ("vsaddu", VectorAluOp.ADD, true, false), ("vsadd", VectorAluOp.ADD, true, true),
+      ("vssubu", VectorAluOp.SUB, true, false), ("vssub", VectorAluOp.SUB, true, true))
+    for ((name, alu, saturate, signed) <- single; form <- Seq("vv", "vx", "vi") if Rvv.all.contains(s"$name.$form") || name == "vmv.v") {
       val mnemonic = if (name == "vmv.v") s"vmv.v.${form.last}" else s"$name.$form"
       val vector = form == "vv"
-      add(Rvv.all(mnemonic), ARITH -> True, ALU_OP -> U(alu, 3 bits),
+      add(Rvv.all(mnemonic), ARITH -> True, ALU_OP -> U(alu, 3 bits), SATURATE -> Bool(saturate), SIGNED -> Bool(signed),
         SCALAR_OPERAND -> Bool(!vector), IMMEDIATE -> Bool(form == "vi"),
-        CHECK_VILL -> True, CHECK_VSTART -> True, ALIGN_VD -> True,
-        ALIGN_VS1 -> Bool(vector), ALIGN_VS2 -> Bool(name != "vmv.v"), MASK_NOT_V0 -> Bool(name != "vmv.v"))
+        CHECK_VILL -> True, CHECK_VSTART -> True, EMUL_VD -> emul(VectorEmul.L),
+        EMUL_VS1 -> emul(if (vector) VectorEmul.L else VectorEmul.NONE),
+        EMUL_VS2 -> emul(if (name != "vmv.v") VectorEmul.L else VectorEmul.NONE), MASK_NOT_V0 -> Bool(name != "vmv.v"))
     }
-    add(Rvv.all("vmv.x.s"), ARITH -> True, SCALAR_READ -> True, CHECK_VILL -> True, CHECK_VSTART -> True)
+    add(Rvv.all("vmv.x.s"), ARITH -> True, SHAPE -> shape(VectorShape.SCALAR_READ), CHECK_VILL -> True, CHECK_VSTART -> True)
     add(Rvv.all("vmv.s.x"), ARITH -> True, ALU_OP -> U(VectorAluOp.MOVE, 3 bits),
-      SCALAR_OPERAND -> True, SCALAR_WRITE -> True, CHECK_VILL -> True, CHECK_VSTART -> True)
+      SCALAR_OPERAND -> True, SHAPE -> shape(VectorShape.SCALAR_WRITE), CHECK_VILL -> True, CHECK_VSTART -> True)
 
     // The LSU frontend owns these uops (completion, flushes, rs1); masked loads must not overwrite v0
     val memoryOps = for (width <- Seq(8, 16, 32); load <- Seq(true, false)) yield Rvv.all(s"${if (load) "vle" else "vse"}$width.v") -> load
@@ -128,10 +146,13 @@ class VectorPlugin(val layer : LaneLayer, val dlen : Int = 64, var withMemory : 
     val arithmetic = new VectorArithmetic(vrf.p, XLEN)
     vrf.io.write := arithmetic.io.write
     arithmetic.io.v0 := vrf.io.v0
-    for (i <- 0 until 2) {
-      vrf.io.reads(i).cmd := arithmetic.io.reads(i).cmd
-      arithmetic.io.reads(i).rsp := vrf.io.reads(i).rsp
-    }
+    for (i <- 0 until 3) arithmetic.io.reads(i).rsp := vrf.io.reads(i).rsp
+    for (i <- 0 until 2) vrf.io.reads(i).cmd := arithmetic.io.reads(i).cmd
+    // Port C belongs to the arithmetic unit from its command until done, otherwise to the memory side
+    val storeRead = Flow(UInt(vrf.p.addressWidth bits))
+    if (!withMemory) storeRead.setIdle()
+    vrf.io.reads(2).cmd := storeRead
+    when(arithmetic.io.busy) { vrf.io.reads(2).cmd := arithmetic.io.reads(2).cmd }
     for (port <- vrf.io.reads.drop(3)) {
       port.cmd.valid := False
       port.cmd.payload.assignDontCare()
@@ -150,6 +171,11 @@ class VectorPlugin(val layer : LaneLayer, val dlen : Int = 64, var withMemory : 
       ((vreg.resize(vrf.p.addressWidth) << vrf.p.beatWidth) + (offset >> log2Up(vrf.p.beatBytes)).resized).resize(vrf.p.addressWidth)
     val DESCRIPTOR = Payload(VectorMemoryDescriptor(vcs.vstartWidth))
 
+    // log2 EMUL of an operand class; classes without a group check as one register
+    def emulOf(cls : UInt, lmul : SInt) : SInt = cls.mux(
+      U(VectorEmul.L) -> lmul.resize(4),
+      default -> S(0, 4 bits)
+    )
     // A register group of 2^log2 registers starts at a multiple of 2^log2
     def aligned(reg : UInt, log2 : SInt) : Bool = {
       val mask = ((U(1, 4 bits) << log2.asUInt.resize(2)) - 1).resize(3)
@@ -172,7 +198,7 @@ class VectorPlugin(val layer : LaneLayer, val dlen : Int = 64, var withMemory : 
 
         val vill = CHECK_VILL && vtype.vill
         val vstart = CHECK_VSTART && vcs.vstart =/= 0
-        val group = ALIGN_VD && !aligned(vd, lmul) || ALIGN_VS1 && !aligned(vs1, lmul) || ALIGN_VS2 && !aligned(vs2, lmul)
+        val group = !aligned(vd, emulOf(EMUL_VD, lmul)) || !aligned(vs1, emulOf(EMUL_VS1, lmul)) || !aligned(vs2, emulOf(EMUL_VS2, lmul))
         val maskOverlap = MASK_NOT_V0 && !vm && vd === 0
         val mem = MEM && (!emulOk || !aligned(vd, emul.resize(4)))
         val illegal = vill || vstart || group || maskOverlap || mem
@@ -242,7 +268,7 @@ class VectorPlugin(val layer : LaneLayer, val dlen : Int = 64, var withMemory : 
           vcs.vstartWrite.valid := True
           vcs.vstartWrite.payload := 0
         }
-        RESULT := SCALAR_READ ? arithmetic.io.result | vl.resize(XLEN).asBits
+        RESULT := (SHAPE === VectorShape.SCALAR_READ) ? arithmetic.io.result | vl.resize(XLEN).asBits
       }
 
       val sequencer = new Area {
@@ -254,12 +280,14 @@ class VectorPlugin(val layer : LaneLayer, val dlen : Int = 64, var withMemory : 
         arithmetic.io.cmd.vl := vcs.vl
         arithmetic.io.cmd.vstart := vcs.vstart
         arithmetic.io.cmd.sew := vtype.vsew.resized
+        arithmetic.io.cmd.shape := SHAPE
         arithmetic.io.cmd.op := ALU_OP
         arithmetic.io.cmd.scalar := IMMEDIATE ? Decode.UOP(Const.rs1Range).asSInt.resize(XLEN).asBits | up(elp(IntRegFile, RS1))
         arithmetic.io.cmd.scalarOperand := SCALAR_OPERAND
         arithmetic.io.cmd.unmasked := vm
-        arithmetic.io.cmd.scalarRead := SCALAR_READ
-        arithmetic.io.cmd.scalarWrite := SCALAR_WRITE
+        arithmetic.io.cmd.signed := SIGNED
+        arithmetic.io.cmd.saturate := SATURATE
+        arithmetic.io.cmd.vxrm := vcs.vxrm
         elp.freezeWhen(sel && ARITH && !legality.illegal && !completed)
         when(arithmetic.io.cmd.valid) { started := True }
         when(arithmetic.io.done) { completed := True }
@@ -268,6 +296,7 @@ class VectorPlugin(val layer : LaneLayer, val dlen : Int = 64, var withMemory : 
           completed := False
           vcs.vstartWrite.valid := True
           vcs.vstartWrite.payload := 0
+          when(arithmetic.io.saturated) { vcs.vxsatSet := True }
         }
       }
     }
@@ -304,8 +333,8 @@ class VectorPlugin(val layer : LaneLayer, val dlen : Int = 64, var withMemory : 
       // Store data: read the element's word one stage before the LSU captures it; the response holds over freezes
       val read = new layer.Execute(-1) {
         val offset = groupOffset(apply(DESCRIPTOR).index, sizeOf(Decode.UOP))
-        vrf.io.reads(2).cmd.valid := !elp.isFreezed()
-        vrf.io.reads(2).cmd.payload := wordOf(Decode.UOP(Const.rdRange).asUInt, offset)
+        storeRead.valid := !elp.isFreezed()
+        storeRead.payload := wordOf(Decode.UOP(Const.rdRange).asUInt, offset)
       }
 
       val issue = new layer.Execute(0) {
@@ -357,11 +386,8 @@ class VectorPlugin(val layer : LaneLayer, val dlen : Int = 64, var withMemory : 
         when(write.valid) {
           vrf.io.write := write
         }
+        assert(!(write.valid && arithmetic.io.write.valid), "VRF write port requested by the arithmetic unit and a load")
       }
-    }
-    if (!withMemory) {
-      vrf.io.reads(2).cmd.valid := False
-      vrf.io.reads(2).cmd.payload.assignDontCare()
     }
     buildBefore.release()
 
@@ -398,6 +424,7 @@ class VectorPlugin(val layer : LaneLayer, val dlen : Int = 64, var withMemory : 
       val vstart = CombInit(vcs.vstart).simPublic()
       val vxrm = CombInit(vcs.vxrm).simPublic()
       val vxsat = CombInit(vcs.vxsat).simPublic()
+      val vxsatSet = CombInit(vcs.vxsatSet).simPublic()
 
       val trap = host[TrapPlugin].logic.harts(0).trap
       val trapEpc = CombInit(trap.pending.pc).simPublic()

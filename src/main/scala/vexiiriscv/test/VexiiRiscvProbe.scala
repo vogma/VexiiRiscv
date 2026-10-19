@@ -663,6 +663,8 @@ class VexiiRiscvProbe(cpu : VexiiRiscv, kb : Option[konata.Backend], var withRvl
           uop.vectorCsrWrites += 0xC21 -> v.configVtype.toLong
         }
         if (v.vstartValid.toBoolean && !v.memoryComplete.toBoolean) uop.vectorCsrWrites += 0x008 -> v.vstartValue.toLong
+        // Saturation only ever sets the sticky vxsat; report it when it changes
+        if (v.vxsatSet.toBoolean && !v.vxsat.toBoolean) uop.vectorCsrWrites += 0x009 -> 1L
       }
       if(v.memoryComplete.toBoolean && v.vstartValid.toBoolean) {
         val hart = harts(0)
