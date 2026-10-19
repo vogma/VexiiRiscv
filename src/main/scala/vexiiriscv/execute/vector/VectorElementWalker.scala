@@ -3,13 +3,13 @@ package vexiiriscv.execute.vector
 import spinal.core._
 import spinal.lib._
 
-// Steps through the active elements of [vstart, vl), one per advance; vl, vstart, unmasked and v0 must hold meanwhile.
+// Steps through the active elements of [vstart, evl), one per advance; evl, vstart, unmasked and v0 must hold meanwhile.
 class VectorElementWalker(val vlen: Int) extends Component {
   val indexWidth = log2Up(vlen)
   val io = new Bundle {
     val start = in Bool() // load the first active element
     val advance = in Bool() // the current element was issued; has priority over start
-    val vl = in UInt(indexWidth + 1 bits)
+    val evl = in UInt(indexWidth + 1 bits)
     val vstart = in UInt(indexWidth bits)
     val unmasked = in Bool()
     val v0 = in Bits(vlen bits)
@@ -19,7 +19,7 @@ class VectorElementWalker(val vlen: Int) extends Component {
   }
 
   val active = Bits(vlen bits)
-  for (i <- 0 until vlen) active(i) := U(i) >= io.vstart && U(i) < io.vl && (io.unmasked || io.v0(i))
+  for (i <- 0 until vlen) active(i) := U(i) >= io.vstart && U(i) < io.evl && (io.unmasked || io.v0(i))
 
   val index = Reg(UInt(indexWidth bits)) init(0)
   val lastIndex = Reg(UInt(indexWidth bits)) init(0)

@@ -73,10 +73,11 @@ class AguFrontend(
 
   val vectorOps = ArrayBuffer[MicroOp]()
   if (withVector) {
+    import vexiiriscv.riscv._
     layer.lane.setDecodingDefault(VECTOR, False)
-    for (width <- Seq(8, 16, 32); load <- Seq(true, false)) {
-      val op = Rvv.all(s"${if (load) "vle" else "vse"}$width.v")
+    for ((op, load) <- vexiiriscv.execute.vector.VectorMemoryOps.all) {
       add(op).srcs(sk.Op.SRC1, sk.SRC1.RF).decode(dec(VECTOR -> True, LOAD -> Bool(load), STORE -> Bool(!load)))
+      if (op.resources.contains(IntRegFile -> RS2)) layer(op).addRsSpec(RS2, 0)
       vectorOps += op
     }
   }

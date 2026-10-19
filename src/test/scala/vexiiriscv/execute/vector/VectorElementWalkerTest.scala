@@ -33,7 +33,7 @@ class VectorElementWalkerTest extends AnyFunSuite {
         val v0 = mask(random.nextInt(4))
         val expected = (vstart until vl).filter(i => unmasked || v0.testBit(i))
 
-        dut.io.vl #= vl
+        dut.io.evl #= vl
         dut.io.vstart #= vstart
         dut.io.unmasked #= unmasked
         dut.io.v0 #= v0
