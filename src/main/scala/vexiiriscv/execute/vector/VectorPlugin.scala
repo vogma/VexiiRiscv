@@ -241,6 +241,7 @@ class VectorPlugin(val layer : LaneLayer, val dlen : Int = 64, var withMemory : 
     def strided(uop : Bits) : Bool = uop(27 downto 26) === B"10"
     def whole(uop : Bits) : Bool = uop(27 downto 26) === 0 && uop(Const.rs2Range) === 8
     def maskMemory(uop : Bits) : Bool = uop(27 downto 26) === 0 && uop(Const.rs2Range) === 11
+    def faultOnlyFirst(uop : Bits) : Bool = uop(27 downto 26) === 0 && uop(Const.rs2Range) === 16
     def dataSize(uop : Bits) : UInt = indexed(uop) ? vcs.vtype.vsew.resize(2) | sizeOf(uop)
     // Fields per element minus one; whole-register transfers use nf as the register count
     def fieldsOf(uop : Bits) : UInt = whole(uop) ? U(0, 3 bits) | uop(31 downto 29).asUInt
@@ -449,6 +450,10 @@ class VectorPlugin(val layer : LaneLayer, val dlen : Int = 64, var withMemory : 
       val walker = new VectorElementWalker(vlen)
       val resume = RegInit(False) // an element retries after REDO or a TLB refill
       val resumeField = Reg(UInt(3 bits)) init(0) // the field it retries from
+      // Fault-only-first: the trap controller may turn the exception of an element past 0 into a trim,
+      // after which the refetched instruction only writes vl := trimIndex
+      val armed, trim = RegInit(False)
+      val trimIndex = Reg(UInt(vcs.vstartWidth bits)) init(0)
       val inflight = host.list[InflightService].map(_.hasInflight(0)).orR
       // Older instructions have left, so vl, vstart and v0 are final; the first micro-op uses that sample
       walker.io.start := seq.valid && seq.first && !inflight && !seq.fire
@@ -458,6 +463,7 @@ class VectorPlugin(val layer : LaneLayer, val dlen : Int = 64, var withMemory : 
       count := vcs.vl
       when(maskMemory(seq.uop)) { count := ((vcs.vl.resize(vlWidth + 1) + 7) >> 3).resized }
       when(whole(seq.uop)) { count := ((nreg << (log2Up(vlen) - 3)) >> sizeOf(seq.uop)).resized }
+      when(trim) { count := 0 }
       walker.io.evl := count
       walker.io.vstart := vcs.vstart
       walker.io.unmasked := seq.uop(25)
@@ -535,11 +541,15 @@ class VectorPlugin(val layer : LaneLayer, val dlen : Int = 64, var withMemory : 
 
         // Any element trap restarts at that element (norm:vector_ls_vstart); the last one completes the instruction
         when(rsp.valid && legal) {
+          val refill = !rsp.trap.exception && rsp.trap.code === TrapReason.MMU_REFILL
+          val arm = rsp.trap.valid && faultOnlyFirst(Decode.UOP) && d.index =/= 0 && (rsp.trap.exception || refill)
+          armed := arm
           when(rsp.trap.valid) {
             vcs.vstartWrite.valid := True
             vcs.vstartWrite.payload := d.index
-            val retry = !rsp.trap.exception && (rsp.trap.code === TrapReason.REDO || rsp.trap.code === TrapReason.MMU_REFILL)
-            resume := retry
+            trimIndex := d.index
+            val retry = !rsp.trap.exception && (rsp.trap.code === TrapReason.REDO || refill)
+            resume := retry || arm
             // A retry continues at the faulting field; an architectural trap restarts the element from its first field
             resumeField := retry ? d.field | U(0, 3 bits)
           } elsewhen(rsp.last) {
@@ -547,6 +557,13 @@ class VectorPlugin(val layer : LaneLayer, val dlen : Int = 64, var withMemory : 
             vcs.vstartWrite.payload := 0
             resume := False
             resumeField := 0
+            // norm:vector_ff_op: vl := index of the faulting element, vtype unchanged
+            when(trim) {
+              vcs.configWrite.valid := True
+              vcs.configWrite.vl := trimIndex.resized
+              vcs.configWrite.vtype := vcs.vtype
+              trim := False
+            }
           }
         }
         when(write.valid) {
@@ -561,18 +578,44 @@ class VectorPlugin(val layer : LaneLayer, val dlen : Int = 64, var withMemory : 
     val interruptHold = withMemory generate new Area {
       val tp = host[TrapPlugin]
       val pp = host[PrivilegedPlugin]
-      when(tp.api.harts(0).rvTrap) {
+      def clear() : Unit = {
         memory.resume := False
         memory.resumeField := 0
+        memory.armed := False
+        memory.trim := False
       }
+      when(tp.api.harts(0).rvTrap) { clear() }
       if (pp.p.withDebug) {
         val fsm = tp.logic.harts(0).trap.fsm
-        when(fsm.isActive(fsm.ENTER_DEBUG)) {
-          memory.resume := False
-          memory.resumeField := 0
-        }
+        when(fsm.isActive(fsm.ENTER_DEBUG)) { clear() }
       }
       when(memory.resume) { pp.inhibateInterrupts(0) }
+    }
+
+    // Fault-only-first: an armed element's exception, from the LSU or the page walker, refetches the instruction
+    val trimControl = withMemory generate new Area {
+      val trap = host[TrapPlugin].logic.harts(0).trap
+      val fsm = trap.fsm
+      def convert() : Unit = {
+        trap.pending.state.exception := False
+        host[TrapPlugin].api.harts(0).redo := True
+        memory.armed := False
+        memory.trim := True
+        fsm.goto(fsm.JUMP)
+      }
+      fsm.COMPUTE.whenIsActiveWithPriority(1) {
+        when(memory.armed && trap.pending.state.exception) {
+          fsm.jumpOffset := 0 // exception codes alias TrapReason.NEXT and others
+          convert()
+        }
+      }
+      if (fsm.ATS_RSP != null) fsm.ATS_RSP.whenIsActiveWithPriority(1) {
+        val rsp = fsm.atsPorts.refill.rsp
+        when(memory.armed && rsp.valid && (rsp.pageFault || rsp.accessFault)) {
+          rsp.ready := True
+          convert()
+        }
+      }
     }
 
     // Simulation taps for the probe

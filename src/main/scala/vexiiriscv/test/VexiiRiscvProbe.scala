@@ -281,6 +281,10 @@ class VexiiRiscvProbe(cpu : VexiiRiscv, kb : Option[konata.Backend], var withRvl
       require(record.vstart.nonEmpty, "vector memory boundary has no final vstart")
       for((reg, mask, data) <- record.writes) backends.foreach(_.writeVrf(hartId, reg, mask, data))
       record.vstart.foreach(value => backends.foreach(_.writeRf(hartId, 5, 0x008, BigInt(value).toBytes(64))))
+      for((vl, vtype) <- record.config) {
+        backends.foreach(_.writeRf(hartId, 5, 0xC20, BigInt(vl).toBytes(64)))
+        backends.foreach(_.writeRf(hartId, 5, 0xC21, BigInt(vtype).toBytes(64)))
+      }
       for(access <- record.stores) {
         access.checked = true
         if(access.broadcast) liveVectorStoreIds -= access.id
@@ -345,6 +349,7 @@ class VexiiRiscvProbe(cpu : VexiiRiscv, kb : Option[konata.Backend], var withRvl
     val loads, stores = ArrayBuffer[VectorAccess]()
     val writes = ArrayBuffer[(Int, Array[Byte], Array[Byte])]()
     var vstart = Option.empty[Long]
+    var config = Option.empty[(Long, Long)] // vl and vtype of a fault-only-first trim
   }
 
   class MicroOpCtx() {
@@ -658,7 +663,7 @@ class VexiiRiscvProbe(cpu : VexiiRiscv, kb : Option[konata.Backend], var withRvl
       if (v.fire.toBoolean) {
         val uop = harts(0).microOp(v.uopId.toInt)
         uop.vectorValid = true
-        if (v.configValid.toBoolean) {
+        if (v.configValid.toBoolean && !v.memoryComplete.toBoolean) {
           uop.vectorCsrWrites += 0xC20 -> v.configVl.toLong
           uop.vectorCsrWrites += 0xC21 -> v.configVtype.toLong
         }
@@ -669,6 +674,10 @@ class VexiiRiscvProbe(cpu : VexiiRiscv, kb : Option[konata.Backend], var withRvl
       if(v.memoryComplete.toBoolean && v.vstartValid.toBoolean) {
         val hart = harts(0)
         hart.openVector(hart.microOp(v.memoryUopId.toInt)).vstart = Some(v.vstartValue.toLong)
+      }
+      if(v.memoryComplete.toBoolean && v.configValid.toBoolean) {
+        val hart = harts(0)
+        hart.openVector(hart.microOp(v.memoryUopId.toInt)).config = Some((v.configVl.toLong, v.configVtype.toLong))
       }
       // VS only changes under the oldest instruction in flight, before its commit
       val hart = harts(0)
