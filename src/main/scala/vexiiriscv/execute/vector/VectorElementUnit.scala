@@ -17,12 +17,20 @@ object VectorElementOp {
   val CPOP = 9
   val FIRST = 10
   val IOTA = 11
-  def width = 4
+  val SLIDEUP = 12
+  val SLIDEDOWN = 13
+  val SLIDE1UP = 14
+  val SLIDE1DOWN = 15
+  val GATHER = 16
+  val GATHEREI16 = 17
+  val COMPRESS = 18
+  def width = 5
 }
 
 case class VectorElementCmd(p: VectorRegFileParam, xlen: Int) extends Bundle {
   val vd, vs1, vs2 = UInt(5 bits)
   val vl = UInt(log2Up(p.vlen) + 1 bits)
+  val vlmax = UInt(log2Up(p.vlen) + 1 bits)
   val sew = UInt(2 bits)
   val op = UInt(VectorElementOp.width bits)
   val scalar = Bits(xlen bits)
@@ -53,6 +61,7 @@ class VectorElementUnit(val p: VectorRegFileParam, val xlen: Int) extends Compon
   val widen = is(VectorElementOp.WMUL) || is(VectorElementOp.WMACC)
   val divide = is(VectorElementOp.DIV) || is(VectorElementOp.REM)
   val scan = is(VectorElementOp.CPOP) || is(VectorElementOp.FIRST) || is(VectorElementOp.IOTA)
+  val permute = command.op >= VectorElementOp.SLIDEUP
   val count = Reg(UInt(log2Up(p.vlen) + 1 bits)) init(0)
   val result = Reg(Bits(xlen bits))
   io.result := result
@@ -82,7 +91,7 @@ class VectorElementUnit(val p: VectorRegFileParam, val xlen: Int) extends Compon
   }
 
   val issue = new Area {
-    val advance = running && !divPending
+    val advance = running && !divPending && !permute
     val active = advance && command.vl =/= 0 && (command.unmasked || io.v0(index))
     val last = advance && (command.vl === 0 || index.resize(offsetWidth) + 1 >= command.vl)
     val offset = (index.resize(offsetWidth) << command.sew).resize(offsetWidth)
@@ -238,7 +247,87 @@ class VectorElementUnit(val p: VectorRegFileParam, val xlen: Int) extends Compon
     io.write.mask := mask
   }
 
+  // Gather indices are read first; the following cycle reads the selected data word.
+  val permutation = new Area {
+    val gather = is(VectorElementOp.GATHER) || is(VectorElementOp.GATHEREI16)
+    val compress = is(VectorElementOp.COMPRESS)
+    val vectorIndex = gather && !command.scalarOperand
+    val indexSew = is(VectorElementOp.GATHEREI16) ? U(1, 2 bits) | command.sew
+    val advance = running && permute
+    val active = advance && command.vl =/= 0 && (compress || command.unmasked || io.v0(index))
+    val last = advance && (command.vl === 0 || index.resize(offsetWidth) + 1 >= command.vl)
+    val indexOffset = (index.resize(offsetWidth) << indexSew).resize(offsetWidth)
+    val maskOffset = index.resize(offsetWidth) >> 3
+    when(permute) {
+      io.reads(0).cmd.valid := active && (vectorIndex || compress)
+      io.reads(0).cmd.payload := word(command.vs1, compress ? maskOffset | indexOffset)
+      io.reads(1).cmd.valid := False
+      io.reads(2).cmd.valid := False
+    }
+    when(advance) {
+      index := index + 1
+      when(last) { running := False }
+    }
+
+    val valid1 = RegNext(active) init(False)
+    val last1 = RegNext(last) init(False)
+    val index1 = RegNext(index)
+    val byte1 = RegNext(indexOffset.resize(log2Up(p.beatBytes)))
+    val rawIndex = (io.reads(0).rsp >> (byte1 << 3)).resize(32)
+    val selectedIndex = indexSew.mux(U(0) -> rawIndex(7 downto 0).asUInt.resize(xlen),
+      U(1) -> rawIndex(15 downto 0).asUInt.resize(xlen), default -> rawIndex.asUInt.resize(xlen))
+    val offset = (vectorIndex ? selectedIndex | command.scalar.asUInt).resize(xlen + 1)
+    val source = UInt(xlen + 1 bits)
+    val keep = Bool()
+    val scalar = Bool()
+    source := index1.resize(xlen + 1)
+    keep := True
+    scalar := False
+    switch(command.op) {
+      spinal.core.is(VectorElementOp.SLIDEUP) { source := index1.resize(xlen + 1) - offset; keep := index1.resize(xlen + 1) >= offset }
+      spinal.core.is(VectorElementOp.SLIDEDOWN) { source := index1.resize(xlen + 1) + offset }
+      spinal.core.is(VectorElementOp.SLIDE1UP) { source := index1.resize(xlen + 1) - 1; scalar := index1 === 0 }
+      spinal.core.is(VectorElementOp.SLIDE1DOWN) { source := index1.resize(xlen + 1) + 1; scalar := index1.resize(offsetWidth) + 1 === command.vl }
+      spinal.core.is(VectorElementOp.GATHER) { source := offset }
+      spinal.core.is(VectorElementOp.GATHEREI16) { source := offset }
+    }
+    val selected = !compress || io.reads(0).rsp(index1.resize(6))
+    val write1 = valid1 && keep && selected
+    val inRange = source < command.vlmax.resize(xlen + 1)
+    val sourceOffset = (source.resize(offsetWidth) << command.sew).resize(offsetWidth)
+    val dest = compress ? count | index1.resize(offsetWidth)
+    val destOffset = (dest << command.sew).resize(offsetWidth)
+    when(permute) {
+      io.reads(1).cmd.valid := write1 && inRange && !scalar
+      io.reads(1).cmd.payload := word(command.vs2, sourceOffset)
+    }
+    when(permute && valid1 && compress && selected) { count := count + 1 }
+
+    val valid2 = RegNext(write1) init(False)
+    val last2 = RegNext(last1) init(False)
+    val byte2 = RegNext(sourceOffset.resize(log2Up(p.beatBytes)))
+    val destByte2 = RegNext(destOffset.resize(log2Up(p.beatBytes)))
+    val address2 = RegNext(word(command.vd, destOffset))
+    val zero2 = RegNext(!inRange)
+    val scalar2 = RegNext(scalar)
+    val data2 = scalar2 ? command.scalar.resize(32) | (zero2 ? B(0, 32 bits) | (io.reads(1).rsp >> (byte2 << 3)).resize(32))
+    val replicated = command.sew.mux(U(0) -> (data2(7 downto 0) #* 8),
+      U(1) -> (data2(15 downto 0) #* 4), default -> (data2 #* 2))
+    val bytes = command.sew.mux(U(0) -> B"0001", U(1) -> B"0011", default -> B"1111")
+    val valid3 = RegNext(valid2) init(False)
+    val last3 = RegNext(last2) init(False)
+    val address3 = RegNext(address2)
+    val data3 = RegNext(replicated)
+    val mask3 = RegNext((bytes.resize(p.beatBytes) << destByte2).resize(p.beatBytes))
+    when(permute) {
+      io.write.valid := valid3
+      io.write.address := address3
+      io.write.data := data3
+      io.write.mask := mask3
+    }
+  }
+
   // The VRF holds every written element when done rises
-  io.done := RegNext(writeback.last) init(False)
+  io.done := RegNext(writeback.last || permutation.last3) init(False)
   when(io.done) { busy := False }
 }

@@ -79,7 +79,7 @@ class VectorElementUnitTest extends AnyFunSuite {
       dut.clockDomain.fallingEdge()
       val cmd = dut.io.cmd
       cmd.valid #= false
-      cmd.vd #= 0; cmd.vs1 #= 0; cmd.vs2 #= 0; cmd.vl #= 0; cmd.sew #= 0; cmd.op #= 0; cmd.scalar #= 0
+      cmd.vd #= 0; cmd.vs1 #= 0; cmd.vs2 #= 0; cmd.vl #= 0; cmd.vlmax #= 0; cmd.sew #= 0; cmd.op #= 0; cmd.scalar #= 0
       cmd.scalarOperand #= false; cmd.unmasked #= true; cmd.signed #= false; cmd.signedVs1 #= false
       cmd.negate #= false; cmd.vxrm #= 0
       dut.io.debug #= true

@@ -23,6 +23,7 @@ object VectorEmul {
   val L4 = 3   // EMUL = LMUL / 4
   val N = 4    // EMUL = NREG of vmv<nr>r.v
   val W = 5    // EMUL = 2 * LMUL
+  val INDEX16 = 6 // EEW 16 gather indices
   def width = 3
 }
 
@@ -262,6 +263,22 @@ class VectorPlugin(val layer : LaneLayer, val dlen : Int = 64, var withMemory : 
         EMUL_VD -> emul(if (iota) VectorEmul.L else VectorEmul.NONE),
         OVERLAP_VS2 -> overlap(if (iota) VectorOverlap.DISJOINT else VectorOverlap.ANY))
     }
+    // Permutes share element writes; only downward slides allow source/destination overlap.
+    for ((name, op) <- Seq(("vslideup", VectorElementOp.SLIDEUP), ("vslidedown", VectorElementOp.SLIDEDOWN),
+         ("vslide1up", VectorElementOp.SLIDE1UP), ("vslide1down", VectorElementOp.SLIDE1DOWN),
+         ("vrgather", VectorElementOp.GATHER), ("vrgatherei16", VectorElementOp.GATHEREI16),
+         ("vcompress", VectorElementOp.COMPRESS)); form <- Seq("vv", "vx", "vi", "vm") if Rvv.all.contains(s"$name.$form")) {
+      val gather = name.startsWith("vrgather")
+      val compress = name == "vcompress"
+      val vector = form == "vv"
+      val disjoint = gather || compress || name == "vslideup" || name == "vslide1up"
+      add(Rvv.all(s"$name.$form"), ELEMENT -> True, ELEMENT_OP -> U(op, VectorElementOp.width bits),
+        SCALAR_OPERAND -> Bool(!vector && !compress), IMMEDIATE -> Bool(form == "vi"),
+        CHECK_VILL -> True, CHECK_VSTART -> True, EMUL_VD -> emul(VectorEmul.L), EMUL_VS2 -> emul(VectorEmul.L),
+        EMUL_VS1 -> emul(if (name == "vrgatherei16") VectorEmul.INDEX16 else if (vector) VectorEmul.L else VectorEmul.NONE),
+        MASK_NOT_V0 -> True, OVERLAP_VS2 -> overlap(if (disjoint) VectorOverlap.DISJOINT else VectorOverlap.ANY),
+        OVERLAP_VS1 -> overlap(if (vector || compress) VectorOverlap.DISJOINT else VectorOverlap.ANY))
+    }
     add(Rvv.all("vmv.x.s"), ARITH -> True, SHAPE -> shape(VectorShape.SCALAR_READ), CHECK_VILL -> True, CHECK_VSTART -> True)
     add(Rvv.all("vmv.s.x"), ARITH -> True, ALU_OP -> alu(VectorAluOp.MOVE),
       SCALAR_OPERAND -> True, SHAPE -> shape(VectorShape.SCALAR_WRITE), CHECK_VILL -> True, CHECK_VSTART -> True)
@@ -353,6 +370,7 @@ class VectorPlugin(val layer : LaneLayer, val dlen : Int = 64, var withMemory : 
       U(VectorEmul.L4) -> (lmul.resize(4) - 2),
       U(VectorEmul.N) -> nreg,
       U(VectorEmul.W) -> (lmul.resize(4) + 1),
+      U(VectorEmul.INDEX16) -> (lmul.resize(4) + 1 - vcs.vtype.vsew.resize(4).asSInt),
       default -> S(0, 4 bits)
     )
     // A register group of 2^log2 registers starts at a multiple of 2^log2
@@ -416,7 +434,9 @@ class VectorPlugin(val layer : LaneLayer, val dlen : Int = 64, var withMemory : 
         // A smaller vd may overlap a source group only at its base (norm:vreg_overlap_legal)
         val baseVs2 = OVERLAP_VS2 === VectorOverlap.BASE && overlapped(vd, vdLog2, vs2, vs2Log2) && vd =/= vs2
         val baseVs1 = OVERLAP_VS1 === VectorOverlap.BASE && overlapped(vd, vdLog2, vs1, vs1Log2) && vd =/= vs1
-        val disjoint = OVERLAP_VS2 === VectorOverlap.DISJOINT && overlapped(vd, vdLog2, vs2, vs2Log2)
+        val disjoint = OVERLAP_VS2 === VectorOverlap.DISJOINT && overlapped(vd, vdLog2, vs2, vs2Log2) ||
+          OVERLAP_VS1 === VectorOverlap.DISJOINT && overlapped(vd, vdLog2, vs1, vs1Log2)
+        val indexRange = EMUL_VS1 === VectorEmul.INDEX16 && (vs1Log2 < -3 || vs1Log2 > 3)
         val range = RANGE.mux(
           U(VectorRange.EXT2) -> (vtype.vsew === 0),
           U(VectorRange.EXT4) -> (vtype.vsew < 2),
@@ -424,7 +444,7 @@ class VectorPlugin(val layer : LaneLayer, val dlen : Int = 64, var withMemory : 
           U(VectorRange.WIDE_SCALAR) -> (vtype.vsew === 2),
           default -> False
         )
-        val illegal = vill || vstart || group || maskOverlap || mem || widen || baseVs2 || baseVs1 || disjoint || range
+        val illegal = vill || vstart || group || maskOverlap || mem || widen || baseVs2 || baseVs1 || disjoint || indexRange || range
       }
 
       val sel = isValid && SEL
@@ -518,9 +538,10 @@ class VectorPlugin(val layer : LaneLayer, val dlen : Int = 64, var withMemory : 
         element.io.cmd.vs1 := vs1
         element.io.cmd.vs2 := vs2
         element.io.cmd.vl := vcs.vl
+        element.io.cmd.vlmax := vlmaxOf(vtype.vsew, vtype.vlmul)
         element.io.cmd.sew := vtype.vsew.resized
         element.io.cmd.op := ELEMENT_OP
-        element.io.cmd.scalar := up(elp(IntRegFile, RS1))
+        element.io.cmd.scalar := IMMEDIATE ? Decode.UOP(19 downto 15).resize(XLEN) | up(elp(IntRegFile, RS1))
         element.io.cmd.scalarOperand := SCALAR_OPERAND
         element.io.cmd.unmasked := vm
         element.io.cmd.signed := SIGNED
