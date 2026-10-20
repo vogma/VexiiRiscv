@@ -40,7 +40,8 @@ object VectorRange {
   val EXT2 = 1 // SEW >= 16; the source EMUL is always legal for a legal vtype
   val EXT4 = 2 // SEW >= 32
   val WIDE = 3 // SEW <= 16 and LMUL <= 4
-  def width = 2
+  val WIDE_SCALAR = 4 // SEW <= 16 for a single 2 * SEW element, whatever LMUL
+  def width = 3
 }
 
 case class VectorMemoryDescriptor(indexWidth : Int) extends Bundle {
@@ -239,6 +240,16 @@ class VectorPlugin(val layer : LaneLayer, val dlen : Int = 64, var withMemory : 
         OVERLAP_VS1 -> overlap(if (wide && vector) VectorOverlap.WIDEN else VectorOverlap.ANY),
         RANGE -> U(if (wide) VectorRange.WIDE else VectorRange.ANY, VectorRange.width bits))
     }
+    // Reductions into element 0 of vd: only vs2 is a group; vd = v0 is legal when masked (norm:vreduction_vd_overlap_vs)
+    for ((name, op, signed) <- Seq(("vredsum", VectorAluOp.ADD, false), ("vredand", VectorAluOp.AND, false),
+         ("vredor", VectorAluOp.OR, false), ("vredxor", VectorAluOp.XOR, false), ("vredminu", VectorAluOp.MIN, false),
+         ("vredmin", VectorAluOp.MIN, true), ("vredmaxu", VectorAluOp.MAX, false), ("vredmax", VectorAluOp.MAX, true),
+         ("vwredsumu", VectorAluOp.ADD, false), ("vwredsum", VectorAluOp.ADD, true))) {
+      val wide = name.startsWith("vw")
+      add(Rvv.all(s"$name.vs"), ARITH -> True, SHAPE -> shape(if (wide) VectorShape.WREDUCE else VectorShape.REDUCE),
+        ALU_OP -> alu(op), SIGNED -> Bool(signed), CHECK_VILL -> True, CHECK_VSTART -> True, EMUL_VS2 -> emul(VectorEmul.L),
+        RANGE -> U(if (wide) VectorRange.WIDE_SCALAR else VectorRange.ANY, VectorRange.width bits))
+    }
     add(Rvv.all("vmv.x.s"), ARITH -> True, SHAPE -> shape(VectorShape.SCALAR_READ), CHECK_VILL -> True, CHECK_VSTART -> True)
     add(Rvv.all("vmv.s.x"), ARITH -> True, ALU_OP -> alu(VectorAluOp.MOVE),
       SCALAR_OPERAND -> True, SHAPE -> shape(VectorShape.SCALAR_WRITE), CHECK_VILL -> True, CHECK_VSTART -> True)
@@ -397,6 +408,7 @@ class VectorPlugin(val layer : LaneLayer, val dlen : Int = 64, var withMemory : 
           U(VectorRange.EXT2) -> (vtype.vsew === 0),
           U(VectorRange.EXT4) -> (vtype.vsew < 2),
           U(VectorRange.WIDE) -> (vtype.vsew === 2 || vtype.vlmul === B"011"),
+          U(VectorRange.WIDE_SCALAR) -> (vtype.vsew === 2),
           default -> False
         )
         val illegal = vill || vstart || group || maskOverlap || mem || widen || baseVs2 || baseVs1 || range

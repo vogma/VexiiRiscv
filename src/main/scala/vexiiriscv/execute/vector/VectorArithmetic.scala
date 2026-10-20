@@ -61,6 +61,10 @@ object VectorShape {
   val WIDE_VV = 8      // vd at 2*SEW: step k writes word k from half k mod 2 of word k/2 of vs2 and vs1
   val WIDE_WV = 9      // vd and vs2 at 2*SEW: step k on word k of both, half k mod 2 of word k/2 of vs1
   val NARROW = 10      // vs2 at 2*SEW: step k reads its word k and half k mod 2 of word k/2 of vs1, writes half k mod 2 of word k/2 of vd
+  // Reductions into element 0 of vd: step k folds word k of vs2 (WREDUCE: half k mod 2 of word k/2, extended to 2*SEW)
+  // into an accumulator that starts from element 0 of vs1, then the accumulator lanes fold into lane 0
+  val REDUCE = 11
+  val WREDUCE = 12
   def width = 4
 }
 
@@ -104,9 +108,11 @@ class VectorArithmetic(val p: VectorRegFileParam, val xlen: Int) extends Compone
   val wideVv = command.shape === VectorShape.WIDE_VV
   val widening = wideVv || command.shape === VectorShape.WIDE_WV
   val narrow = command.shape === VectorShape.NARROW
-  // log2 bytes of a destination element, and of the lanes the adder and shifter work on
-  val dstSew = command.sew + U(widening)
-  val laneSew = command.sew + U(widening || narrow)
+  val wreduce = command.shape === VectorShape.WREDUCE
+  val reduce = wreduce || command.shape === VectorShape.REDUCE
+  // log2 bytes of a destination element (of a source element for reductions), and of the adder and shifter lanes
+  val dstSew = command.sew + U(widening || wreduce)
+  val laneSew = command.sew + U(widening || narrow || wreduce)
   val index = command.op === VectorAluOp.INDEX
   val subtract = command.op === VectorAluOp.SUB || command.op === VectorAluOp.RSUB ||
     command.op === VectorAluOp.MIN || command.op === VectorAluOp.MAX ||
@@ -118,7 +124,10 @@ class VectorArithmetic(val p: VectorRegFileParam, val xlen: Int) extends Compone
   val running = RegInit(False)
   val busy = RegInit(False)
   val saturated = RegInit(False)
-  val step = Reg(UInt(log2Up(p.beatsPerReg * 8) bits)) init(0)
+  val step = Reg(UInt(log2Up(p.beatsPerReg * 16) bits)) init(0)
+  // Reductions: after the last step, one fold per halving of the accumulator down to one lane
+  val folding = RegInit(False)
+  val fold = Reg(UInt(2 bits)) init(0)
   val result = Reg(Bits(xlen bits))
   io.result := result
   io.busy := busy
@@ -136,6 +145,8 @@ class VectorArithmetic(val p: VectorRegFileParam, val xlen: Int) extends Compone
     busy := True
     saturated := False
     step := 0
+    folding := False
+    fold := 0
   }
 
   val issue = new Area {
@@ -151,30 +162,37 @@ class VectorArithmetic(val p: VectorRegFileParam, val xlen: Int) extends Compone
     }
     val wide = step.resize(log2Up(p.vlen) + 7)
     val nextElement = (maskMm ? ((wide + 1) << 6) | (((wide + 1) << 3) >> laneSew)).resize(log2Up(p.vlen) + 7)
-    // Mask shapes issue every step up to the last one, so the old destination word is always read
-    val active = running && (enables.orR || scalarRead || (maskDst || maskMm) && command.vl =/= 0)
+    // Mask shapes issue every step up to the last one, so the old destination word is always read; reductions
+    // always fold vs1 and write, unless vl is zero (norm:vreduction_vl_0)
+    val active = running && (enables.orR || scalarRead || (maskDst || maskMm || reduce) && command.vl =/= 0)
     val wholeLast = (wide + 1) === (command.nreg.resize(wide.getWidth) << p.beatWidth)
-    val last = running && (scalarRead || scalarWrite || (whole ? wholeLast | nextElement >= command.vl))
+    val stepsDone = nextElement >= command.vl
+    val foldLast = fold === (U(2, 2 bits) - laneSew.resize(2))
+    val last = running && (scalarRead || scalarWrite || (whole ? wholeLast |
+      (reduce ? (command.vl === 0 || folding && foldLast) | stepsDone)))
     // MASK_DST: position of this step's result bits in the destination mask word, and that word
     val offset = ((wide << 3) >> command.sew).resize(6)
     val nextOffset = (((wide + 1) << 3) >> command.sew).resize(6)
     val maskWord = (step >> 3) >> command.sew
-    val wordLast = !maskDst || last || nextOffset === 0
+    val wordLast = reduce ? last | (!maskDst || last || nextOffset === 0)
     // MASK_MM: body bits of this word; mask/mask commands start at element 0, E0 traps a nonzero vstart
     val rest = command.vl.resize(wide.getWidth) - (wide << 6).resize(wide.getWidth)
     val bodyBits = (rest >= 64) ? U(64, 7 bits) | rest.resize(7)
 
     // Ports A, B and C; scalar reads always use vs2, including when vl is zero
-    io.reads(0).cmd.valid := active && (scalarRead || !scalarWrite && command.op =/= VectorAluOp.MOVE && !index)
-    io.reads(0).cmd.payload := word(command.vs2, ext4 ? (step >> 2) | ((ext2 || wideVv) ? (step >> 1) | step))
-    io.reads(1).cmd.valid := active && !command.scalarOperand && !scalarRead && !ext2 && !ext4 && !whole && !index
-    io.reads(1).cmd.payload := word(command.vs1, (widening || narrow) ? (step >> 1) | step)
+    io.reads(0).cmd.valid := active && !folding && (scalarRead || !scalarWrite && command.op =/= VectorAluOp.MOVE && !index)
+    io.reads(0).cmd.payload := word(command.vs2, ext4 ? (step >> 2) | ((ext2 || wideVv || wreduce) ? (step >> 1) | step))
+    io.reads(1).cmd.valid := active && !command.scalarOperand && !scalarRead && !ext2 && !ext4 && !whole && !index &&
+      (!reduce || step === 0 && !folding)
+    io.reads(1).cmd.payload := word(command.vs1, reduce ? U(0, step.getWidth bits) | ((widening || narrow) ? (step >> 1) | step))
     // The old destination word, whose bits outside the result are kept (norm:vreg_mask_tail_agn, P3)
     io.reads(2).cmd.valid := active && (maskMm || maskDst && offset === 0)
     io.reads(2).cmd.payload := word(command.vd, maskDst ? maskWord.resize(step.getWidth) | step)
 
     when(running) {
-      step := step + 1
+      when(!folding) { step := step + 1 }
+      when(reduce && stepsDone) { folding := True }
+      when(folding) { fold := fold + 1 }
       when(last) { running := False }
     }
   }
@@ -183,7 +201,8 @@ class VectorArithmetic(val p: VectorRegFileParam, val xlen: Int) extends Compone
   val x1 = new Area {
     val valid = RegNext(issue.active) init(False)
     val last = RegNext(issue.last) init(False)
-    val address = RegNext(word(command.vd, maskDst ? issue.maskWord.resize(step.getWidth) | issue.dstWord))
+    val address = RegNext(word(command.vd, maskDst ? issue.maskWord.resize(step.getWidth) |
+      (reduce ? U(0, step.getWidth bits) | issue.dstWord)))
     val mask = RegNext(issue.enables)
     val selects = RegNext(issue.selects)
     val part = RegNext(step(1 downto 0))
@@ -191,6 +210,9 @@ class VectorArithmetic(val p: VectorRegFileParam, val xlen: Int) extends Compone
     val offset = RegNext(issue.offset)
     val wordLast = RegNext(issue.wordLast)
     val bodyBits = RegNext(issue.bodyBits)
+    val first = RegNext(step === 0 && !folding)
+    val folds = RegNext(folding)
+    val foldIndex = RegNext(fold)
     val old = io.reads(2).rsp
 
     val scalarBeat = command.sew.mux(
@@ -212,11 +234,34 @@ class VectorArithmetic(val p: VectorRegFileParam, val xlen: Int) extends Compone
       val half = v.subdivideIn(32 bits)(part(0 downto 0))
       (command.sew === 0) ? extend(half, 1, 2) | extend(half, 2, 4)
     }
+    // Reduction identity of every lane: 0 for sum, or, xor and maxu, all ones for and and minu, INT_MAX for min,
+    // INT_MIN for max (norm:vredsum_vredmaxu_vredmax_vredminu_vredmin_vredand_vredor_vredxor_op)
+    val identity = Bits(64 bits)
+    for (j <- 0 until 8) {
+      val top = topOf(j) === U(j, 3 bits)
+      identity(j * 8, 8 bits) := command.op.mux(
+        U(VectorAluOp.AND) -> B"xff",
+        U(VectorAluOp.MIN) -> (command.signed ? (top ? B"x7f" | B"xff") | B"xff"),
+        U(VectorAluOp.MAX) -> ((command.signed && top) ? B"x80" | B"x00"),
+        default -> B"x00"
+      )
+    }
+    // Reductions: a = the active elements of the step (identity elsewhere, norm:vreduction_scalar_disregard_maskval),
+    // or the upper part of the accumulator during folds; b = the accumulator, at step 0 vs1[0] and identities
+    val partial = Reg(Bits(64 bits))
+    val elements = wreduce ? widen(io.reads(0).rsp) | io.reads(0).rsp
+    val upperPart = foldIndex.mux(U(0) -> (partial |>> 32), U(1) -> (partial |>> 16), default -> (partial |>> 8))
+    val reduceA, reduceB = Bits(64 bits)
+    for (j <- 0 until 8) {
+      reduceA(j * 8, 8 bits) := folds ? upperPart(j * 8, 8 bits) | (mask(j) ? elements(j * 8, 8 bits) | identity(j * 8, 8 bits))
+      val scalarByte = (U(j, 3 bits) >> laneSew) === 0
+      reduceB(j * 8, 8 bits) := first ? (scalarByte ? io.reads(1).rsp(j * 8, 8 bits) | identity(j * 8, 8 bits)) | partial(j * 8, 8 bits)
+    }
     // Widening extends the SEW operands to 2*SEW (norm:vwaddu_vwadd_vwsubu_vwsub_op); narrowing places each
     // SEW shift amount in the low bits of its 2*SEW lane
-    val a = wideVv ? widen(io.reads(0).rsp) | io.reads(0).rsp
+    val a = reduce ? reduceA | (wideVv ? widen(io.reads(0).rsp) | io.reads(0).rsp)
     val narrowB = command.scalarOperand ? scalarBeat | io.reads(1).rsp
-    val b = (widening || narrow) ? widen(narrowB) | narrowB
+    val b = reduce ? reduceB | ((widening || narrow) ? widen(narrowB) | narrowB)
     val left = (command.op === VectorAluOp.RSUB) ? b | a
     val right = (command.op === VectorAluOp.RSUB) ? a | b
     val sum = Bits(64 bits)
@@ -299,6 +344,7 @@ class VectorArithmetic(val p: VectorRegFileParam, val xlen: Int) extends Compone
       default -> sum
     )
     val output = whole ? a | ((ext2 || ext4) ? extended | data)
+    when(valid && reduce) { partial := data }
     val negative = Bits(8 bits)
     for (j <- 0 until 8) negative(j) := a(j * 8 + 7)
 
@@ -432,7 +478,9 @@ class VectorArithmetic(val p: VectorRegFileParam, val xlen: Int) extends Compone
     val valid = RegNext(x2.valid && !scalarRead && x2.wordLast) init(False)
     val last = RegNext(x2.last) init(False)
     val address = RegNext(x2.address)
-    val mask = RegNext((maskDst || maskMm) ? B(0xff, 8 bits) | x2.mask)
+    // Reductions write element 0 only; the rest of vd is tail (norm:vreduction_tail_policy)
+    val elementZero = Vec((0 until 8).map(j => (U(j, 3 bits) >> laneSew) === 0)).asBits
+    val mask = RegNext((maskDst || maskMm) ? B(0xff, 8 bits) | (reduce ? elementZero | x2.mask))
     val data = RegNext(x2.output)
     io.write.valid := valid
     io.write.address := address
