@@ -22,6 +22,7 @@ object VectorEmul {
   val L2 = 2   // EMUL = LMUL / 2
   val L4 = 3   // EMUL = LMUL / 4
   val N = 4    // EMUL = NREG of vmv<nr>r.v
+  val W = 5    // EMUL = 2 * LMUL
   def width = 3
 }
 
@@ -38,6 +39,7 @@ object VectorRange {
   val ANY = 0
   val EXT2 = 1 // SEW >= 16; the source EMUL is always legal for a legal vtype
   val EXT4 = 2 // SEW >= 32
+  val WIDE = 3 // SEW <= 16 and LMUL <= 4
   def width = 2
 }
 
@@ -67,6 +69,8 @@ class VectorPlugin(val layer : LaneLayer, val dlen : Int = 64, var withMemory : 
   val VSET_IMM = Payload(Bool()) // vsetivli: AVL from uimm, vtype from zimm10
   val VSET_REG = Payload(Bool()) // vsetvl: vtype from rs2
   val ARITH, SCALAR_OPERAND, IMMEDIATE, SIGNED, SATURATE, MASK_DATA = Payload(Bool())
+  val ELEMENT, SIGNED_VS1, NEGATE = Payload(Bool()) // element unit; vs1 or scalar signed; product subtracted
+  val ELEMENT_OP = Payload(UInt(VectorElementOp.width bits))
   val SHAPE = Payload(UInt(VectorShape.width bits))
   val ALU_OP = Payload(UInt(VectorAluOp.width bits))
   val RESULT = Payload(Bits(XLEN bits))
@@ -97,10 +101,11 @@ class VectorPlugin(val layer : LaneLayer, val dlen : Int = 64, var withMemory : 
     if (withMemory) lsuRetainer.release()
 
     val checks = List(VSET, VSET_IMM, VSET_REG, CHECK_VILL, CHECK_VSTART, MASK_NOT_V0, MEM,
-      ARITH, SCALAR_OPERAND, IMMEDIATE, SIGNED, SATURATE, MASK_DATA)
+      ARITH, SCALAR_OPERAND, IMMEDIATE, SIGNED, SATURATE, MASK_DATA, ELEMENT, SIGNED_VS1, NEGATE)
     elp.setDecodingDefault(SEL, False)
     elp.setDecodingDefault(ALU_OP, U(VectorAluOp.ADD, VectorAluOp.width bits))
     elp.setDecodingDefault(SHAPE, U(VectorShape.SINGLE, VectorShape.width bits))
+    elp.setDecodingDefault(ELEMENT_OP, U(VectorElementOp.MUL, VectorElementOp.width bits))
     for (key <- List(OVERLAP_VS1, OVERLAP_VS2)) elp.setDecodingDefault(key, U(VectorOverlap.ANY, VectorOverlap.width bits))
     elp.setDecodingDefault(RANGE, U(VectorRange.ANY, VectorRange.width bits))
     for (key <- List(EMUL_VD, EMUL_VS1, EMUL_VS2)) elp.setDecodingDefault(key, U(VectorEmul.NONE, VectorEmul.width bits))
@@ -189,6 +194,27 @@ class VectorPlugin(val layer : LaneLayer, val dlen : Int = 64, var withMemory : 
         EMUL_VD -> emul(VectorEmul.N), EMUL_VS2 -> emul(VectorEmul.N))
     add(Rvv.all("vid.v"), ARITH -> True, ALU_OP -> alu(VectorAluOp.INDEX), CHECK_VILL -> True, CHECK_VSTART -> True,
       EMUL_VD -> emul(VectorEmul.L), MASK_NOT_V0 -> True)
+    // Multiplies in the element unit: name, operation, vs2 signed, vs1 or scalar signed, product subtracted
+    val multiplies = Seq(
+      ("vmul", VectorElementOp.MUL, false, false, false), ("vmulh", VectorElementOp.MULH, true, true, false),
+      ("vmulhu", VectorElementOp.MULH, false, false, false), ("vmulhsu", VectorElementOp.MULH, true, false, false),
+      ("vmacc", VectorElementOp.MACC, false, false, false), ("vnmsac", VectorElementOp.MACC, false, false, true),
+      ("vmadd", VectorElementOp.MADD, false, false, false), ("vnmsub", VectorElementOp.MADD, false, false, true),
+      ("vwmul", VectorElementOp.WMUL, true, true, false), ("vwmulu", VectorElementOp.WMUL, false, false, false),
+      ("vwmulsu", VectorElementOp.WMUL, true, false, false), ("vwmacc", VectorElementOp.WMACC, true, true, false),
+      ("vwmaccu", VectorElementOp.WMACC, false, false, false), ("vwmaccsu", VectorElementOp.WMACC, false, true, false),
+      ("vwmaccus", VectorElementOp.WMACC, true, false, false), ("vsmul", VectorElementOp.SMUL, true, true, false))
+    for ((name, op, signed, signedVs1, negate) <- multiplies; form <- Seq("vv", "vx") if Rvv.all.contains(s"$name.$form")) {
+      val vector = form == "vv"
+      val wide = op == VectorElementOp.WMUL || op == VectorElementOp.WMACC
+      add(Rvv.all(s"$name.$form"), ELEMENT -> True, ELEMENT_OP -> U(op, VectorElementOp.width bits), SIGNED -> Bool(signed),
+        SIGNED_VS1 -> Bool(signedVs1), NEGATE -> Bool(negate), SCALAR_OPERAND -> Bool(!vector),
+        CHECK_VILL -> True, CHECK_VSTART -> True, EMUL_VD -> emul(if (wide) VectorEmul.W else VectorEmul.L),
+        EMUL_VS1 -> emul(if (vector) VectorEmul.L else VectorEmul.NONE), EMUL_VS2 -> emul(VectorEmul.L), MASK_NOT_V0 -> True,
+        OVERLAP_VS2 -> overlap(if (wide) VectorOverlap.WIDEN else VectorOverlap.ANY),
+        OVERLAP_VS1 -> overlap(if (wide && vector) VectorOverlap.WIDEN else VectorOverlap.ANY),
+        RANGE -> U(if (wide) VectorRange.WIDE else VectorRange.ANY, VectorRange.width bits))
+    }
     add(Rvv.all("vmv.x.s"), ARITH -> True, SHAPE -> shape(VectorShape.SCALAR_READ), CHECK_VILL -> True, CHECK_VSTART -> True)
     add(Rvv.all("vmv.s.x"), ARITH -> True, ALU_OP -> alu(VectorAluOp.MOVE),
       SCALAR_OPERAND -> True, SHAPE -> shape(VectorShape.SCALAR_WRITE), CHECK_VILL -> True, CHECK_VSTART -> True)
@@ -212,19 +238,29 @@ class VectorPlugin(val layer : LaneLayer, val dlen : Int = 64, var withMemory : 
     val vlWidth = vcs.vlWidth
     val vrf = regFile.vrf
     val arithmetic = new VectorArithmetic(vrf.p, XLEN)
+    val element = new VectorElementUnit(vrf.p, XLEN)
     vrf.io.write := arithmetic.io.write
+    when(element.io.busy) { vrf.io.write := element.io.write }
     arithmetic.io.v0 := vrf.io.v0
-    for (i <- 0 until 3) arithmetic.io.reads(i).rsp := vrf.io.reads(i).rsp
+    element.io.v0 := vrf.io.v0
+    for (i <- 0 until 3) {
+      arithmetic.io.reads(i).rsp := vrf.io.reads(i).rsp
+      element.io.reads(i).rsp := vrf.io.reads(i).rsp
+    }
+    assert(!(arithmetic.io.busy && element.io.busy), "both vector units busy")
     val indexRead = Flow(UInt(vrf.p.addressWidth bits))
     if (!withMemory) indexRead.setIdle()
     vrf.io.reads(0).cmd := indexRead
     when(arithmetic.io.busy) { vrf.io.reads(0).cmd := arithmetic.io.reads(0).cmd }
+    when(element.io.busy) { vrf.io.reads(0).cmd := element.io.reads(0).cmd }
     vrf.io.reads(1).cmd := arithmetic.io.reads(1).cmd
-    // Port C belongs to the arithmetic unit from its command until done, otherwise to the memory side
+    when(element.io.busy) { vrf.io.reads(1).cmd := element.io.reads(1).cmd }
+    // Port C belongs to a unit from its command until done, otherwise to the memory side
     val storeRead = Flow(UInt(vrf.p.addressWidth bits))
     if (!withMemory) storeRead.setIdle()
     vrf.io.reads(2).cmd := storeRead
     when(arithmetic.io.busy) { vrf.io.reads(2).cmd := arithmetic.io.reads(2).cmd }
+    when(element.io.busy) { vrf.io.reads(2).cmd := element.io.reads(2).cmd }
     for (port <- vrf.io.reads.drop(3)) {
       port.cmd.valid := False
       port.cmd.payload.assignDontCare()
@@ -269,6 +305,7 @@ class VectorPlugin(val layer : LaneLayer, val dlen : Int = 64, var withMemory : 
       U(VectorEmul.L2) -> (lmul.resize(4) - 1),
       U(VectorEmul.L4) -> (lmul.resize(4) - 2),
       U(VectorEmul.N) -> nreg,
+      U(VectorEmul.W) -> (lmul.resize(4) + 1),
       default -> S(0, 4 bits)
     )
     // A register group of 2^log2 registers starts at a multiple of 2^log2
@@ -325,15 +362,17 @@ class VectorPlugin(val layer : LaneLayer, val dlen : Int = 64, var withMemory : 
         // A smaller source may overlap vd only in its highest part, and only with EMUL >= 1 (norm:vreg_overlap_legal)
         val vdLog2 = emulOf(EMUL_VD, lmul, nreg)
         val vs2Log2 = emulOf(EMUL_VS2, lmul, nreg)
-        val highest = vs2Log2 >= S(0) && vs2.resize(6) + groupSize(vs2Log2) === vd.resize(6) + groupSize(vdLog2)
-        val widen = OVERLAP_VS2 === VectorOverlap.WIDEN && overlapped(vd, vdLog2, vs2, vs2Log2) && !highest
-        // A mask vd may overlap a source group only at its base (norm:vreg_overlap_legal)
+        def highest(vs : UInt, log2 : SInt) = log2 >= S(0) && vs.resize(6) + groupSize(log2) === vd.resize(6) + groupSize(vdLog2)
         val vs1Log2 = emulOf(EMUL_VS1, lmul, nreg)
+        val widen = OVERLAP_VS2 === VectorOverlap.WIDEN && overlapped(vd, vdLog2, vs2, vs2Log2) && !highest(vs2, vs2Log2) ||
+          OVERLAP_VS1 === VectorOverlap.WIDEN && overlapped(vd, vdLog2, vs1, vs1Log2) && !highest(vs1, vs1Log2)
+        // A mask vd may overlap a source group only at its base (norm:vreg_overlap_legal)
         val maskVs2 = OVERLAP_VS2 === VectorOverlap.MASK && overlapped(vd, vdLog2, vs2, vs2Log2) && vd =/= vs2
         val maskVs1 = OVERLAP_VS1 === VectorOverlap.MASK && overlapped(vd, vdLog2, vs1, vs1Log2) && vd =/= vs1
         val range = RANGE.mux(
           U(VectorRange.EXT2) -> (vtype.vsew === 0),
           U(VectorRange.EXT4) -> (vtype.vsew < 2),
+          U(VectorRange.WIDE) -> (vtype.vsew === 2 || vtype.vlmul === B"011"),
           default -> False
         )
         val illegal = vill || vstart || group || maskOverlap || mem || widen || maskVs2 || maskVs1 || range
@@ -425,15 +464,30 @@ class VectorPlugin(val layer : LaneLayer, val dlen : Int = 64, var withMemory : 
         arithmetic.io.cmd.saturate := SATURATE
         arithmetic.io.cmd.vxrm := vcs.vxrm
         arithmetic.io.cmd.nreg := Decode.UOP(17 downto 15).asUInt.resize(4) + 1
-        elp.freezeWhen(sel && ARITH && !legality.illegal && !completed)
-        when(arithmetic.io.cmd.valid) { started := True }
-        when(arithmetic.io.done) { completed := True }
-        when(fire && ARITH) {
+        element.io.cmd.valid := sel && ELEMENT && !legality.illegal && !started
+        element.io.cmd.vd := vd
+        element.io.cmd.vs1 := vs1
+        element.io.cmd.vs2 := vs2
+        element.io.cmd.vl := vcs.vl
+        element.io.cmd.sew := vtype.vsew.resized
+        element.io.cmd.op := ELEMENT_OP
+        element.io.cmd.scalar := up(elp(IntRegFile, RS1))
+        element.io.cmd.scalarOperand := SCALAR_OPERAND
+        element.io.cmd.unmasked := vm
+        element.io.cmd.signed := SIGNED
+        element.io.cmd.signedVs1 := SIGNED_VS1
+        element.io.cmd.negate := NEGATE
+        element.io.cmd.vxrm := vcs.vxrm
+        val unit = ARITH || ELEMENT
+        elp.freezeWhen(sel && unit && !legality.illegal && !completed)
+        when(arithmetic.io.cmd.valid || element.io.cmd.valid) { started := True }
+        when(arithmetic.io.done || element.io.done) { completed := True }
+        when(fire && unit) {
           started := False
           completed := False
           vcs.vstartWrite.valid := True
           vcs.vstartWrite.payload := 0
-          when(arithmetic.io.saturated) { vcs.vxsatSet := True }
+          when(ARITH ? arithmetic.io.saturated | element.io.saturated) { vcs.vxsatSet := True }
         }
       }
     }
@@ -569,7 +623,7 @@ class VectorPlugin(val layer : LaneLayer, val dlen : Int = 64, var withMemory : 
         when(write.valid) {
           vrf.io.write := write
         }
-        assert(!(write.valid && arithmetic.io.write.valid), "VRF write port requested by the arithmetic unit and a load")
+        assert(!(write.valid && (arithmetic.io.write.valid || element.io.write.valid)), "VRF write port requested by a vector unit and a load")
       }
     }
     buildBefore.release()
