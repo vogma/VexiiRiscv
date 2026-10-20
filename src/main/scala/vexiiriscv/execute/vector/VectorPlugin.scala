@@ -30,7 +30,7 @@ object VectorEmul {
 object VectorOverlap {
   val ANY = 0
   val WIDEN = 1 // a smaller vs2 group overlaps vd only in its highest part; a fractional one not at all
-  val MASK = 2  // a mask vd overlaps the source group only at its base
+  val BASE = 2  // a smaller vd (mask or narrowing) overlaps the source group only at its base
   def width = 2
 }
 
@@ -179,8 +179,8 @@ class VectorPlugin(val layer : LaneLayer, val dlen : Int = 64, var withMemory : 
       add(Rvv.all(s"$name.$form"), ARITH -> True, SHAPE -> shape(VectorShape.MASK_DST), ALU_OP -> alu(op), SIGNED -> Bool(signed),
         SCALAR_OPERAND -> Bool(!vector), IMMEDIATE -> Bool(form.startsWith("vi")), MASK_DATA -> Bool(form.length == 3),
         CHECK_VILL -> True, CHECK_VSTART -> True, EMUL_VS1 -> emul(if (vector) VectorEmul.L else VectorEmul.NONE),
-        EMUL_VS2 -> emul(VectorEmul.L), OVERLAP_VS2 -> overlap(VectorOverlap.MASK),
-        OVERLAP_VS1 -> overlap(if (vector) VectorOverlap.MASK else VectorOverlap.ANY))
+        EMUL_VS2 -> emul(VectorEmul.L), OVERLAP_VS2 -> overlap(VectorOverlap.BASE),
+        OVERLAP_VS1 -> overlap(if (vector) VectorOverlap.BASE else VectorOverlap.ANY))
     }
     // Mask logicals: single registers whatever LMUL, unmasked by encoding (norm:vmask_maskreg_def)
     val logicals = Seq(("vmand", VectorAluOp.AND), ("vmnand", VectorAluOp.NAND), ("vmandn", VectorAluOp.ANDN),
@@ -194,6 +194,28 @@ class VectorPlugin(val layer : LaneLayer, val dlen : Int = 64, var withMemory : 
         EMUL_VD -> emul(VectorEmul.N), EMUL_VS2 -> emul(VectorEmul.N))
     add(Rvv.all("vid.v"), ARITH -> True, ALU_OP -> alu(VectorAluOp.INDEX), CHECK_VILL -> True, CHECK_VSTART -> True,
       EMUL_VD -> emul(VectorEmul.L), MASK_NOT_V0 -> True)
+    // Widening add/subtract: vd at 2 * SEW, vs2 at SEW or, for the .w forms, at 2 * SEW (norm:vwaddu_vwadd_vwsubu_vwsub_op)
+    for ((name, op, signed) <- Seq(("vwaddu", VectorAluOp.ADD, false), ("vwadd", VectorAluOp.ADD, true),
+         ("vwsubu", VectorAluOp.SUB, false), ("vwsub", VectorAluOp.SUB, true)); form <- Seq("vv", "vx", "wv", "wx")) {
+      val vector = form.endsWith("v")
+      val wideVs2 = form.startsWith("w")
+      add(Rvv.all(s"$name.$form"), ARITH -> True, SHAPE -> shape(if (wideVs2) VectorShape.WIDE_WV else VectorShape.WIDE_VV),
+        ALU_OP -> alu(op), SIGNED -> Bool(signed), SCALAR_OPERAND -> Bool(!vector), CHECK_VILL -> True, CHECK_VSTART -> True,
+        EMUL_VD -> emul(VectorEmul.W), EMUL_VS1 -> emul(if (vector) VectorEmul.L else VectorEmul.NONE),
+        EMUL_VS2 -> emul(if (wideVs2) VectorEmul.W else VectorEmul.L), MASK_NOT_V0 -> True,
+        OVERLAP_VS2 -> overlap(if (wideVs2) VectorOverlap.ANY else VectorOverlap.WIDEN),
+        OVERLAP_VS1 -> overlap(if (vector) VectorOverlap.WIDEN else VectorOverlap.ANY), RANGE -> U(VectorRange.WIDE, VectorRange.width bits))
+    }
+    // Narrowing shifts and clips: vs2 at 2 * SEW, shifted right by the low lg2(2 * SEW) bits of vs1, rs1 or uimm
+    for ((name, op, signed, saturate) <- Seq(("vnsrl", VectorAluOp.SRL, false, false), ("vnsra", VectorAluOp.SRL, true, false),
+         ("vnclipu", VectorAluOp.SSRL, false, true), ("vnclip", VectorAluOp.SSRL, true, true)); form <- Seq("wv", "wx", "wi")) {
+      val vector = form == "wv"
+      add(Rvv.all(s"$name.$form"), ARITH -> True, SHAPE -> shape(VectorShape.NARROW), ALU_OP -> alu(op),
+        SIGNED -> Bool(signed), SATURATE -> Bool(saturate), SCALAR_OPERAND -> Bool(!vector), IMMEDIATE -> Bool(form == "wi"),
+        CHECK_VILL -> True, CHECK_VSTART -> True, EMUL_VD -> emul(VectorEmul.L),
+        EMUL_VS1 -> emul(if (vector) VectorEmul.L else VectorEmul.NONE), EMUL_VS2 -> emul(VectorEmul.W), MASK_NOT_V0 -> True,
+        OVERLAP_VS2 -> overlap(VectorOverlap.BASE), RANGE -> U(VectorRange.WIDE, VectorRange.width bits))
+    }
     // Element arithmetic: name, operation, vs2 signed, vs1 or scalar signed, product subtracted
     val elementOps = Seq(
       ("vmul", VectorElementOp.MUL, false, false, false), ("vmulh", VectorElementOp.MULH, true, true, false),
@@ -368,16 +390,16 @@ class VectorPlugin(val layer : LaneLayer, val dlen : Int = 64, var withMemory : 
         val vs1Log2 = emulOf(EMUL_VS1, lmul, nreg)
         val widen = OVERLAP_VS2 === VectorOverlap.WIDEN && overlapped(vd, vdLog2, vs2, vs2Log2) && !highest(vs2, vs2Log2) ||
           OVERLAP_VS1 === VectorOverlap.WIDEN && overlapped(vd, vdLog2, vs1, vs1Log2) && !highest(vs1, vs1Log2)
-        // A mask vd may overlap a source group only at its base (norm:vreg_overlap_legal)
-        val maskVs2 = OVERLAP_VS2 === VectorOverlap.MASK && overlapped(vd, vdLog2, vs2, vs2Log2) && vd =/= vs2
-        val maskVs1 = OVERLAP_VS1 === VectorOverlap.MASK && overlapped(vd, vdLog2, vs1, vs1Log2) && vd =/= vs1
+        // A smaller vd may overlap a source group only at its base (norm:vreg_overlap_legal)
+        val baseVs2 = OVERLAP_VS2 === VectorOverlap.BASE && overlapped(vd, vdLog2, vs2, vs2Log2) && vd =/= vs2
+        val baseVs1 = OVERLAP_VS1 === VectorOverlap.BASE && overlapped(vd, vdLog2, vs1, vs1Log2) && vd =/= vs1
         val range = RANGE.mux(
           U(VectorRange.EXT2) -> (vtype.vsew === 0),
           U(VectorRange.EXT4) -> (vtype.vsew < 2),
           U(VectorRange.WIDE) -> (vtype.vsew === 2 || vtype.vlmul === B"011"),
           default -> False
         )
-        val illegal = vill || vstart || group || maskOverlap || mem || widen || maskVs2 || maskVs1 || range
+        val illegal = vill || vstart || group || maskOverlap || mem || widen || baseVs2 || baseVs1 || range
       }
 
       val sel = isValid && SEL
