@@ -35,6 +35,9 @@ object VectorAluOp {
   val ASUB = 23
   val SSRL = 24
   val INDEX = 25 // the element index, without operands (norm:vid_op)
+  val MSBF = 26
+  val MSIF = 27
+  val MSOF = 28
   def width = 5
 }
 
@@ -104,6 +107,7 @@ class VectorArithmetic(val p: VectorRegFileParam, val xlen: Int) extends Compone
   val ext4 = command.shape === VectorShape.EXT4
   val maskDst = command.shape === VectorShape.MASK_DST
   val maskMm = command.shape === VectorShape.MASK_MM
+  val maskScan = command.op === VectorAluOp.MSBF || command.op === VectorAluOp.MSIF || command.op === VectorAluOp.MSOF
   val whole = command.shape === VectorShape.WHOLE
   val wideVv = command.shape === VectorShape.WIDE_VV
   val widening = wideVv || command.shape === VectorShape.WIDE_WV
@@ -182,7 +186,7 @@ class VectorArithmetic(val p: VectorRegFileParam, val xlen: Int) extends Compone
     // Ports A, B and C; scalar reads always use vs2, including when vl is zero
     io.reads(0).cmd.valid := active && !folding && (scalarRead || !scalarWrite && command.op =/= VectorAluOp.MOVE && !index)
     io.reads(0).cmd.payload := word(command.vs2, ext4 ? (step >> 2) | ((ext2 || wideVv || wreduce) ? (step >> 1) | step))
-    io.reads(1).cmd.valid := active && !command.scalarOperand && !scalarRead && !ext2 && !ext4 && !whole && !index &&
+    io.reads(1).cmd.valid := active && !command.scalarOperand && !scalarRead && !ext2 && !ext4 && !whole && !index && !maskScan &&
       (!reduce || step === 0 && !folding)
     io.reads(1).cmd.payload := word(command.vs1, reduce ? U(0, step.getWidth bits) | ((widening || narrow) ? (step >> 1) | step))
     // The old destination word, whose bits outside the result are kept (norm:vreg_mask_tail_agn, P3)
@@ -343,7 +347,21 @@ class VectorArithmetic(val p: VectorRegFileParam, val xlen: Int) extends Compone
       U(VectorAluOp.INDEX) -> ids,
       default -> sum
     )
-    val output = whole ? a | ((ext2 || ext4) ? extended | data)
+    // Mask prefix operations: one recurrence per mask word, counting only active source bits
+    val scanFound = Reg(Bool())
+    val scanEn = Bits(64 bits)
+    val maskWord = (io.v0 >> (position << 6)).resize(64)
+    for (i <- 0 until 64) scanEn(i) := U(i, 7 bits) < bodyBits && (command.unmasked || maskWord(i))
+    val scanSource = a & scanEn
+    val before = (scanSource.asUInt - 1).asBits
+    val scanBits = command.op.mux(
+      U(VectorAluOp.MSBF) -> (before & ~scanSource),
+      U(VectorAluOp.MSIF) -> (before ^ scanSource),
+      default -> (scanSource & ~before)
+    )
+    val scanOutput = (!first && scanFound) ? B(0, 64 bits) | scanBits
+    when(valid && maskScan) { scanFound := (!first && scanFound) || scanSource.orR }
+    val output = maskScan ? scanOutput | (whole ? a | ((ext2 || ext4) ? extended | data))
     when(valid && reduce) { partial := data }
     val negative = Bits(8 bits)
     for (j <- 0 until 8) negative(j) := a(j * 8 + 7)
@@ -366,6 +384,7 @@ class VectorArithmetic(val p: VectorRegFileParam, val xlen: Int) extends Compone
     val offset = RegNext(x1.offset)
     val wordLast = RegNext(x1.wordLast)
     val bodyBits = RegNext(x1.bodyBits)
+    val scanEn = RegNext(x1.scanEn)
     val old = RegNext(x1.old)
     val bits = RegNext(x1.bits)
     val actives = RegNext(x1.actives)
@@ -470,7 +489,8 @@ class VectorArithmetic(val p: VectorRegFileParam, val xlen: Int) extends Compone
     // MASK_MM: result bits below vl, the old word above
     val body = Bits(64 bits)
     for (i <- 0 until 64) body(i) := U(i, 7 bits) < bodyBits
-    val merged = (data & body) | (old & ~body)
+    val maskEnable = maskScan ? scanEn | body
+    val merged = (data & maskEnable) | (old & ~maskEnable)
     val output = maskDst ? gathered | (maskMm ? merged | (narrow ? (packed ## packed) | value))
   }
 

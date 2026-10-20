@@ -14,6 +14,9 @@ object VectorElementOp {
   val SMUL = 6  // vs2 * vs1 >> (SEW - 1), rounded by vxrm and saturated
   val DIV = 7   // quotient, signed when command.signed
   val REM = 8   // remainder, signed when command.signed
+  val CPOP = 9
+  val FIRST = 10
+  val IOTA = 11
   def width = 4
 }
 
@@ -41,6 +44,7 @@ class VectorElementUnit(val p: VectorRegFileParam, val xlen: Int) extends Compon
     val write = master(Flow(VrfWriteCmd(p)))
     val v0 = in Bits(p.vlen bits)
     val busy, done = out Bool()
+    val result = out Bits(xlen bits)
     val saturated = out Bool() // an active element saturated; holds from done until the next command
   }
 
@@ -48,6 +52,10 @@ class VectorElementUnit(val p: VectorRegFileParam, val xlen: Int) extends Compon
   def is(op: Int): Bool = command.op === op
   val widen = is(VectorElementOp.WMUL) || is(VectorElementOp.WMACC)
   val divide = is(VectorElementOp.DIV) || is(VectorElementOp.REM)
+  val scan = is(VectorElementOp.CPOP) || is(VectorElementOp.FIRST) || is(VectorElementOp.IOTA)
+  val count = Reg(UInt(log2Up(p.vlen) + 1 bits)) init(0)
+  val result = Reg(Bits(xlen bits))
+  io.result := result
   val divPending = RegInit(False)
   val madd = is(VectorElementOp.MADD)
   val readVd = is(VectorElementOp.MACC) || madd || is(VectorElementOp.WMACC)
@@ -69,6 +77,8 @@ class VectorElementUnit(val p: VectorRegFileParam, val xlen: Int) extends Compon
     busy := True
     saturated := False
     index := 0
+    count := 0
+    result := (io.cmd.op === VectorElementOp.FIRST) ? B(xlen bits, default -> True) | B(0, xlen bits)
   }
 
   val issue = new Area {
@@ -79,8 +89,8 @@ class VectorElementUnit(val p: VectorRegFileParam, val xlen: Int) extends Compon
     val vdOffset = widen ? (offset << 1).resize(offsetWidth) | offset
 
     io.reads(0).cmd.valid := active
-    io.reads(0).cmd.payload := word(command.vs2, offset)
-    io.reads(1).cmd.valid := active && !command.scalarOperand
+    io.reads(0).cmd.payload := word(command.vs2, scan ? (index.resize(offsetWidth) >> 3) | offset)
+    io.reads(1).cmd.valid := active && !command.scalarOperand && !scan
     io.reads(1).cmd.payload := word(command.vs1, offset)
     io.reads(2).cmd.valid := active && readVd
     io.reads(2).cmd.payload := word(command.vd, vdOffset)
@@ -96,6 +106,8 @@ class VectorElementUnit(val p: VectorRegFileParam, val xlen: Int) extends Compon
   val x1 = new Area {
     val valid = RegNext(issue.active) init(False)
     val last = RegNext(issue.last) init(False)
+    val maskBit = RegNext(index.resize(6))
+    val elementIndex = RegNext(index)
     val byte = RegNext(issue.offset.resize(log2Up(p.beatBytes)))
     val vdByte = RegNext(issue.vdOffset.resize(log2Up(p.beatBytes)))
     val address = RegNext(word(command.vd, issue.vdOffset))
@@ -114,6 +126,12 @@ class VectorElementUnit(val p: VectorRegFileParam, val xlen: Int) extends Compon
     val y = extend(b, command.sew, command.signedVs1)
     val addend = madd ? a | c
     val intMin = command.sew.mux(U(0) -> S(-128, 33 bits), U(1) -> S(-32768, 33 bits), default -> S(BigInt(-1) << 31, 33 bits))
+    val hit = io.reads(0).rsp(maskBit)
+    when(valid && scan) {
+      count := count + hit.asUInt
+      when(is(VectorElementOp.CPOP)) { result := (count + hit.asUInt).resize(xlen).asBits }
+      when(is(VectorElementOp.FIRST) && hit && result.msb) { result := elementIndex.resize(xlen).asBits }
+    }
     val overflow = x === intMin && y === intMin // the only vsmul product that does not fit (norm:vsmul_op)
   }
 
@@ -140,8 +158,8 @@ class VectorElementUnit(val p: VectorRegFileParam, val xlen: Int) extends Compon
 
   // 33 x 33 signed multiplier with two pipeline registers
   val operands = new Area {
-    val valid = RegNext(x1.valid && !divide) init(False)
-    val last = RegNext(x1.last && !divide) init(False)
+    val valid = RegNext(x1.valid && !divide && !scan) init(False)
+    val last = RegNext(x1.last && !divide && !scan) init(False)
     val vdByte = RegNext(x1.vdByte)
     val address = RegNext(x1.address)
     val x = RegNext(x1.x)
@@ -205,11 +223,15 @@ class VectorElementUnit(val p: VectorRegFileParam, val xlen: Int) extends Compon
   }
 
   val writeback = new Area {
-    val valid = RegNext(m2.valid || division.core.io.rsp.fire) init(False)
-    val last = RegNext(m2.last || (divide && ((division.core.io.rsp.fire && division.last) || (x1.last && !x1.valid)))) init(False)
-    val address = RegNext(divide ? division.address | m2.address)
-    val data = RegNext(finish.data)
-    val mask = RegNext(finish.mask)
+    val valid = RegNext(m2.valid || division.core.io.rsp.fire || (scan && is(VectorElementOp.IOTA) && x1.valid)) init(False)
+    val last = RegNext((scan && x1.last) || m2.last || (divide && ((division.core.io.rsp.fire && division.last) || (x1.last && !x1.valid)))) init(False)
+    val address = RegNext(scan ? x1.address | (divide ? division.address | m2.address))
+    val scanData = command.sew.mux(U(0) -> (count.resize(8).asBits #* 8),
+      U(1) -> (count.resize(16).asBits #* 4), default -> (count.resize(32).asBits #* 2))
+    val scanBytes = command.sew.mux(U(0) -> B"0001", U(1) -> B"0011", default -> B"1111")
+    val scanMask = (scanBytes.resize(p.beatBytes) << x1.vdByte).resize(p.beatBytes)
+    val data = RegNext(scan ? scanData | finish.data)
+    val mask = RegNext(scan ? scanMask | finish.mask)
     io.write.valid := valid
     io.write.address := address
     io.write.data := data

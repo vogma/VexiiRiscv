@@ -31,6 +31,7 @@ object VectorOverlap {
   val ANY = 0
   val WIDEN = 1 // a smaller vs2 group overlaps vd only in its highest part; a fractional one not at all
   val BASE = 2  // a smaller vd (mask or narrowing) overlaps the source group only at its base
+  val DISJOINT = 3 // no destination register may overlap the source
   def width = 2
 }
 
@@ -250,6 +251,17 @@ class VectorPlugin(val layer : LaneLayer, val dlen : Int = 64, var withMemory : 
         ALU_OP -> alu(op), SIGNED -> Bool(signed), CHECK_VILL -> True, CHECK_VSTART -> True, EMUL_VS2 -> emul(VectorEmul.L),
         RANGE -> U(if (wide) VectorRange.WIDE_SCALAR else VectorRange.ANY, VectorRange.width bits))
     }
+    // Mask prefix results are single registers; iota writes an LMUL group (norm:viota_vreg_constr)
+    for ((name, op) <- Seq(("vmsbf", VectorAluOp.MSBF), ("vmsif", VectorAluOp.MSIF), ("vmsof", VectorAluOp.MSOF)))
+      add(Rvv.all(s"$name.m"), ARITH -> True, SHAPE -> shape(VectorShape.MASK_MM), ALU_OP -> alu(op),
+        CHECK_VILL -> True, CHECK_VSTART -> True, MASK_NOT_V0 -> True, OVERLAP_VS2 -> overlap(VectorOverlap.DISJOINT))
+    for ((name, op) <- Seq(("vcpop", VectorElementOp.CPOP), ("vfirst", VectorElementOp.FIRST), ("viota", VectorElementOp.IOTA))) {
+      val iota = op == VectorElementOp.IOTA
+      add(Rvv.all(s"$name.m"), ELEMENT -> True, ELEMENT_OP -> U(op, VectorElementOp.width bits),
+        CHECK_VILL -> True, CHECK_VSTART -> True, MASK_NOT_V0 -> Bool(iota),
+        EMUL_VD -> emul(if (iota) VectorEmul.L else VectorEmul.NONE),
+        OVERLAP_VS2 -> overlap(if (iota) VectorOverlap.DISJOINT else VectorOverlap.ANY))
+    }
     add(Rvv.all("vmv.x.s"), ARITH -> True, SHAPE -> shape(VectorShape.SCALAR_READ), CHECK_VILL -> True, CHECK_VSTART -> True)
     add(Rvv.all("vmv.s.x"), ARITH -> True, ALU_OP -> alu(VectorAluOp.MOVE),
       SCALAR_OPERAND -> True, SHAPE -> shape(VectorShape.SCALAR_WRITE), CHECK_VILL -> True, CHECK_VSTART -> True)
@@ -404,6 +416,7 @@ class VectorPlugin(val layer : LaneLayer, val dlen : Int = 64, var withMemory : 
         // A smaller vd may overlap a source group only at its base (norm:vreg_overlap_legal)
         val baseVs2 = OVERLAP_VS2 === VectorOverlap.BASE && overlapped(vd, vdLog2, vs2, vs2Log2) && vd =/= vs2
         val baseVs1 = OVERLAP_VS1 === VectorOverlap.BASE && overlapped(vd, vdLog2, vs1, vs1Log2) && vd =/= vs1
+        val disjoint = OVERLAP_VS2 === VectorOverlap.DISJOINT && overlapped(vd, vdLog2, vs2, vs2Log2)
         val range = RANGE.mux(
           U(VectorRange.EXT2) -> (vtype.vsew === 0),
           U(VectorRange.EXT4) -> (vtype.vsew < 2),
@@ -411,7 +424,7 @@ class VectorPlugin(val layer : LaneLayer, val dlen : Int = 64, var withMemory : 
           U(VectorRange.WIDE_SCALAR) -> (vtype.vsew === 2),
           default -> False
         )
-        val illegal = vill || vstart || group || maskOverlap || mem || widen || baseVs2 || baseVs1 || range
+        val illegal = vill || vstart || group || maskOverlap || mem || widen || baseVs2 || baseVs1 || disjoint || range
       }
 
       val sel = isValid && SEL
@@ -478,7 +491,7 @@ class VectorPlugin(val layer : LaneLayer, val dlen : Int = 64, var withMemory : 
           vcs.vstartWrite.valid := True
           vcs.vstartWrite.payload := 0
         }
-        RESULT := (SHAPE === VectorShape.SCALAR_READ) ? arithmetic.io.result | vl.resize(XLEN).asBits
+        RESULT := ELEMENT ? element.io.result | ((SHAPE === VectorShape.SCALAR_READ) ? arithmetic.io.result | vl.resize(XLEN).asBits)
       }
 
       val sequencer = new Area {
