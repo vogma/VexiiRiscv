@@ -17,6 +17,7 @@ class VectorElementHarness(p: VectorRegFileParam, xlen: Int) extends Component {
     val readData = out Bits(64 bits)
     val initHold, done, busy, saturated = out Bool()
     val write = master(Flow(VrfWriteCmd(p)))
+    val divCommand = out Bool()
     val readValid = out Bits(3 bits)
     val readAddresses = out Vec(UInt(p.addressWidth bits), 3)
   }
@@ -36,6 +37,8 @@ class VectorElementHarness(p: VectorRegFileParam, xlen: Int) extends Component {
     vrf.io.reads(0).cmd.valid := True
     vrf.io.reads(0).cmd.payload := io.readAddress
   }
+  val divFire = unit.rework { unit.division.core.io.cmd.fire }
+  io.divCommand := divFire.pull()
   io.readData := vrf.io.reads(0).rsp
   io.initHold := vrf.io.initHold
   io.done := unit.io.done
@@ -55,7 +58,9 @@ class VectorElementUnitTest extends AnyFunSuite {
     ("vwmul", WMUL, true, true, false, "vv vx"), ("vwmulu", WMUL, false, false, false, "vv vx"),
     ("vwmulsu", WMUL, true, false, false, "vv vx"), ("vwmacc", WMACC, true, true, false, "vv vx"),
     ("vwmaccu", WMACC, false, false, false, "vv vx"), ("vwmaccsu", WMACC, false, true, false, "vv vx"),
-    ("vwmaccus", WMACC, true, false, false, "vx"), ("vsmul", SMUL, true, true, false, "vv vx"))
+    ("vwmaccus", WMACC, true, false, false, "vx"), ("vsmul", SMUL, true, true, false, "vv vx"),
+    ("vdiv", DIV, true, true, false, "vv vx"), ("vdivu", DIV, false, false, false, "vv vx"),
+    ("vrem", REM, true, true, false, "vv vx"), ("vremu", REM, false, false, false, "vv vx"))
   def wide(name: String) = name.startsWith("vw")
   def readsVd(name: String) = Seq("vmacc", "vnmsac", "vmadd", "vnmsub").contains(name) || name.startsWith("vwmacc")
 
@@ -122,6 +127,8 @@ class VectorElementUnitTest extends AnyFunSuite {
         var expectedSaturation = false
         val expected = ArrayBuffer[(Int, BigInt, Int)]()
         val actives = ArrayBuffer[Int]()
+        val divide = op == DIV || op == REM
+        val divideLatencies = ArrayBuffer[Int]()
         // Element by element, each reading its sources before writing vd, as the spec's loop
         for (i <- 0 until vl if !masked || maskBit(i)) {
           actives += i
@@ -130,7 +137,11 @@ class VectorElementUnitTest extends AnyFunSuite {
           val d = element(vd, i, dsize)
           val sa = if (signedVs2) sext(a, w) else a
           val sb = if (signedVs1) sext(b, w) else b
+          if (divide) divideLatencies += scala.math.max(8, ((sa.abs.bitLength + 7) / 8) * 8) + 3
           val value = name match {
+            case "vdiv" | "vdivu" | "vrem" | "vremu" =>
+              val q = if (sb == 0) BigInt(-1) else sa / sb // truncates towards zero; narrow overflow wraps
+              if (op == REM) { if (sb == 0) sa else sa - q * sb } else q
             case "vmul" => a * b
             case "vmulh" | "vmulhu" | "vmulhsu" => (sa * sb) >> w // norm:vmul_vmulh_vmulhu_vmulhsu_op
             case "vmacc" => b * a + d // norm:vmacc_vnmsac_vmadd_vnmsub_op
@@ -173,10 +184,11 @@ class VectorElementUnitTest extends AnyFunSuite {
         cmd.valid #= false
         var cycles = 0
         val readCycles, writeCycles = ArrayBuffer[Int]()
-        var writeIndex = 0
-        while (!dut.io.done.toBoolean && cycles < 4 * vlen) {
+        var writeIndex, divCommands = 0
+        while (!dut.io.done.toBoolean && cycles < 40 * vlen) {
           sleep(1)
           assert(dut.io.busy.toBoolean, s"busy before done case $cases")
+          if (dut.io.divCommand.toBoolean) divCommands += 1
           val rv = dut.io.readValid.toInt
           if (rv != 0) {
             val k = readCycles.size
@@ -204,9 +216,17 @@ class VectorElementUnitTest extends AnyFunSuite {
         }
         assert(dut.io.done.toBoolean, s"timeout case $cases")
         assert(writeIndex == expected.size, s"missing writes case $cases $name")
-        // One element per cycle, inactive ones included; each write five cycles after its reads
-        for (k <- actives.indices) assert(readCycles(k) - readCycles(0) == actives(k) - actives(0), s"element rate case $cases")
-        assert(writeCycles.toSeq == readCycles.map(_ + 5).toSeq, s"write latency case $cases")
+        assert(divCommands == (if (divide) actives.size else 0), s"divider commands case $cases")
+        if (divide) {
+          for (k <- actives.indices) {
+            assert(writeCycles(k) == readCycles(k) + divideLatencies(k), s"divide latency case $cases element $k")
+            if (k > 0) assert(readCycles(k) == writeCycles(k-1) + actives(k) - actives(k-1) - 1, s"divide issue case $cases")
+          }
+          if (actives.isEmpty) assert(cycles == scala.math.max(vl, 1) + 2, s"inactive divider cycles case $cases: $cycles")
+        } else {
+          for (k <- actives.indices) assert(readCycles(k) - readCycles(0) == actives(k) - actives(0), s"element rate case $cases")
+          assert(writeCycles.toSeq == readCycles.map(_ + 5).toSeq, s"write latency case $cases")
+        }
         assert(dut.io.saturated.toBoolean == expectedSaturation, s"saturation case $cases $name sew $sew")
         sleep(1); tick()
         assert(!dut.io.busy.toBoolean, s"busy after done case $cases")
@@ -221,7 +241,7 @@ class VectorElementUnitTest extends AnyFunSuite {
       }
 
       if (exhaustive) {
-        // Every SEW-8 operand pair of every multiply, and of vsmul at each vxrm: vs2 in v8, vs1 in v16, vd in v24
+        // Every SEW-8 operand pair of every multiply and divide, and of vsmul at each vxrm: vs2 in v8, vs1 in v16, vd in v24
         for ((name, _, _, _, _, forms) <- ops; vxrm <- if (name == "vsmul") 0 to 3 else Seq(0)) {
           val lmul = if (wide(name)) 2 else 3
           val vlmax = (vlen / 8) << lmul
@@ -234,7 +254,8 @@ class VectorElementUnitTest extends AnyFunSuite {
             for (r <- 24 until 32; b <- 0 until vlenb) bytes(r)(b) = random.nextInt(256)
             upload((8 until 24) ++ (24 until 32))
             execute(name, true, 0, lmul, vlmax, false, 24, 8, 16, BigInt(xlen, random), vxrm, false)
-          } else for (s <- 0 until 256; chunk <- 0 until 256 / vlmax) {
+          }
+          if (!forms.contains("vv") || name.startsWith("vdiv") || name.startsWith("vrem")) for (s <- 0 until 256; chunk <- 0 until 256 / vlmax) {
             for (e <- 0 until vlmax) bytes(8 + e / vlenb)(e % vlenb) = chunk * vlmax + e
             upload(8 until 16)
             execute(name, false, 0, lmul, vlmax, false, 24, 8, 16, (BigInt(xlen - 8, random) << 8) | s, vxrm, false)

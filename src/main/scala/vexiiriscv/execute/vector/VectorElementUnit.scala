@@ -2,6 +2,7 @@ package vexiiriscv.execute.vector
 
 import spinal.core._
 import spinal.lib._
+import vexiiriscv.misc.DivRadix
 
 object VectorElementOp {
   val MUL = 0   // low SEW bits of vs2 * vs1
@@ -11,7 +12,9 @@ object VectorElementOp {
   val MADD = 4  // vs2 +/- vs1 * vd, low SEW bits
   val WMACC = 5 // 2*SEW-bit vd + vs1 * vs2
   val SMUL = 6  // vs2 * vs1 >> (SEW - 1), rounded by vxrm and saturated
-  def width = 3
+  val DIV = 7   // quotient, signed when command.signed
+  val REM = 8   // remainder, signed when command.signed
+  def width = 4
 }
 
 case class VectorElementCmd(p: VectorRegFileParam, xlen: Int) extends Bundle {
@@ -28,7 +31,7 @@ case class VectorElementCmd(p: VectorRegFileParam, xlen: Int) extends Bundle {
 }
 
 // One element per cycle from element 0: read in cycle t, extract and extend in t+1, multiply in t+2 and t+3,
-// finish in t+4 and write the element with its byte enables in t+5. Inactive elements take a cycle and no reads.
+// finish in t+4 and write in t+5. Division serializes active elements; inactive elements take a cycle and no reads.
 class VectorElementUnit(val p: VectorRegFileParam, val xlen: Int) extends Component {
   require(p.dlen == 64 && p.readPorts >= 3)
   require(xlen == 32 || xlen == 64)
@@ -44,6 +47,8 @@ class VectorElementUnit(val p: VectorRegFileParam, val xlen: Int) extends Compon
   val command = Reg(VectorElementCmd(p, xlen))
   def is(op: Int): Bool = command.op === op
   val widen = is(VectorElementOp.WMUL) || is(VectorElementOp.WMACC)
+  val divide = is(VectorElementOp.DIV) || is(VectorElementOp.REM)
+  val divPending = RegInit(False)
   val madd = is(VectorElementOp.MADD)
   val readVd = is(VectorElementOp.MACC) || madd || is(VectorElementOp.WMACC)
   val running = RegInit(False)
@@ -67,8 +72,9 @@ class VectorElementUnit(val p: VectorRegFileParam, val xlen: Int) extends Compon
   }
 
   val issue = new Area {
-    val active = running && command.vl =/= 0 && (command.unmasked || io.v0(index))
-    val last = running && (command.vl === 0 || index.resize(offsetWidth) + 1 >= command.vl)
+    val advance = running && !divPending
+    val active = advance && command.vl =/= 0 && (command.unmasked || io.v0(index))
+    val last = advance && (command.vl === 0 || index.resize(offsetWidth) + 1 >= command.vl)
     val offset = (index.resize(offsetWidth) << command.sew).resize(offsetWidth)
     val vdOffset = widen ? (offset << 1).resize(offsetWidth) | offset
 
@@ -79,7 +85,8 @@ class VectorElementUnit(val p: VectorRegFileParam, val xlen: Int) extends Compon
     io.reads(2).cmd.valid := active && readVd
     io.reads(2).cmd.payload := word(command.vd, vdOffset)
 
-    when(running) {
+    when(active && divide) { divPending := True }
+    when(advance) {
       index := index + 1
       when(last) { running := False }
     }
@@ -110,10 +117,31 @@ class VectorElementUnit(val p: VectorRegFileParam, val xlen: Int) extends Compon
     val overflow = x === intMin && y === intMin // the only vsmul product that does not fit (norm:vsmul_op)
   }
 
+  // Unsigned division of magnitudes, then restore the quotient or remainder sign
+  val division = new Area {
+    val core = new DivRadix(32, 2)
+    core.io.flush := False
+    core.io.cmd.valid := x1.valid && divide
+    core.io.cmd.normalized := False
+    core.io.cmd.iterations := 0
+    core.io.cmd.a := (x1.x.msb ? -x1.x | x1.x).asUInt.resized
+    core.io.cmd.b := (x1.y.msb ? -x1.y | x1.y).asUInt.resized
+    core.io.rsp.ready := True
+    val address = RegNextWhen(x1.address, core.io.cmd.fire)
+    val vdByte = RegNextWhen(x1.vdByte, core.io.cmd.fire)
+    val last = RegNextWhen(x1.last, core.io.cmd.fire) init(False)
+    val revert = RegNextWhen(is(VectorElementOp.REM) ? x1.x.msb |
+      ((x1.x.msb ^ x1.y.msb) && x1.y =/= 0), core.io.cmd.fire)
+    val magnitude = is(VectorElementOp.REM) ? core.io.rsp.remain | core.io.rsp.result
+    val result = (revert ? (~magnitude + 1) | magnitude).asBits
+    when(core.io.rsp.fire) { divPending := False }
+    assert(!(core.io.cmd.valid && !core.io.cmd.ready), "vector divide issued while busy")
+  }
+
   // 33 x 33 signed multiplier with two pipeline registers
   val operands = new Area {
-    val valid = RegNext(x1.valid) init(False)
-    val last = RegNext(x1.last) init(False)
+    val valid = RegNext(x1.valid && !divide) init(False)
+    val last = RegNext(x1.last && !divide) init(False)
     val vdByte = RegNext(x1.vdByte)
     val address = RegNext(x1.address)
     val x = RegNext(x1.x)
@@ -158,7 +186,7 @@ class VectorElementUnit(val p: VectorRegFileParam, val xlen: Int) extends Compon
     val rounded = (shifted.asUInt + VectorFixedPoint.roundIncrement(lsb, half, sticky, command.vxrm).asUInt).asBits
     val intMax = command.sew.mux(U(0) -> B(0x7f, 32 bits), U(1) -> B(0x7fff, 32 bits), default -> B(0x7fffffff, 32 bits))
     val fractional = m2.overflow ? intMax | rounded
-    val result = command.op.mux(
+    val multiplyResult = command.op.mux(
       U(VectorElementOp.MULH) -> high,
       U(VectorElementOp.MACC) -> sum,
       U(VectorElementOp.MADD) -> sum,
@@ -168,16 +196,18 @@ class VectorElementUnit(val p: VectorRegFileParam, val xlen: Int) extends Compon
     )
     when(m2.valid && is(VectorElementOp.SMUL) && m2.overflow) { saturated := True }
 
+    val result = divide ? division.result | multiplyResult
+    val vdByte = divide ? division.vdByte | m2.vdByte
     val eew = widen ? (command.sew + 1) | command.sew
     val data = eew.mux(U(0) -> (result(7 downto 0) #* 8), U(1) -> (result(15 downto 0) #* 4), default -> (result #* 2))
     val bytes = eew.mux(U(0) -> B"0001", U(1) -> B"0011", default -> B"1111")
-    val mask = (bytes.resize(p.beatBytes) << m2.vdByte).resize(p.beatBytes)
+    val mask = (bytes.resize(p.beatBytes) << vdByte).resize(p.beatBytes)
   }
 
   val writeback = new Area {
-    val valid = RegNext(m2.valid) init(False)
-    val last = RegNext(m2.last) init(False)
-    val address = RegNext(m2.address)
+    val valid = RegNext(m2.valid || division.core.io.rsp.fire) init(False)
+    val last = RegNext(m2.last || (divide && ((division.core.io.rsp.fire && division.last) || (x1.last && !x1.valid)))) init(False)
+    val address = RegNext(divide ? division.address | m2.address)
     val data = RegNext(finish.data)
     val mask = RegNext(finish.mask)
     io.write.valid := valid

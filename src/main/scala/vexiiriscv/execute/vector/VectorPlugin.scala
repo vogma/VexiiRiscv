@@ -194,8 +194,8 @@ class VectorPlugin(val layer : LaneLayer, val dlen : Int = 64, var withMemory : 
         EMUL_VD -> emul(VectorEmul.N), EMUL_VS2 -> emul(VectorEmul.N))
     add(Rvv.all("vid.v"), ARITH -> True, ALU_OP -> alu(VectorAluOp.INDEX), CHECK_VILL -> True, CHECK_VSTART -> True,
       EMUL_VD -> emul(VectorEmul.L), MASK_NOT_V0 -> True)
-    // Multiplies in the element unit: name, operation, vs2 signed, vs1 or scalar signed, product subtracted
-    val multiplies = Seq(
+    // Element arithmetic: name, operation, vs2 signed, vs1 or scalar signed, product subtracted
+    val elementOps = Seq(
       ("vmul", VectorElementOp.MUL, false, false, false), ("vmulh", VectorElementOp.MULH, true, true, false),
       ("vmulhu", VectorElementOp.MULH, false, false, false), ("vmulhsu", VectorElementOp.MULH, true, false, false),
       ("vmacc", VectorElementOp.MACC, false, false, false), ("vnmsac", VectorElementOp.MACC, false, false, true),
@@ -203,8 +203,10 @@ class VectorPlugin(val layer : LaneLayer, val dlen : Int = 64, var withMemory : 
       ("vwmul", VectorElementOp.WMUL, true, true, false), ("vwmulu", VectorElementOp.WMUL, false, false, false),
       ("vwmulsu", VectorElementOp.WMUL, true, false, false), ("vwmacc", VectorElementOp.WMACC, true, true, false),
       ("vwmaccu", VectorElementOp.WMACC, false, false, false), ("vwmaccsu", VectorElementOp.WMACC, false, true, false),
-      ("vwmaccus", VectorElementOp.WMACC, true, false, false), ("vsmul", VectorElementOp.SMUL, true, true, false))
-    for ((name, op, signed, signedVs1, negate) <- multiplies; form <- Seq("vv", "vx") if Rvv.all.contains(s"$name.$form")) {
+      ("vwmaccus", VectorElementOp.WMACC, true, false, false), ("vsmul", VectorElementOp.SMUL, true, true, false),
+      ("vdiv", VectorElementOp.DIV, true, true, false), ("vdivu", VectorElementOp.DIV, false, false, false),
+      ("vrem", VectorElementOp.REM, true, true, false), ("vremu", VectorElementOp.REM, false, false, false))
+    for ((name, op, signed, signedVs1, negate) <- elementOps; form <- Seq("vv", "vx") if Rvv.all.contains(s"$name.$form")) {
       val vector = form == "vv"
       val wide = op == VectorElementOp.WMUL || op == VectorElementOp.WMACC
       add(Rvv.all(s"$name.$form"), ELEMENT -> True, ELEMENT_OP -> U(op, VectorElementOp.width bits), SIGNED -> Bool(signed),
