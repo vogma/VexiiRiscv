@@ -577,6 +577,8 @@ class VectorPlugin(val layer : LaneLayer, val dlen : Int = 64, var withMemory : 
       // Fault-only-first: the trap controller may turn the exception of an element past 0 into a trim,
       // after which the refetched instruction only writes vl := trimIndex
       val armed, trim = RegInit(False)
+      val triggerPending = RegInit(False)
+      val triggerAddress = Reg(UInt(XLEN bits))
       val trimIndex = Reg(UInt(vcs.vstartWidth bits)) init(0)
       val inflight = host.list[InflightService].map(_.hasInflight(0)).orR
       // Older instructions have left, so vl, vstart and v0 are final; the first micro-op uses that sample
@@ -668,6 +670,10 @@ class VectorPlugin(val layer : LaneLayer, val dlen : Int = 64, var withMemory : 
           val refill = !rsp.trap.exception && rsp.trap.code === TrapReason.MMU_REFILL
           val arm = rsp.trap.valid && faultOnlyFirst(Decode.UOP) && d.index =/= 0 && (rsp.trap.exception || refill)
           armed := arm
+          when(rsp.trap.valid && !rsp.trap.exception && rsp.trap.code === TrapReason.DEBUG_TRIGGER) {
+            triggerPending := True
+            triggerAddress := lsu.logic.onCtrl(lsu.logic.vector.ELEMENT).address.resized
+          }
           when(rsp.trap.valid) {
             vcs.vstartWrite.valid := True
             vcs.vstartWrite.payload := d.index
@@ -707,6 +713,7 @@ class VectorPlugin(val layer : LaneLayer, val dlen : Int = 64, var withMemory : 
         memory.resumeField := 0
         memory.armed := False
         memory.trim := False
+        memory.triggerPending := False
       }
       when(tp.api.harts(0).rvTrap) { clear() }
       if (pp.p.withDebug) {
@@ -714,6 +721,13 @@ class VectorPlugin(val layer : LaneLayer, val dlen : Int = 64, var withMemory : 
         when(fsm.isActive(fsm.ENTER_DEBUG)) { clear() }
       }
       when(memory.resume) { pp.inhibateInterrupts(0) }
+    }
+
+    if (withMemory && host[PrivilegedPlugin].p.debugTriggers > 0) {
+      val hart = host[TrapPlugin].logic.harts(0)
+      hart.trap.fsm.TRAP_TVAL.whenIsActiveWithPriority(1) {
+        when(memory.triggerPending) { hart.crsPorts.write.data := memory.triggerAddress.asBits }
+      }
     }
 
     // Fault-only-first: an armed element's exception, from the LSU or the page walker, refetches the instruction
@@ -768,6 +782,7 @@ class VectorPlugin(val layer : LaneLayer, val dlen : Int = 64, var withMemory : 
       val trap = host[TrapPlugin].logic.harts(0).trap
       val trapEpc = CombInit(trap.pending.pc).simPublic()
       val trapTval = CombInit(trap.fsm.buffer.trap.tval).simPublic()
+      if (withMemory) when(memory.triggerPending) { trapTval := memory.triggerAddress.asBits.resized }
     }
   }
 

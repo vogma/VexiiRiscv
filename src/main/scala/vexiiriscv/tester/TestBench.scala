@@ -24,7 +24,9 @@ import vexiiriscv._
 import vexiiriscv.execute.cfu.{CfuPlugin, CfuRsp}
 import vexiiriscv.execute.lsu.{LsuCachelessAxi4Plugin, LsuCachelessPlugin, LsuCachelessWishbonePlugin, LsuL1, LsuL1Axi4Plugin, LsuL1Plugin, LsuL1TlPlugin, LsuL1WishbonePlugin, LsuPlugin}
 import vexiiriscv.fetch.{FetchCachelessPlugin, FetchL1Plugin, PcService}
-import vexiiriscv.misc.{EmbeddedRiscvJtag, ImsicPlugin, PrivilegedPlugin}
+import vexiiriscv.misc.{EmbeddedRiscvJtag, ImsicPlugin, PrivilegedPlugin, TrapPlugin}
+import vexiiriscv.execute.vector.VectorPlugin
+import vexiiriscv.test.WhiteboxerPlugin
 import vexiiriscv.regfile.RegFilePlugin
 import vexiiriscv.riscv.{IntRegFile, Riscv}
 import vexiiriscv.test.konata.Backend
@@ -37,11 +39,41 @@ import java.util.{Locale, Scanner}
 import scala.collection.mutable
 import scala.collection.mutable.ArrayBuffer
 
+class VectorSystemSignals(core: VexiiRiscv, plugin: VectorPlugin) extends Area {
+  private val v = plugin.logic
+  private val p = core.host[PrivilegedPlugin].hart(0)
+  def tap[T <: Data](d: T): T = CombInit(d).simPublic()
+  val valid = tap(v.e0.isValid && v.e0(plugin.SEL))
+  val pc = tap(Global.expendPc(v.e0(Global.PC), 64))
+  val mem = tap(v.e0(plugin.MEM))
+  val rsp = tap(v.memory.port.rsp)
+  val index = tap(v.memory.complete(v.DESCRIPTOR).index)
+  val resume = tap(v.memory.resume)
+  val armed = tap(v.memory.armed)
+  val trim = tap(v.memory.trim)
+  val enabled = tap(p.m.status.mie || !p.withMachinePrivilege)
+  val allowInterrupts = tap(core.host[PrivilegedPlugin].api.harts(0).allowInterrupts)
+  val haltRequest = tap(if(core.host[PrivilegedPlugin].p.withDebug) p.debug.bus.haltReq else False)
+  val debugMode = tap(p.debugMode)
+  val timerEnabled = tap(p.spec.interrupt.find(_.id == 7).get.cond)
+  val softwareEnabled = tap(p.spec.interrupt.find(_.id == 3).get.cond)
+  val epc = tap(v.whitebox.trapEpc)
+  val vs = tap(core.host[vexiiriscv.execute.vector.VectorCsrService].vs)
+  val vstart = tap(core.host[vexiiriscv.execute.vector.VectorCsrService].vstart)
+  val vl = tap(core.host[vexiiriscv.execute.vector.VectorCsrService].vl)
+}
+
 class TestBenchDut(plugins : scala.collection.Seq[scala.collection.Seq[Hostable]]) extends Component {
   val cores = plugins.map(VexiiRiscv(_))
 
   val signal = Fiber patch {
     cores.foreach(_.getAllIo.foreach(_.simPublic()))
+  }
+
+  val vectorSystem = Fiber patch {
+    cores.map(core => core.rework { core.database on {
+      core.host.get[VectorPlugin].filter(_.withMemory).map(plugin => new VectorSystemSignals(core, plugin).setName("vectorSystem"))
+    }})
   }
 
   val lsuL1TlBus = Fiber patch {
@@ -234,6 +266,8 @@ class TestOptions {
   var dbusReadyFactor = 1.01f
   var dbusBaseLatency = 0
   var seed = 2
+  var vectorSystemTrace = false
+  var vectorIrqInject = false
   var jtagRemote = false
   var spawnProcess = Option.empty[String]
 
@@ -311,6 +345,10 @@ class TestOptions {
       .text("Set the instruction-bus ready/response randomization factor; default: 1.01.")
     opt[Double]("dbus-ready-factor").unbounded().action { (v, c) => dbusReadyFactor = v.toFloat }
       .text("Set the data-bus ready/response randomization factor; default: 1.01.")
+    opt[Unit]("vector-irq-inject").action { (v, c) => vectorIrqInject = true }
+      .text("Schedule CLINT inputs during labelled vector interrupt tests.")
+    opt[Unit]("vector-system-trace").action { (v, c) => vectorSystemTrace = true }
+      .text("Record vector execution, retry and enabled interrupt events.")
     opt[Unit]("jtag-remote").unbounded().action { (v, c) => jtagRemote = true }
       .text("Enable remote JTAG; requires --debug-jtag-tap.")
     opt[Int]("memory-latency").action { (v, c) => dbusBaseLatency = v; ibusBaseLatency = v }
@@ -557,6 +595,59 @@ class TestOptions {
       cmb.mem = mem
     }
     peripheral.withStdIn = withStdIn
+    if(vectorIrqInject) {
+      require(vectorSystemTrace, "interrupt injection requires the system trace")
+      val names = Seq("irq_div_timer", "irq_add_timer", "irq_div_software", "irq_add_software", "irq_load_timer", "irq_ff_timer")
+      val sites = loadedElfs.flatMap(elf => names.flatMap(n =>
+        Option(elf.getELFSymbol(n)).map(s => ((if(xlen == 32) s.st_value & 0xffffffffL else s.st_value), n))
+      )).toMap
+      require(sites.nonEmpty, "no labelled vector interrupt sites")
+      val seen = mutable.Set[Long]()
+      val v = duts.vectorSystem.get.head.get
+      var scheduled = Option.empty[(Long, String)]
+      cd.onSamplings {
+        scheduled.filter(_._1 <= probe.cycle).foreach { case (_, name) =>
+          if(name.endsWith("software")) peripheral.access(true, peripheral.CLINT_BASE, Array[Byte](1, 0, 0, 0))
+          else peripheral.cmp(0) = probe.cycle
+          scheduled = None
+        }
+        if(v.valid.toBoolean) {
+          val pc = v.pc.toBigInt.longValue
+          sites.get(pc).filter(_ => !seen(pc)).foreach { name =>
+            seen += pc
+            scheduled = Some((probe.cycle + 1, name))
+          }
+        }
+      }
+    }
+
+    if(vectorSystemTrace) duts.cores.zipWithIndex.foreach { case (core, i) =>
+      val v = duts.vectorSystem.get(i).get
+      val wb = core.host[WhiteboxerPlugin].logic
+      val out = new PrintWriter(new File(currentTestPath(), s"vector-system$i.csv"))
+      out.println("cycle,event,pc,a,b,c")
+      var previous = ""
+      var previousDebug = ""
+      cd.onSamplings {
+        val pins = s"${v.enabled.toBoolean},${v.timerEnabled.toBoolean},${v.softwareEnabled.toBoolean},${v.resume.toBoolean},${v.armed.toBoolean},${v.trim.toBoolean}"
+        if(pins != previous) {
+          out.println(s"${probe.cycle},state,0,$pins")
+          previous = pins
+        }
+        val debug = s"${v.haltRequest.toBoolean},${v.debugMode.toBoolean},${v.vstart.toInt}"
+        if(debug != previousDebug) {
+          out.println(s"${probe.cycle},debug,0,$debug")
+          previousDebug = debug
+        }
+        if(v.valid.toBoolean) out.println(s"${probe.cycle},execute,${v.pc.toBigInt.toString(16)},${v.mem.toBoolean},${v.vs.toInt},${v.vstart.toInt}")
+        if(v.rsp.valid.toBoolean) out.println(s"${probe.cycle},memory,0,${v.index.toInt},${v.rsp.trap.valid.toBoolean},${v.rsp.trap.code.toInt},${v.rsp.load.toBoolean},${v.rsp.access.toBoolean}")
+        wb.commits.ports.foreach { p => if(p.valid.toBoolean) out.println(s"${probe.cycle},commit,${p.pc.toLong.toHexString},0,0,0") }
+        if(wb.trap.ports.head.valid.toBoolean) out.println(s"${probe.cycle},trap,${v.epc.toBigInt.toString(16)},${wb.trap.ports.head.interrupt.toBoolean},${wb.trap.ports.head.cause.toInt},${v.vstart.toInt}")
+        out.flush()
+      }
+      onSimEnd { out.close() }
+    }
+
 
     val manager = IoDeviceManager()
 
