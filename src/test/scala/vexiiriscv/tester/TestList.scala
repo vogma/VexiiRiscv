@@ -14,6 +14,8 @@ import scala.io.Source
 /** Compile once and run a fresh list of self-checking ELFs with RVLS. */
 object TestList {
   case class Entry(name: String, elf: File, options: Seq[String])
+  // List-only option: log LSU events of the entry to lsu-events.log (LsuEventMonitor)
+  val LSU_EVENTS = "--with-lsu-events"
 
   def read(file: File): Seq[Entry] = {
     val source = Source.fromFile(file)
@@ -69,7 +71,8 @@ object TestList {
     require(rvlsAvailable || entries.forall(_.options.contains("--no-rvls-check")),
       "RVLS is not available: ext/rvls/build/apps/rvls.so")
 
-    val tests = entries.map { entry =>
+    val tests = entries.map { entry0 =>
+      val entry: Entry = entry0.copy(options = entry0.options.filter(_ != LSU_EVENTS))
       val options = defaults ++ entry.options
       require(!options.contains("--no-probe"), "--no-probe disables retirement checking and is forbidden")
       require(!options.contains("--pass-after"), "--pass-after disables self-checking and is forbidden")
@@ -84,7 +87,8 @@ object TestList {
       test.testName = Some(entry.name)
       test.withStdIn = false
       if (test.failAfter.isEmpty) test.setFailAfter(100000000L)
-      entry -> test
+      require(!entry0.options.contains(LSU_EVENTS) || !test.dualSim, s"$LSU_EVENTS needs a single simulation")
+      entry0 -> test
     }
 
     FileUtils.forceMkdir(output)
@@ -92,18 +96,28 @@ object TestList {
     simConfig.workspacePath(new File(output, "simWorkspace").getAbsolutePath)
     simConfig.setTestPath(new File(output, "tests/$TEST").getAbsolutePath)
     if (tests.exists(_._2.traceWave)) simConfig.withFstWave
-    val compiled = simConfig.compile(TestBench.makeDut(param, 1))
+    val withEvents = entries.exists(_.options.contains(LSU_EVENTS))
+    val compiled = simConfig.compile {
+      val dut = TestBench.makeDut(param, 1)
+      if (withEvents) LsuEventMonitor.publish(dut)
+      dut
+    }
     implicit val executor: ExecutionContext = ExecutionContext.fromExecutorService(Executors.newFixedThreadPool(jobs))
     val hostOutput = Console.out
     val tasks = tests.map { case (entry, test) =>
       val directory = new File(output, "tests/" + entry.name)
       new AsyncJob(toStdout = false, logsPath = directory)({
         write(new File(directory, "args"), (defaults ++ entry.options).mkString(" ") + "\n")
+        val events = entry.options.contains(LSU_EVENTS)
         var status = "PASS"
         var reason = ""
         try {
           if (!entry.elf.isFile) throw new java.io.FileNotFoundException(s"missing ELF: ${entry.elf}")
-          test.test(compiled)
+          if (events) compiled.doSimUntilVoid(name = test.getTestName(), seed = test.seed) { dut =>
+            disableSimWave()
+            test.test(dut, f => f)
+            LsuEventMonitor.attach(dut, new File(directory, "lsu-events.log"))
+          } else test.test(compiled)
         } catch {
           case error: Throwable =>
             status = "FAIL"
