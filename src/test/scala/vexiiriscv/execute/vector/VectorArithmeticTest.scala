@@ -57,7 +57,8 @@ class VectorArithmeticTest extends AnyFunSuite {
     ("vmax", VectorAluOp.MAX, false), ("vsll", VectorAluOp.SLL, false), ("vsrl", VectorAluOp.SRL, false),
     ("vsra", VectorAluOp.SRL, false), ("vadc", VectorAluOp.ADD, false), ("vsbc", VectorAluOp.SUB, false),
     ("vmerge", VectorAluOp.MERGE, false), ("vzext2", VectorAluOp.ADD, false), ("vsext2", VectorAluOp.ADD, false),
-    ("vzext4", VectorAluOp.ADD, false), ("vsext4", VectorAluOp.ADD, false),
+    ("vzext4", VectorAluOp.ADD, false), ("vsext4", VectorAluOp.ADD, false), ("vzext8", VectorAluOp.ADD, false),
+    ("vsext8", VectorAluOp.ADD, false),
     ("vmseq", VectorAluOp.SEQ, false), ("vmsne", VectorAluOp.SNE, false), ("vmsltu", VectorAluOp.SLT, false),
     ("vmslt", VectorAluOp.SLT, false), ("vmsleu", VectorAluOp.SLE, false), ("vmsle", VectorAluOp.SLE, false),
     ("vmsgtu", VectorAluOp.SGT, false), ("vmsgt", VectorAluOp.SGT, false), ("vmadc", VectorAluOp.ADD, false),
@@ -87,34 +88,35 @@ class VectorArithmeticTest extends AnyFunSuite {
     if (reductions.contains(name)) 0
     else if (Seq("vwaddu", "vwadd", "vwsubu", "vwsub").contains(name)) 1
     else if (name.startsWith("vw")) 2 else if (name.startsWith("vn")) 3 else 0
-  // Widening and narrowing need SEW <= 16 and LMUL <= 4 (norm:vwop_vd_eew_emul, norm:vnarrowing_eew_emul)
-  // Widening reductions need SEW <= 16 at any LMUL (norm:vwredsum_op)
-  def sizeOk(name: String, sew: Int, lmul: Int) =
-    if (name.startsWith("vwred")) sew <= 1 else wideKind(name) == 0 || sew <= 1 && lmul <= 2
+  // Widening and narrowing need SEW <= ELEN/2 and LMUL <= 4 (norm:vwop_vd_eew_emul, norm:vnarrowing_eew_emul)
+  // Widening reductions need SEW <= ELEN/2 at any LMUL (norm:vwredsum_op)
+  def sizeOk(name: String, sew: Int, lmul: Int, elen: Int) = {
+    val wideSew = log2Up(elen / 8) - 1
+    if (name.startsWith("vwred")) sew <= wideSew else wideKind(name) == 0 || sew <= wideSew && lmul <= 2
+  }
   // Operations whose signedness the command must carry; the others get a random value
-  def isSigned(name: String) = Seq("vsadd", "vssub", "vmin", "vmax", "vsra", "vsext2", "vsext4", "vmslt", "vmsle", "vmsgt",
+  def isSigned(name: String) = Seq("vsadd", "vssub", "vmin", "vmax", "vsra", "vsext2", "vsext4", "vsext8", "vmslt", "vmsle", "vmsgt",
     "vaadd", "vasub", "vssra", "vwadd", "vwsub", "vwaddw", "vwsubw", "vnsra", "vnclip", "vredmin", "vredmax", "vwredsum").contains(name)
   def signedMatters(name: String) = isSigned(name) || carries.contains(name) ||
-    Seq("vsaddu", "vssubu", "vminu", "vmaxu", "vsrl", "vzext2", "vzext4", "vmsltu", "vmsleu", "vmsgtu", "vaaddu", "vasubu",
+    Seq("vsaddu", "vssubu", "vminu", "vmaxu", "vsrl", "vzext2", "vzext4", "vzext8", "vmsltu", "vmsleu", "vmsgtu", "vaaddu", "vasubu",
       "vssrl", "vwaddu", "vwsubu", "vwadduw", "vwsubuw", "vnsrl", "vnclipu", "vredminu", "vredmaxu", "vwredsumu").contains(name)
   // v0 as carry or merge select: encoded masked, every body element written
   def withV0(name: String) = Seq("vadc", "vsbc", "vmerge", "vmadcm", "vmsbcm").contains(name)
   // Encoded unmasked
   def unmaskedOnly(name: String) = Seq("vmadc", "vmsbc").contains(name) || logicals.contains(name)
   // log2 of the extension factor, 0 for single width
-  def extLog2(name: String) = if (name.endsWith("ext2")) 1 else if (name.endsWith("ext4")) 2 else 0
+  def extLog2(name: String) = if (name.endsWith("ext2")) 1 else if (name.endsWith("ext4")) 2 else if (name.endsWith("ext8")) 3 else 0
   // NREG of a whole-register move, 0 otherwise
   def nregOf(name: String) = if (name.matches("vmv[1248]r")) name(3).asDigit else 0
-  // Forms whose SEW-64 datapath is not modelled at ELEN 64 yet: fixed point, widening/narrowing, reductions, extensions
-  def noSew64(name: String) = ops.exists(o => o._1 == name && o._3) || roundings.contains(name) || wideKind(name) != 0 ||
-    reductions.contains(name) || extLog2(name) != 0
   def shapeOf(name: String) =
     if (nregOf(name) > 0) VectorShape.WHOLE
     else if (compares.contains(name) || carries.contains(name)) VectorShape.MASK_DST
     else if (logicals.contains(name)) VectorShape.MASK_MM
     else if (reductions.contains(name)) if (name.startsWith("vw")) VectorShape.WREDUCE else VectorShape.REDUCE
     else if (wideKind(name) != 0) Seq(VectorShape.WIDE_VV, VectorShape.WIDE_WV, VectorShape.NARROW)(wideKind(name) - 1)
-    else extLog2(name) match { case 1 => VectorShape.EXT2; case 2 => VectorShape.EXT4; case _ => VectorShape.SINGLE }
+    else extLog2(name) match {
+      case 1 => VectorShape.EXT2; case 2 => VectorShape.EXT4; case 3 => VectorShape.EXT8; case _ => VectorShape.SINGLE
+    }
 
   def run(vlen: Int, xlen: Int, elen: Int = 32): Unit = {
     val p = VectorRegFileParam(vlen = vlen)
@@ -162,6 +164,8 @@ class VectorArithmeticTest extends AnyFunSuite {
       val outcomes = scala.collection.mutable.Map[(String, String), Int]().withDefaultValue(0)
       // Rounding increments seen per operation and vxrm
       val increments = scala.collection.mutable.Map[(String, Int, Int), Int]().withDefaultValue(0)
+      // Operations run with 64-bit destination or adder lanes
+      val lanes64 = scala.collection.mutable.Set[String]()
       def execute(name: String, sew: Int, lmul: Int, vl: Int, start: Int, masked0: Boolean,
                   scalarOperand0: Boolean, shape0: Int = VectorShape.SINGLE, vxrm0: Int = -1): Unit = {
         val (_, op, saturate) = ops.find(_._1 == name).get
@@ -182,6 +186,7 @@ class VectorArithmeticTest extends AnyFunSuite {
         val mask = (BigInt(1) << width) - 1
         // Any aligned groups; same-EEW overlap is always legal, and vd = v0 only unmasked
         val wk = wideKind(name)
+        if (sew == 3 || sew == 2 && (wk != 0 || name.startsWith("vwred"))) lanes64 += name
         val group = if (whole) nreg else 1 << scala.math.max(lmul, 0)
         def pick(): Int = random.nextInt(32 / group) * group
         // Widening and narrowing groups: SEW operands span narrowGroup, 2*SEW ones wideGroup (norm:vreg_overlap_legal)
@@ -421,8 +426,8 @@ class VectorArithmeticTest extends AnyFunSuite {
               case "vadc" => (a + b + m, false)
               case "vsbc" => (a - b - m, false)
               case "vmerge" => (if (m == 1) b else a, false)
-              case "vzext2" | "vzext4" => (a, false)
-              case "vsext2" | "vsext4" => (sextFrom(a, width >> ext), false)
+              case "vzext2" | "vzext4" | "vzext8" => (a, false)
+              case "vsext2" | "vsext4" | "vsext8" => (sextFrom(a, width >> ext), false)
               // Exact sums and differences, then a rounded shift by 1; vasub wraps (norm:vasub_vasubu_op_overflow)
               case "vaaddu" => (roundoff(a + b, 1), false)
               case "vaadd" => (roundoff(sext(a) + sext(b), 1), false)
@@ -536,7 +541,7 @@ class VectorArithmeticTest extends AnyFunSuite {
       for (sew <- 0 to maxSew; lmul <- -3 to 3 if (8 << sew) <= elen * scala.math.pow(2, lmul)) {
         val vlmax = ((vlen / (8 << sew)) * scala.math.pow(2, lmul)).toInt
         // Extensions need a source EEW of at least 8 bits
-        for ((name, _, _) <- ops if sew >= extLog2(name) && sizeOk(name, sew, lmul) && (sew < 3 || !noSew64(name)); scalar <- Seq(false, true);
+        for ((name, _, _) <- ops if sew >= extLog2(name) && sizeOk(name, sew, lmul, elen); scalar <- Seq(false, true);
              vl <- Seq(0, 1, vlmax - 1, vlmax).distinct;
              masked <- Seq(false, true))
           execute(name, sew, lmul, vl, 0, masked, scalar)
@@ -544,8 +549,8 @@ class VectorArithmeticTest extends AnyFunSuite {
           execute("vadd", sew, lmul, vlmax, start, true, false)
       }
       // Operands at the limits: random elements rarely reach them exactly, nor equal each other or shift by 0
-      for (sew <- 0 to maxSew; (name, _, saturate) <- ops if sew >= extLog2(name) && sizeOk(name, sew, 1) && name != "vmv" &&
-           name != "vid" && nregOf(name) == 0 && (sew < 3 || !noSew64(name));
+      for (sew <- 0 to maxSew; (name, _, saturate) <- ops if sew >= extLog2(name) && sizeOk(name, sew, 1, elen) && name != "vmv" &&
+           name != "vid" && nregOf(name) == 0;
            _ <- 0 until (if (saturate || compares.contains(name) || carries.contains(name) || roundings.contains(name)) 4 else 2)) {
         val size = 1 << sew
         // vasub wraps only for INT_MAX - INT_MIN (norm:vasub_vasubu_op_overflow)
@@ -583,6 +588,7 @@ class VectorArithmeticTest extends AnyFunSuite {
       for ((name, _, _) <- ops if wideKind(name) != 0 || reductions.contains(name))
         assert(outcomes((name, "overlap")) > 0, s"$name never overlapped vd")
       for (name <- reductions) assert(outcomes((name, "inactive")) > 0, s"$name never had only inactive elements")
+      if (elen == 64) assert(lanes64 == ops.map(_._1).toSet, s"never with 64-bit lanes: ${ops.map(_._1).toSet -- lanes64}")
       println(s"VectorArithmetic VLEN=$vlen XLEN=$xlen ELEN=$elen: $cases cases, $writes writes, saturation outcomes " +
         saturations.toSeq.sorted.map { case ((n, o), c) => s"$n/$o=$c" }.mkString(" ") +
         s", $sourceInVd extensions with vs2 in the highest part of vd, mask outcomes " +

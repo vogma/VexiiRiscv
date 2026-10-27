@@ -144,6 +144,8 @@ object Rvv extends AreaObject {
   val VSEXT_VF4 = opv("vsext.vf4", "010010", "010", "-", "-----", "00101", Nil)
   val VZEXT_VF2 = opv("vzext.vf2", "010010", "010", "-", "-----", "00110", Nil)
   val VSEXT_VF2 = opv("vsext.vf2", "010010", "010", "-", "-----", "00111", Nil)
+  val VZEXT_VF8 = opv("vzext.vf8", "010010", "010", "-", "-----", "00010", Nil)
+  val VSEXT_VF8 = opv("vsext.vf8", "010010", "010", "-", "-----", "00011", Nil)
   val VMSBF_M = opv("vmsbf.m", "010100", "010", "-", "-----", "00001", Nil)
   val VMSOF_M = opv("vmsof.m", "010100", "010", "-", "-----", "00010", Nil)
   val VMSIF_M = opv("vmsif.m", "010100", "010", "-", "-----", "00011", Nil)

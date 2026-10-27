@@ -24,6 +24,7 @@ object VectorEmul {
   val N = 4    // EMUL = NREG of vmv<nr>r.v
   val W = 5    // EMUL = 2 * LMUL
   val INDEX16 = 6 // EEW 16 gather indices
+  val L8 = 7   // EMUL = LMUL / 8
   def width = 3
 }
 
@@ -44,6 +45,7 @@ object VectorRange {
   val WIDE = 3 // SEW <= ELEN / 2 and LMUL <= 4
   val WIDE_SCALAR = 4 // SEW <= ELEN / 2 for a single 2 * SEW element, whatever LMUL
   val NO64 = 5 // SEW < 64 (norm:Zve64_eew64_nsupport_vmulh, norm:Zve64_eew64_nsupport_vsmul)
+  val EXT8 = 6 // SEW = 64
   def width = 3
 }
 
@@ -172,8 +174,12 @@ class VectorPlugin(val layer : LaneLayer, val dlen : Int = 64, var withMemory : 
       if (elen == 64 && shiftNames(name) && form == "vi") spec.addDecoding(UNSIGNED_IMMEDIATE -> True)
     }
     // Extensions: vs2 at SEW / f and EMUL = LMUL / f (norm:vsext_vzext_vs_eew_emul)
-    for (f <- Seq(2, 4); signed <- Seq(false, true)) {
-      val (s, cls, range) = if (f == 2) (VectorShape.EXT2, VectorEmul.L2, VectorRange.EXT2) else (VectorShape.EXT4, VectorEmul.L4, VectorRange.EXT4)
+    for (f <- (if (elen == 64) Seq(2, 4, 8) else Seq(2, 4)); signed <- Seq(false, true)) {
+      val (s, cls, range) = f match {
+        case 2 => (VectorShape.EXT2, VectorEmul.L2, VectorRange.EXT2)
+        case 4 => (VectorShape.EXT4, VectorEmul.L4, VectorRange.EXT4)
+        case 8 => (VectorShape.EXT8, VectorEmul.L8, VectorRange.EXT8)
+      }
       add(Rvv.all(s"v${if (signed) "s" else "z"}ext.vf$f"), ARITH -> True, SHAPE -> shape(s), SIGNED -> Bool(signed),
         CHECK_VILL -> True, CHECK_VSTART -> True, EMUL_VD -> emul(VectorEmul.L), EMUL_VS2 -> emul(cls), MASK_NOT_V0 -> True,
         OVERLAP_VS2 -> U(VectorOverlap.WIDEN, VectorOverlap.width bits), RANGE -> U(range, VectorRange.width bits))
@@ -382,14 +388,15 @@ class VectorPlugin(val layer : LaneLayer, val dlen : Int = 64, var withMemory : 
     val DESCRIPTOR = Payload(VectorMemoryDescriptor(vcs.vstartWidth, split))
 
     // log2 EMUL of an operand class; classes without a group check as one register
-    def emulOf(cls : UInt, lmul : SInt, nreg : SInt) : SInt = cls.mux(
+    def emulOf(cls : UInt, lmul : SInt, nreg : SInt) : SInt = cls.mux(Seq[(Any, SInt)](
       U(VectorEmul.L) -> lmul.resize(4),
       U(VectorEmul.L2) -> (lmul.resize(4) - 1),
       U(VectorEmul.L4) -> (lmul.resize(4) - 2),
       U(VectorEmul.N) -> nreg,
       U(VectorEmul.W) -> (lmul.resize(4) + 1),
-      U(VectorEmul.INDEX16) -> (lmul.resize(4) + 1 - vcs.vtype.vsew.resize(4).asSInt),
-      default -> S(0, 4 bits)
+      U(VectorEmul.INDEX16) -> (lmul.resize(4) + 1 - vcs.vtype.vsew.resize(4).asSInt)) ++
+      (if (elen == 64) Seq(U(VectorEmul.L8) -> (lmul.resize(4) - 3)) else Nil) ++
+      Seq(default -> S(0, 4 bits)) : _*
     )
     // A register group of 2^log2 registers starts at a multiple of 2^log2
     def aligned(reg : UInt, log2 : SInt) : Bool = {
@@ -462,6 +469,7 @@ class VectorPlugin(val layer : LaneLayer, val dlen : Int = 64, var withMemory : 
           U(VectorRange.WIDE) -> (vtype.vsew === wideSew || vtype.vlmul === B"011"),
           U(VectorRange.WIDE_SCALAR) -> (vtype.vsew === wideSew),
           U(VectorRange.NO64) -> (vtype.vsew === 3),
+          U(VectorRange.EXT8) -> (vtype.vsew < 3),
           default -> False
         ) else RANGE.mux(
           U(VectorRange.EXT2) -> (vtype.vsew === 0),
