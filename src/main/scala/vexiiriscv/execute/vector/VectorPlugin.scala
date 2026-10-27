@@ -131,7 +131,7 @@ class VectorPlugin(val layer : LaneLayer, val dlen : Int = 64, var withMemory : 
       spec.addDecoding(decodings)
       ds.addMicroOpDecoding(op, VECTOR, True)
       dp.fenceOlder(op)
-      spec.mayFlushUpTo(0)
+      spec.mayFlushUpTo(1)
       spec.dontFlushFrom(0)
       op.resources.foreach {
         case RfResource(IntRegFile, rs : RfRead) => spec.addRsSpec(rs, 0)
@@ -310,7 +310,8 @@ class VectorPlugin(val layer : LaneLayer, val dlen : Int = 64, var withMemory : 
 
     ds.addIllegalCheck(ctrl => ctrl(VECTOR) && !vcs.vectorEnable)
 
-    val age = elp.getExecuteAge(0)
+    // The illegal-instruction trap is raised one stage after the checks, from a register
+    val age = elp.getExecuteAge(1)
     val flushPort = sp.newFlushPort(age, laneAgeWidth = Execute.LANE_AGE_WIDTH, withUopId = true)
     val trapPort = ts.newTrap(age, Execute.LANE_AGE_WIDTH)
     ioRetainer.release()
@@ -483,21 +484,7 @@ class VectorPlugin(val layer : LaneLayer, val dlen : Int = 64, var withMemory : 
 
       val sel = isValid && SEL
       val fire = sel && isReady && !legality.illegal
-
-      flushPort.valid := sel && legality.illegal
-      flushPort.hartId := Global.HART_ID
-      flushPort.uopId := Decode.UOP_ID
-      flushPort.laneAge := Execute.LANE_AGE
-      flushPort.self := False
-
-      trapPort.valid := sel && legality.illegal
-      trapPort.exception := True
-      trapPort.code := CSR.MCAUSE_ENUM.ILLEGAL_INSTRUCTION
-      trapPort.tval := Decode.UOP.resized
-      trapPort.tval2 := 0
-      trapPort.arg := 0
-      trapPort.laneAge := Execute.LANE_AGE
-      trapPort.hartId := Global.HART_ID
+      val ILLEGAL = insert(legality.illegal)
       when(sel && legality.illegal) {
         bypass(Global.TRAP) := True
         bypass(Global.COMMIT) := False
@@ -585,7 +572,12 @@ class VectorPlugin(val layer : LaneLayer, val dlen : Int = 64, var withMemory : 
         element.io.cmd.negate := NEGATE
         element.io.cmd.vxrm := vcs.vxrm
         val unit = ARITH || ELEMENT
-        elp.freezeWhen(sel && unit && !legality.illegal && !completed)
+        // An illegal uop is held for one cycle before it leaves for its trap, which keeps the checks out of the freeze
+        val illegalHeld = RegInit(False)
+        elp.freezeWhen(sel && unit && !illegalHeld && !completed)
+        when(sel && legality.illegal) { illegalHeld := True }
+        when(isReady) { illegalHeld := False }
+        assert(!(sel && illegalHeld && !legality.illegal), "vector legality changed while the uop was held in E0")
         when(arithmetic.io.cmd.valid || element.io.cmd.valid) { started := True }
         when(arithmetic.io.done || element.io.done) { completed := True }
         when(fire && unit) {
@@ -601,6 +593,22 @@ class VectorPlugin(val layer : LaneLayer, val dlen : Int = 64, var withMemory : 
     val e1 = new layer.Execute(1) {
       wb.valid := SEL && !MEM
       wb.payload := RESULT
+
+      val trap = isValid && SEL && e0.ILLEGAL
+      flushPort.valid := trap
+      flushPort.hartId := Global.HART_ID
+      flushPort.uopId := Decode.UOP_ID
+      flushPort.laneAge := Execute.LANE_AGE
+      flushPort.self := False
+
+      trapPort.valid := trap
+      trapPort.exception := True
+      trapPort.code := CSR.MCAUSE_ENUM.ILLEGAL_INSTRUCTION
+      trapPort.tval := Decode.UOP.resized
+      trapPort.tval2 := 0
+      trapPort.arg := 0
+      trapPort.laneAge := Execute.LANE_AGE
+      trapPort.hartId := Global.HART_ID
     }
 
     // One LSU micro-op per field of each active element; the descriptor travels with it from the dispatch insert node.
