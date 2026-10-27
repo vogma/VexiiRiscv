@@ -9,10 +9,10 @@ class VectorPermuteTest extends AnyFunSuite {
   import VectorElementOp._
   val ops = Seq(SLIDEUP, SLIDEDOWN, SLIDE1UP, SLIDE1DOWN, GATHER, GATHEREI16, COMPRESS)
 
-  def run(vlen: Int, xlen: Int): Unit = {
+  def run(vlen: Int, xlen: Int, elen: Int = 32): Unit = {
     val p = VectorRegFileParam(vlen = vlen)
-    SimConfig.compile(new VectorElementHarness(p, xlen)).doSim { dut =>
-      val rng = new Random(1818 + vlen + xlen)
+    SimConfig.compile(new VectorElementHarness(p, xlen, elen)).doSim { dut =>
+      val rng = new Random(1818 + vlen + xlen + (if (elen == 64) 64 else 0))
       val nbytes = vlen / 8
       def tick(): Unit = {
         dut.clockDomain.risingEdge(); sleep(5)
@@ -36,7 +36,7 @@ class VectorPermuteTest extends AnyFunSuite {
       assert(!dut.io.initHold.toBoolean)
       var cases, writes = 0
       val crossings = scala.collection.mutable.Set[Int]()
-      for (op <- ops; sew <- 0 to 2; lmul <- -2 to 3 if (8 << sew) <= 32 * scala.math.pow(2, lmul)
+      for (op <- ops; sew <- 0 to log2Up(elen / 8); lmul <- -3 to 3 if (8 << sew) <= elen * scala.math.pow(2, lmul)
            if !(op == GATHEREI16 && lmul + 1 - sew > 3)) {
         val size = 1 << sew
         val max = (vlen / (8 << sew) * scala.math.pow(2, lmul)).toInt
@@ -71,9 +71,12 @@ class VectorPermuteTest extends AnyFunSuite {
             if (op == COMPRESS) bytes(vs1)(b) = if (pattern == 0) 0 else if (pattern == 1) 255 else bytes(vs1)(b)
           }
           val indexBytes = if (op == GATHEREI16) 2 else size
+          // A 64-bit index above 2^32 is out of range, also on RV32 (norm:vrgather_vrgatherei16_id_ge_vlmax)
           if (vector) for (i <- 0 until max) {
-            val value = Seq(BigInt(0), BigInt(max - 1), BigInt(max), BigInt(max + 1),
-              (BigInt(1) << (indexBytes * 8)) - 1, BigInt(rng.nextInt(max)))(i % 6)
+            val values = Seq(BigInt(0), BigInt(max - 1), BigInt(max), BigInt(max + 1),
+              (BigInt(1) << (indexBytes * 8)) - 1, BigInt(rng.nextInt(max))) ++
+              (if (indexBytes == 8) Seq((BigInt(1) << 32) | 1, BigInt(1) << 63) else Nil)
+            val value = values(i % values.size)
             set(bytes, vs1, i, indexBytes, value)
           }
           val expected = bytes.map(_.clone())
@@ -89,7 +92,8 @@ class VectorPermuteTest extends AnyFunSuite {
             }
             if ((op != SLIDEUP || at >= 0) && (op != COMPRESS || bit(vs1, i))) {
               val inserted = (op == SLIDE1UP && i == 0) || (op == SLIDE1DOWN && i == vl - 1)
-              val value = if (inserted) scalar else if (at < 0 || at >= max) BigInt(0) else get(vs2, at.toInt, size)
+              // The inserted scalar is sign-extended from XLEN to SEW (norm:vslide1up-vx_op)
+              val value = if (inserted) (if (scalar.testBit(xlen - 1)) scalar - (BigInt(1) << xlen) else scalar) & ((BigInt(1) << (8 * size)) - 1) else if (at < 0 || at >= max) BigInt(0) else get(vs2, at.toInt, size)
               set(expected, vd, if (op == COMPRESS) pos else i, size, value)
               expectedWrites += 1
               if (op == COMPRESS) pos += 1
@@ -153,10 +157,13 @@ class VectorPermuteTest extends AnyFunSuite {
         }
       }
       assert(ops.forall(crossings.contains), s"group-crossing coverage $crossings")
-      println(s"VectorPermute VLEN=$vlen XLEN=$xlen: $cases cases, $writes writes; full physical readback")
+      println(s"VectorPermute VLEN=$vlen XLEN=$xlen ELEN=$elen: $cases cases, $writes writes; full physical readback")
     }
   }
   test("permutations on RV32") { run(128, 32) }
   test("full XLEN offsets on RV64") { run(128, 64) }
   test("larger register groups") { run(256, 64) }
+  test("SEW-64 permutations on RV32") { run(128, 32, 64) }
+  test("SEW-64 permutations on RV64") { run(128, 64, 64) }
+  test("SEW-64 permutations at VLEN 256") { run(256, 64, 64) }
 }

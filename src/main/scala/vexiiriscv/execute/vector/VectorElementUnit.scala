@@ -43,7 +43,8 @@ case class VectorElementCmd(p: VectorRegFileParam, xlen: Int) extends Bundle {
 
 // One element per cycle from element 0: read in cycle t, extract and extend in t+1, multiply in t+2 and t+3,
 // finish in t+4 and write in t+5. Division serializes active elements; inactive elements take a cycle and no reads.
-// With ELEN 64 an active SEW-64 multiply takes three passes of the 33 x 33 multiplier, reading its element in each.
+// With ELEN 64 an active SEW-64 multiply takes three passes of the 33 x 33 multiplier, reading its element in each,
+// and the divider, iota counts, gather indices and permuted data are 64 bits wide.
 class VectorElementUnit(val p: VectorRegFileParam, val xlen: Int, val elen: Int = 32) extends Component {
   require(p.dlen == 64 && p.readPorts >= 3)
   require(xlen == 32 || xlen == 64)
@@ -167,7 +168,7 @@ class VectorElementUnit(val p: VectorRegFileParam, val xlen: Int, val elen: Int 
 
   // Unsigned division of magnitudes, then restore the quotient or remainder sign
   val division = new Area {
-    val core = new DivRadix(32, 2)
+    val core = new DivRadix(elen, 2)
     core.io.flush := False
     core.io.cmd.valid := x1.valid && divide
     core.io.cmd.normalized := False
@@ -274,9 +275,11 @@ class VectorElementUnit(val p: VectorRegFileParam, val xlen: Int, val elen: Int 
     val valid = RegNext(finish.write || division.core.io.rsp.fire || (scan && is(VectorElementOp.IOTA) && x1.valid)) init(False)
     val last = RegNext((scan && x1.last) || m2.last || (divide && ((division.core.io.rsp.fire && division.last) || (x1.last && !x1.valid)))) init(False)
     val address = RegNext(scan ? x1.address | (divide ? division.address | m2.address))
-    val scanData = command.sew.mux(U(0) -> (count.resize(8).asBits #* 8),
+    val scanData = if (elen == 64) command.sew.mux(U(0) -> (count.resize(8).asBits #* 8), U(1) -> (count.resize(16).asBits #* 4),
+      U(2) -> (count.resize(32).asBits #* 2), default -> count.resize(64).asBits) else command.sew.mux(U(0) -> (count.resize(8).asBits #* 8),
       U(1) -> (count.resize(16).asBits #* 4), default -> (count.resize(32).asBits #* 2))
-    val scanBytes = command.sew.mux(U(0) -> B"0001", U(1) -> B"0011", default -> B"1111")
+    val scanBytes = if (elen == 64) command.sew.mux(U(0) -> B"x01", U(1) -> B"x03", U(2) -> B"x0F", default -> B"xFF") else
+      command.sew.mux(U(0) -> B"0001", U(1) -> B"0011", default -> B"1111")
     val scanMask = (scanBytes.resize(p.beatBytes) << x1.vdByte).resize(p.beatBytes)
     val data = RegNext(scan ? scanData | finish.data)
     val mask = RegNext(scan ? scanMask | finish.mask)
@@ -312,27 +315,31 @@ class VectorElementUnit(val p: VectorRegFileParam, val xlen: Int, val elen: Int 
     val last1 = RegNext(last) init(False)
     val index1 = RegNext(index)
     val byte1 = RegNext(indexOffset.resize(log2Up(p.beatBytes)))
-    val rawIndex = (io.reads(0).rsp >> (byte1 << 3)).resize(32)
-    val selectedIndex = indexSew.mux(U(0) -> rawIndex(7 downto 0).asUInt.resize(xlen),
+    // Indices and offsets are unsigned; a 64-bit index is compared in full, also on RV32
+    val indexWidth = scala.math.max(xlen, elen)
+    val rawIndex = (io.reads(0).rsp >> (byte1 << 3)).resize(elen)
+    val selectedIndex = if (elen == 64) indexSew.mux(U(0) -> rawIndex(7 downto 0).asUInt.resize(indexWidth),
+      U(1) -> rawIndex(15 downto 0).asUInt.resize(indexWidth), U(2) -> rawIndex(31 downto 0).asUInt.resize(indexWidth),
+      default -> rawIndex.asUInt.resize(indexWidth)) else indexSew.mux(U(0) -> rawIndex(7 downto 0).asUInt.resize(xlen),
       U(1) -> rawIndex(15 downto 0).asUInt.resize(xlen), default -> rawIndex.asUInt.resize(xlen))
-    val offset = (vectorIndex ? selectedIndex | command.scalar.asUInt).resize(xlen + 1)
-    val source = UInt(xlen + 1 bits)
+    val offset = (vectorIndex ? selectedIndex | command.scalar.asUInt.resize(indexWidth)).resize(indexWidth + 1)
+    val source = UInt(indexWidth + 1 bits)
     val keep = Bool()
     val scalar = Bool()
-    source := index1.resize(xlen + 1)
+    source := index1.resize(indexWidth + 1)
     keep := True
     scalar := False
     switch(command.op) {
-      spinal.core.is(VectorElementOp.SLIDEUP) { source := index1.resize(xlen + 1) - offset; keep := index1.resize(xlen + 1) >= offset }
-      spinal.core.is(VectorElementOp.SLIDEDOWN) { source := index1.resize(xlen + 1) + offset }
-      spinal.core.is(VectorElementOp.SLIDE1UP) { source := index1.resize(xlen + 1) - 1; scalar := index1 === 0 }
-      spinal.core.is(VectorElementOp.SLIDE1DOWN) { source := index1.resize(xlen + 1) + 1; scalar := index1.resize(offsetWidth) + 1 === command.vl }
+      spinal.core.is(VectorElementOp.SLIDEUP) { source := index1.resize(indexWidth + 1) - offset; keep := index1.resize(indexWidth + 1) >= offset }
+      spinal.core.is(VectorElementOp.SLIDEDOWN) { source := index1.resize(indexWidth + 1) + offset }
+      spinal.core.is(VectorElementOp.SLIDE1UP) { source := index1.resize(indexWidth + 1) - 1; scalar := index1 === 0 }
+      spinal.core.is(VectorElementOp.SLIDE1DOWN) { source := index1.resize(indexWidth + 1) + 1; scalar := index1.resize(offsetWidth) + 1 === command.vl }
       spinal.core.is(VectorElementOp.GATHER) { source := offset }
       spinal.core.is(VectorElementOp.GATHEREI16) { source := offset }
     }
     val selected = !compress || io.reads(0).rsp(index1.resize(6))
     val write1 = valid1 && keep && selected
-    val inRange = source < command.vlmax.resize(xlen + 1)
+    val inRange = source < command.vlmax.resize(indexWidth + 1)
     val sourceOffset = (source.resize(offsetWidth) << command.sew).resize(offsetWidth)
     val dest = compress ? count | index1.resize(offsetWidth)
     val destOffset = (dest << command.sew).resize(offsetWidth)
@@ -349,10 +356,14 @@ class VectorElementUnit(val p: VectorRegFileParam, val xlen: Int, val elen: Int 
     val address2 = RegNext(word(command.vd, destOffset))
     val zero2 = RegNext(!inRange)
     val scalar2 = RegNext(scalar)
-    val data2 = scalar2 ? command.scalar.resize(32) | (zero2 ? B(0, 32 bits) | (io.reads(1).rsp >> (byte2 << 3)).resize(32))
-    val replicated = command.sew.mux(U(0) -> (data2(7 downto 0) #* 8),
+    // vslide1up/vslide1down sign-extend the scalar to SEW (norm:vslide1up-vx_op)
+    val data2 = scalar2 ? (if (elen == 64) command.scalar.asSInt.resize(64).asBits else command.scalar.resize(32)) |
+      (zero2 ? B(0, elen bits) | (io.reads(1).rsp >> (byte2 << 3)).resize(elen))
+    val replicated = if (elen == 64) command.sew.mux(U(0) -> (data2(7 downto 0) #* 8), U(1) -> (data2(15 downto 0) #* 4),
+      U(2) -> (data2(31 downto 0) #* 2), default -> data2) else command.sew.mux(U(0) -> (data2(7 downto 0) #* 8),
       U(1) -> (data2(15 downto 0) #* 4), default -> (data2 #* 2))
-    val bytes = command.sew.mux(U(0) -> B"0001", U(1) -> B"0011", default -> B"1111")
+    val bytes = if (elen == 64) command.sew.mux(U(0) -> B"x01", U(1) -> B"x03", U(2) -> B"x0F", default -> B"xFF") else
+      command.sew.mux(U(0) -> B"0001", U(1) -> B"0011", default -> B"1111")
     val valid3 = RegNext(valid2) init(False)
     val last3 = RegNext(last2) init(False)
     val address3 = RegNext(address2)

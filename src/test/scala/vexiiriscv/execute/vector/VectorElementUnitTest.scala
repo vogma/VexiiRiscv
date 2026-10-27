@@ -104,7 +104,7 @@ class VectorElementUnitTest extends AnyFunSuite {
       }
       upload(0 until 32)
 
-      var cases, writes, overlaps, passCases, wide64 = 0
+      var cases, writes, overlaps, passCases, wide64, divide64 = 0
       val saturations = scala.collection.mutable.Map[Boolean, Int]().withDefaultValue(0)
       val increments = scala.collection.mutable.Map[(Int, Int), Int]().withDefaultValue(0)
       def sext(v: BigInt, bits: Int): BigInt = if (v.testBit(bits - 1)) v - (BigInt(1) << bits) else v
@@ -134,6 +134,7 @@ class VectorElementUnitTest extends AnyFunSuite {
         val starts = (0 until vl).scanLeft(0)((c, i) => c + (if (!masked || maskBit(i)) passes else 1))
         if (passes == 3) passCases += 1
         if (wide(name) && sew == 2) wide64 += 1
+        if (divide && sew == 3) divide64 += 1
         // Element by element, each reading its sources before writing vd, as the spec's loop
         for (i <- 0 until vl if !masked || maskBit(i)) {
           actives += i
@@ -142,7 +143,9 @@ class VectorElementUnitTest extends AnyFunSuite {
           val d = element(vd, i, dsize)
           val sa = if (signedVs2) sext(a, w) else a
           val sb = if (signedVs1) sext(b, w) else b
-          if (divide) divideLatencies += scala.math.max(8, ((sa.abs.bitLength + 7) / 8) * 8) + 3
+          // The divider skips leading zero quarters of the dividend magnitude: ELEN/4-bit steps
+          val quarter = elen / 4
+          if (divide) divideLatencies += scala.math.max(quarter, ((sa.abs.bitLength + quarter - 1) / quarter) * quarter) + 3
           val value = name match {
             case "vdiv" | "vdivu" | "vrem" | "vremu" =>
               val q = if (sb == 0) BigInt(-1) else sa / sb // truncates towards zero; narrow overflow wraps
@@ -273,11 +276,11 @@ class VectorElementUnitTest extends AnyFunSuite {
       } else {
 
       // Random operands at every SEW and LMUL, with limit values in about half the elements
-      // At ELEN 64, SEW-64 divides belong to the divider; vmulh* and vsmul at SEW 64 are reserved
+      // vmulh* and vsmul at SEW 64 are reserved
       val sews = if (elen == 64) 0 to 3 else 0 to 2
       for ((name, op, _, _, _, forms) <- ops; form <- forms.split(" "); sew <- sews; lmul <- -3 to 3
            if (8 << sew) <= elen * scala.math.pow(2, lmul) && (!wide(name) || (16 << sew) <= elen && lmul <= 2) &&
-             (sew < 3 || op == MUL || op == MACC || op == MADD)) {
+             (sew < 3 || op != MULH && op != SMUL)) {
         val w = 8 << sew
         for (reg <- 8 until 32; e <- 0 until vlenb / (w / 8) if random.nextBoolean()) {
           val v = Seq(BigInt(0), BigInt(1), (BigInt(1) << (w - 1)) - 1, BigInt(1) << (w - 1), (BigInt(1) << w) - 1)(random.nextInt(5))
@@ -302,8 +305,10 @@ class VectorElementUnitTest extends AnyFunSuite {
         }
       }
       for (vxrm <- 0 to 3; r <- 0 to 1) assert((increments((vxrm, r)) > 0) == (vxrm != 2 || r == 0), s"vsmul vxrm $vxrm increment $r")
-      assert((passCases > 0) == (elen == 64) && (wide64 > 0) == (elen == 64), s"SEW-64 cases $passCases, widening into 64 $wide64")
-      println(s"VectorElementUnit VLEN=$vlen XLEN=$xlen ELEN=$elen: $cases cases ($passCases three-pass, $wide64 widening into 64), " +
+      assert((passCases > 0) == (elen == 64) && (wide64 > 0) == (elen == 64) && (divide64 > 0) == (elen == 64),
+        s"SEW-64 cases $passCases, widening into 64 $wide64, SEW-64 divides $divide64")
+      println(s"VectorElementUnit VLEN=$vlen XLEN=$xlen ELEN=$elen: $cases cases ($passCases three-pass, $wide64 widening into 64, " +
+        s"$divide64 SEW-64 divides), " +
         s"$writes element writes, $overlaps with a source in vd, " +
         s"vsmul saturation $saturations, rounding increments ${increments.toSeq.sorted.mkString(" ")}, full physical readback after every case")
       }
@@ -313,7 +318,7 @@ class VectorElementUnitTest extends AnyFunSuite {
   test("random operands and overlaps on RV32") { run(128, 32, false) }
   test("scalar truncation on RV64") { run(128, 64, false) }
   test("larger vector register addressing") { run(256, 64, false) }
-  test("SEW-64 multiplies and widening into 64 on RV32") { run(128, 32, false, 64) }
-  test("SEW-64 multiplies and widening into 64 on RV64") { run(128, 64, false, 64) }
-  test("SEW-64 multiplies at VLEN 256") { run(256, 64, false, 64) }
+  test("SEW-64 multiplies, divides and widening into 64 on RV32") { run(128, 32, false, 64) }
+  test("SEW-64 multiplies, divides and widening into 64 on RV64") { run(128, 64, false, 64) }
+  test("SEW-64 multiplies and divides at VLEN 256") { run(256, 64, false, 64) }
 }

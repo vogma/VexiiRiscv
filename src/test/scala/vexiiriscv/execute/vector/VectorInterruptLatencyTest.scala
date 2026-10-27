@@ -76,6 +76,7 @@ class VectorInterruptLatencyTest extends AnyFunSuite {
         if (unit.io.done.toBoolean) done = cycle
       }
     } finally out.close()
-    assert(rows == 104, s"expected every arithmetic site, got $rows")
+    val sites = sys.env.get("VEXII_VECTOR_LATENCY_SITES").map(_.toInt).getOrElse(104)
+    assert(rows == sites, s"expected every arithmetic site, got $rows")
   }
 }
