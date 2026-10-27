@@ -29,7 +29,9 @@ class VectorPermuteTest extends AnyFunSuite {
       dut.io.debug #= true; dut.io.access.valid #= false
       dut.io.access.address #= 0; dut.io.access.data #= 0; dut.io.access.mask #= 0
       dut.io.readAddress #= 0
-      dut.clockDomain.assertReset(); tick(); dut.clockDomain.deassertReset()
+      dut.clockDomain.deassertReset(); sleep(1)
+      dut.clockDomain.assertReset(); sleep(1); tick()
+      dut.clockDomain.deassertReset()
       for (_ <- 0 until p.wordCount) tick()
       assert(!dut.io.initHold.toBoolean)
       var cases, writes = 0
