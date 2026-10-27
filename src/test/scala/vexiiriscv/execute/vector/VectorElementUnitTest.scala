@@ -8,7 +8,7 @@ import spinal.lib._
 import scala.collection.mutable.ArrayBuffer
 import scala.util.Random
 
-class VectorElementHarness(p: VectorRegFileParam, xlen: Int) extends Component {
+class VectorElementHarness(p: VectorRegFileParam, xlen: Int, elen: Int = 32) extends Component {
   val io = new Bundle {
     val cmd = slave(Flow(VectorElementCmd(p, xlen)))
     val debug = in Bool()
@@ -22,7 +22,7 @@ class VectorElementHarness(p: VectorRegFileParam, xlen: Int) extends Component {
     val readAddresses = out Vec(UInt(p.addressWidth bits), 3)
   }
   val vrf = new VectorRegFile(p)
-  val unit = new VectorElementUnit(p, xlen)
+  val unit = new VectorElementUnit(p, xlen, elen)
   unit.io.cmd := io.cmd
   unit.io.v0 := vrf.io.v0
   vrf.io.write := unit.io.write
@@ -64,10 +64,10 @@ class VectorElementUnitTest extends AnyFunSuite {
   def wide(name: String) = name.startsWith("vw")
   def readsVd(name: String) = Seq("vmacc", "vnmsac", "vmadd", "vnmsub").contains(name) || name.startsWith("vwmacc")
 
-  def run(vlen: Int, xlen: Int, exhaustive: Boolean): Unit = {
+  def run(vlen: Int, xlen: Int, exhaustive: Boolean, elen: Int = 32): Unit = {
     val p = VectorRegFileParam(vlen = vlen)
-    SimConfig.compile(new VectorElementHarness(p, xlen)).doSim { dut =>
-      val random = new Random(1301 + xlen + vlen)
+    SimConfig.compile(new VectorElementHarness(p, xlen, elen)).doSim { dut =>
+      val random = new Random(1301 + xlen + vlen + (if (elen == 64) 64 else 0))
       val vlenb = vlen / 8
       val bytes = Array.fill(32, vlenb)(random.nextInt(256))
       def word(reg: Int, offset: Int): BigInt =
@@ -104,7 +104,7 @@ class VectorElementUnitTest extends AnyFunSuite {
       }
       upload(0 until 32)
 
-      var cases, writes, overlaps = 0
+      var cases, writes, overlaps, passCases, wide64 = 0
       val saturations = scala.collection.mutable.Map[Boolean, Int]().withDefaultValue(0)
       val increments = scala.collection.mutable.Map[(Int, Int), Int]().withDefaultValue(0)
       def sext(v: BigInt, bits: Int): BigInt = if (v.testBit(bits - 1)) v - (BigInt(1) << bits) else v
@@ -129,11 +129,16 @@ class VectorElementUnitTest extends AnyFunSuite {
         val actives = ArrayBuffer[Int]()
         val divide = op == DIV || op == REM
         val divideLatencies = ArrayBuffer[Int]()
+        // A SEW-64 multiply reads its element in each of three passes; an inactive element takes one cycle
+        val passes = if (sew == 3 && op <= SMUL) 3 else 1
+        val starts = (0 until vl).scanLeft(0)((c, i) => c + (if (!masked || maskBit(i)) passes else 1))
+        if (passes == 3) passCases += 1
+        if (wide(name) && sew == 2) wide64 += 1
         // Element by element, each reading its sources before writing vd, as the spec's loop
         for (i <- 0 until vl if !masked || maskBit(i)) {
           actives += i
           val a = element(vs2, i, size)
-          val b = if (vector) element(vs1, i, size) else scalar & mask
+          val b = if (vector) element(vs1, i, size) else sext(scalar, xlen) & mask // norm:vop-vx_rs1_sext_sewbits
           val d = element(vd, i, dsize)
           val sa = if (signedVs2) sext(a, w) else a
           val sb = if (signedVs1) sext(b, w) else b
@@ -185,15 +190,16 @@ class VectorElementUnitTest extends AnyFunSuite {
         var cycles = 0
         val readCycles, writeCycles = ArrayBuffer[Int]()
         var writeIndex, divCommands = 0
-        while (!dut.io.done.toBoolean && cycles < 40 * vlen) {
+        while (!dut.io.done.toBoolean && cycles < 120 * vlen) {
           sleep(1)
           assert(dut.io.busy.toBoolean, s"busy before done case $cases")
           if (dut.io.divCommand.toBoolean) divCommands += 1
           val rv = dut.io.readValid.toInt
           if (rv != 0) {
-            val k = readCycles.size
+            val k = readCycles.size / passes
             assert(k < actives.size, s"read for an inactive element case $cases")
             val i = actives(k)
+            if (!divide) assert(cycles == starts(i) + readCycles.size % passes, s"read cycle case $cases $name element $i")
             val want = 1 | (if (vector) 2 else 0) | (if (readsVd(name)) 4 else 0)
             assert(rv == want, s"read ports case $cases $name")
             assert(dut.io.readAddresses(0).toInt == vs2 * p.beatsPerReg + i * size / 8, s"vs2 word case $cases")
@@ -224,8 +230,10 @@ class VectorElementUnitTest extends AnyFunSuite {
           }
           if (actives.isEmpty) assert(cycles == scala.math.max(vl, 1) + 2, s"inactive divider cycles case $cases: $cycles")
         } else {
-          for (k <- actives.indices) assert(readCycles(k) - readCycles(0) == actives(k) - actives(0), s"element rate case $cases")
-          assert(writeCycles.toSeq == readCycles.map(_ + 5).toSeq, s"write latency case $cases")
+          assert(readCycles.size == actives.size * passes, s"reads per element case $cases $name")
+          assert(writeCycles.toSeq == actives.map(i => starts(i) + passes + 4).toSeq, s"write latency case $cases $name")
+          // done follows the last element's issue by six cycles: 3 * VLMAX + 6 for an all-active SEW-64 multiply
+          assert(cycles == scala.math.max(starts(vl), 1) + 5, s"done cycle case $cases $name: $cycles")
         }
         assert(dut.io.saturated.toBoolean == expectedSaturation, s"saturation case $cases $name sew $sew")
         sleep(1); tick()
@@ -265,8 +273,11 @@ class VectorElementUnitTest extends AnyFunSuite {
       } else {
 
       // Random operands at every SEW and LMUL, with limit values in about half the elements
-      for ((name, _, _, _, _, forms) <- ops; form <- forms.split(" "); sew <- 0 to 2; lmul <- -3 to 3
-           if (8 << sew) <= 32 * scala.math.pow(2, lmul) && (!wide(name) || sew <= 1 && lmul <= 2)) {
+      // At ELEN 64, SEW-64 divides belong to the divider; vmulh* and vsmul at SEW 64 are reserved
+      val sews = if (elen == 64) 0 to 3 else 0 to 2
+      for ((name, op, _, _, _, forms) <- ops; form <- forms.split(" "); sew <- sews; lmul <- -3 to 3
+           if (8 << sew) <= elen * scala.math.pow(2, lmul) && (!wide(name) || (16 << sew) <= elen && lmul <= 2) &&
+             (sew < 3 || op == MUL || op == MACC || op == MADD)) {
         val w = 8 << sew
         for (reg <- 8 until 32; e <- 0 until vlenb / (w / 8) if random.nextBoolean()) {
           val v = Seq(BigInt(0), BigInt(1), (BigInt(1) << (w - 1)) - 1, BigInt(1) << (w - 1), (BigInt(1) << w) - 1)(random.nextInt(5))
@@ -291,7 +302,9 @@ class VectorElementUnitTest extends AnyFunSuite {
         }
       }
       for (vxrm <- 0 to 3; r <- 0 to 1) assert((increments((vxrm, r)) > 0) == (vxrm != 2 || r == 0), s"vsmul vxrm $vxrm increment $r")
-      println(s"VectorElementUnit VLEN=$vlen XLEN=$xlen: $cases cases, $writes element writes, $overlaps with a source in vd, " +
+      assert((passCases > 0) == (elen == 64) && (wide64 > 0) == (elen == 64), s"SEW-64 cases $passCases, widening into 64 $wide64")
+      println(s"VectorElementUnit VLEN=$vlen XLEN=$xlen ELEN=$elen: $cases cases ($passCases three-pass, $wide64 widening into 64), " +
+        s"$writes element writes, $overlaps with a source in vd, " +
         s"vsmul saturation $saturations, rounding increments ${increments.toSeq.sorted.mkString(" ")}, full physical readback after every case")
       }
     }
@@ -300,4 +313,7 @@ class VectorElementUnitTest extends AnyFunSuite {
   test("random operands and overlaps on RV32") { run(128, 32, false) }
   test("scalar truncation on RV64") { run(128, 64, false) }
   test("larger vector register addressing") { run(256, 64, false) }
+  test("SEW-64 multiplies and widening into 64 on RV32") { run(128, 32, false, 64) }
+  test("SEW-64 multiplies and widening into 64 on RV64") { run(128, 64, false, 64) }
+  test("SEW-64 multiplies at VLEN 256") { run(256, 64, false, 64) }
 }

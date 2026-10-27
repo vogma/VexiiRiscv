@@ -43,9 +43,11 @@ case class VectorElementCmd(p: VectorRegFileParam, xlen: Int) extends Bundle {
 
 // One element per cycle from element 0: read in cycle t, extract and extend in t+1, multiply in t+2 and t+3,
 // finish in t+4 and write in t+5. Division serializes active elements; inactive elements take a cycle and no reads.
-class VectorElementUnit(val p: VectorRegFileParam, val xlen: Int) extends Component {
+// With ELEN 64 an active SEW-64 multiply takes three passes of the 33 x 33 multiplier, reading its element in each.
+class VectorElementUnit(val p: VectorRegFileParam, val xlen: Int, val elen: Int = 32) extends Component {
   require(p.dlen == 64 && p.readPorts >= 3)
   require(xlen == 32 || xlen == 64)
+  require(elen == 32 || elen == 64)
   val io = new Bundle {
     val cmd = slave(Flow(VectorElementCmd(p, xlen)))
     val reads = Vec.fill(3)(master(VrfReadPort(p)))
@@ -90,10 +92,17 @@ class VectorElementUnit(val p: VectorRegFileParam, val xlen: Int) extends Compon
     result := (io.cmd.op === VectorElementOp.FIRST) ? B(xlen bits, default -> True) | B(0, xlen bits)
   }
 
+  // SEW-64 multiply passes: lo*lo, lo(x)*hi(y), hi(x)*lo(y); the low 64 product bits do not depend on the signs
+  val split = elen == 64 generate (command.sew === 3 && command.op <= VectorElementOp.SMUL)
+  val pass = elen == 64 generate (Reg(UInt(2 bits)) init(0))
+  if (elen == 64) when(io.cmd.valid) { pass := 0 }
+
   val issue = new Area {
     val advance = running && !divPending && !permute
     val active = advance && command.vl =/= 0 && (command.unmasked || io.v0(index))
-    val last = advance && (command.vl === 0 || index.resize(offsetWidth) + 1 >= command.vl)
+    // An element moves on after its third pass, or at once if inactive
+    val step = if (elen == 64) advance && (!split || !active || pass === 2) else advance
+    val last = step && (command.vl === 0 || index.resize(offsetWidth) + 1 >= command.vl)
     val offset = (index.resize(offsetWidth) << command.sew).resize(offsetWidth)
     val vdOffset = widen ? (offset << 1).resize(offsetWidth) | offset
 
@@ -105,36 +114,48 @@ class VectorElementUnit(val p: VectorRegFileParam, val xlen: Int) extends Compon
     io.reads(2).cmd.payload := word(command.vd, vdOffset)
 
     when(active && divide) { divPending := True }
-    when(advance) {
+    if (elen == 64) when(advance) { pass := step ? U(0, 2 bits) | pass + 1 }
+    when(step) {
       index := index + 1
       when(last) { running := False }
     }
   }
 
-  // Element extraction from the read words, extended to 33 bits
+  // Element extraction from the read words, extended to ELEN + 1 bits
   val x1 = new Area {
     val valid = RegNext(issue.active) init(False)
     val last = RegNext(issue.last) init(False)
+    val pass = elen == 64 generate RegNext(VectorElementUnit.this.pass)
     val maskBit = RegNext(index.resize(6))
     val elementIndex = RegNext(index)
     val byte = RegNext(issue.offset.resize(log2Up(p.beatBytes)))
     val vdByte = RegNext(issue.vdOffset.resize(log2Up(p.beatBytes)))
     val address = RegNext(word(command.vd, issue.vdOffset))
 
-    def extend(v: Bits, size: UInt, signed: Bool): SInt = size.mux(
+    def extend(v: Bits, size: UInt, signed: Bool): SInt = if (elen == 64) {
+      def from(w: Int) = signed ? v(w - 1 downto 0).asSInt.resize(65) | v(w - 1 downto 0).asUInt.resize(65).asSInt
+      size.mux(U(0) -> from(8), U(1) -> from(16), U(2) -> from(32), default -> from(64))
+    } else size.mux(
       U(0) -> (signed ? v(7 downto 0).asSInt.resize(33) | v(7 downto 0).asUInt.resize(33).asSInt),
       U(1) -> (signed ? v(15 downto 0).asSInt.resize(33) | v(15 downto 0).asUInt.resize(33).asSInt),
       default -> (signed ? v(31 downto 0).asSInt.resize(33) | v(31 downto 0).asUInt.resize(33).asSInt)
     )
-    def element(data: Bits, at: UInt): Bits = (data >> (at << 3)).resize(32)
+    def element(data: Bits, at: UInt): Bits = (data >> (at << 3)).resize(elen)
     val a = element(io.reads(0).rsp, byte)
-    val b = command.scalarOperand ? command.scalar.resize(32) | element(io.reads(1).rsp, byte)
+    // A scalar wider than XLEN is sign-extended (norm:vop-vx_rs1_sext_sewbits)
+    val scalar = elen == 64 generate command.scalar.asSInt.resize(64).asBits
+    val b = command.scalarOperand ? (if (elen == 64) scalar else command.scalar.resize(32)) | element(io.reads(1).rsp, byte)
     val c = element(io.reads(2).rsp, vdByte)
     // vmadd/vnmsub multiply vd and add vs2; the others multiply vs2 and add vd
     val x = extend(madd ? c | a, command.sew, command.signed)
     val y = extend(b, command.sew, command.signedVs1)
     val addend = madd ? a | c
-    val intMin = command.sew.mux(U(0) -> S(-128, 33 bits), U(1) -> S(-32768, 33 bits), default -> S(BigInt(-1) << 31, 33 bits))
+    val intMin = command.sew.mux(U(0) -> S(-128, elen + 1 bits), U(1) -> S(-32768, elen + 1 bits), default -> S(BigInt(-1) << 31, elen + 1 bits))
+    // Multiplier operands: the extended elements, or zero-extended 32-bit halves of a SEW-64 pass
+    def lo(v: SInt): SInt = (False ## v(31 downto 0)).asSInt
+    def hi(v: SInt): SInt = (False ## v(63 downto 32)).asSInt
+    val mulX = if (elen == 64) split ? ((pass === 2) ? hi(x) | lo(x)) | x(32 downto 0) else x
+    val mulY = if (elen == 64) split ? ((pass === 1) ? hi(y) | lo(y)) | y(32 downto 0) else y
     val hit = io.reads(0).rsp(maskBit)
     when(valid && scan) {
       count := count + hit.asUInt
@@ -171,10 +192,11 @@ class VectorElementUnit(val p: VectorRegFileParam, val xlen: Int) extends Compon
     val last = RegNext(x1.last && !divide && !scan) init(False)
     val vdByte = RegNext(x1.vdByte)
     val address = RegNext(x1.address)
-    val x = RegNext(x1.x)
-    val y = RegNext(x1.y)
+    val x = RegNext(x1.mulX)
+    val y = RegNext(x1.mulY)
     val addend = RegNext(x1.addend)
     val overflow = RegNext(x1.overflow)
+    val pass = elen == 64 generate RegNext(x1.pass)
   }
   val m1 = new Area {
     val valid = RegNext(operands.valid) init(False)
@@ -184,6 +206,7 @@ class VectorElementUnit(val p: VectorRegFileParam, val xlen: Int) extends Compon
     val product = RegNext(operands.x * operands.y)
     val addend = RegNext(operands.addend)
     val overflow = RegNext(operands.overflow)
+    val pass = elen == 64 generate RegNext(operands.pass)
   }
   val m2 = new Area {
     val valid = RegNext(m1.valid) init(False)
@@ -193,14 +216,21 @@ class VectorElementUnit(val p: VectorRegFileParam, val xlen: Int) extends Compon
     val product = RegNext(m1.product)
     val addend = RegNext(m1.addend)
     val overflow = RegNext(m1.overflow)
+    val pass = elen == 64 generate RegNext(m1.pass)
   }
 
   // Half selection, accumulation, vsmul rounding (norm:vxrm_op) and saturation (norm:vxsat_op_vsmul)
   val finish = new Area {
     val product = m2.product.asBits
-    val low = product(31 downto 0)
+    // ELEN 64: pass 0 or a single pass adds the 64-bit product to the addend, passes 1 and 2 their low word at bit 32
+    val first = elen == 64 generate (m2.pass === 0)
+    val low = if (elen == 64) first ? product(63 downto 0) | (product(31 downto 0) ## B(0, 32 bits)) else product(31 downto 0)
     val term = command.negate ? (~low.asUInt + 1) | low.asUInt
-    val sum = (m2.addend.asUInt + term).asBits
+    val accumulate = elen == 64 generate (is(VectorElementOp.MACC) || madd || is(VectorElementOp.WMACC))
+    val partial = elen == 64 generate Reg(UInt(64 bits))
+    val base = elen == 64 generate (first ? (accumulate ? m2.addend.asUInt | U(0, 64 bits)) | partial)
+    val sum = ((if (elen == 64) base else m2.addend.asUInt) + term).asBits
+    if (elen == 64) when(m2.valid) { partial := sum.asUInt }
     val high = command.sew.mux(
       U(0) -> product(15 downto 8).resize(32),
       U(1) -> product(31 downto 16).resize(32),
@@ -213,7 +243,11 @@ class VectorElementUnit(val p: VectorRegFileParam, val xlen: Int) extends Compon
     val rounded = (shifted.asUInt + VectorFixedPoint.roundIncrement(lsb, half, sticky, command.vxrm).asUInt).asBits
     val intMax = command.sew.mux(U(0) -> B(0x7f, 32 bits), U(1) -> B(0x7fff, 32 bits), default -> B(0x7fffffff, 32 bits))
     val fractional = m2.overflow ? intMax | rounded
-    val multiplyResult = command.op.mux(
+    val multiplyResult = if (elen == 64) command.op.mux(
+      U(VectorElementOp.MULH) -> high.resize(64),
+      U(VectorElementOp.SMUL) -> fractional.resize(64),
+      default -> sum
+    ) else command.op.mux(
       U(VectorElementOp.MULH) -> high,
       U(VectorElementOp.MACC) -> sum,
       U(VectorElementOp.MADD) -> sum,
@@ -223,16 +257,21 @@ class VectorElementUnit(val p: VectorRegFileParam, val xlen: Int) extends Compon
     )
     when(m2.valid && is(VectorElementOp.SMUL) && m2.overflow) { saturated := True }
 
-    val result = divide ? division.result | multiplyResult
+    val result = divide ? division.result.resize(elen) | multiplyResult
     val vdByte = divide ? division.vdByte | m2.vdByte
     val eew = widen ? (command.sew + 1) | command.sew
-    val data = eew.mux(U(0) -> (result(7 downto 0) #* 8), U(1) -> (result(15 downto 0) #* 4), default -> (result #* 2))
-    val bytes = eew.mux(U(0) -> B"0001", U(1) -> B"0011", default -> B"1111")
+    val data = if (elen == 64) eew.mux(U(0) -> (result(7 downto 0) #* 8), U(1) -> (result(15 downto 0) #* 4),
+      U(2) -> (result(31 downto 0) #* 2), default -> result) else
+      eew.mux(U(0) -> (result(7 downto 0) #* 8), U(1) -> (result(15 downto 0) #* 4), default -> (result #* 2))
+    val bytes = if (elen == 64) eew.mux(U(0) -> B"x01", U(1) -> B"x03", U(2) -> B"x0F", default -> B"xFF") else
+      eew.mux(U(0) -> B"0001", U(1) -> B"0011", default -> B"1111")
     val mask = (bytes.resize(p.beatBytes) << vdByte).resize(p.beatBytes)
+    // A SEW-64 multiply writes after its third pass
+    val write = if (elen == 64) m2.valid && (!split || m2.pass === 2) else m2.valid
   }
 
   val writeback = new Area {
-    val valid = RegNext(m2.valid || division.core.io.rsp.fire || (scan && is(VectorElementOp.IOTA) && x1.valid)) init(False)
+    val valid = RegNext(finish.write || division.core.io.rsp.fire || (scan && is(VectorElementOp.IOTA) && x1.valid)) init(False)
     val last = RegNext((scan && x1.last) || m2.last || (divide && ((division.core.io.rsp.fire && division.last) || (x1.last && !x1.valid)))) init(False)
     val address = RegNext(scan ? x1.address | (divide ? division.address | m2.address))
     val scanData = command.sew.mux(U(0) -> (count.resize(8).asBits #* 8),
