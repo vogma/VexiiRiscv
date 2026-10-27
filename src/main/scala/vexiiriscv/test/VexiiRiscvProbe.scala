@@ -400,6 +400,7 @@ class VexiiRiscvProbe(cpu : VexiiRiscv, kb : Option[konata.Backend], var withRvl
     var vectorValid = false
     val vectorCsrWrites = ArrayBuffer[(Int, Long)]() // Implicit vl, vtype, vstart updates
     val vectorWrites = ArrayBuffer[(Int, Array[Byte], Array[Byte])]()
+    val ioAccesses = ArrayBuffer[TraceIo]() // Reported when this uop retires
 
 
     def traceT2s(cycle : Long) = cycle match {
@@ -479,6 +480,7 @@ class VexiiRiscvProbe(cpu : VexiiRiscv, kb : Option[konata.Backend], var withRvl
       vectorValid = false
       vectorCsrWrites.clear()
       vectorWrites.clear()
+      ioAccesses.clear()
     }
 
     clear()
@@ -737,7 +739,8 @@ class VexiiRiscvProbe(cpu : VexiiRiscv, kb : Option[konata.Backend], var withRvl
           }
           trace.error = bus.rsp.error.toBoolean
           if(isVectorMemory(harts(trace.threadId).microOp(trace.uopId).instruction)) trace.mask = (1 << trace.size) - 1
-          backends.foreach(_.ioAccess(trace.hartId, trace))
+          // An older uop may retire in this same cycle, so the access waits for its own uop
+          harts(trace.threadId).microOp(trace.uopId).ioAccesses += trace
         } else if(nativeCacheless && trace.fromHart && !bus.rsp.error.toBoolean) {
           import LsuCachelessBusAmo._
           val hart = harts(trace.threadId)
@@ -841,6 +844,7 @@ class VexiiRiscvProbe(cpu : VexiiRiscv, kb : Option[konata.Backend], var withRvl
         import hart._
         val uopId = hart.microOpRetirePtr
         val uop = hart.microOp(uopId)
+        for (io <- uop.ioAccesses) backends.foreach(_.ioAccess(hartId, io))
         if (uop.spawned) {
           val fetch = hart.fetch(uop.fetchId)
           val decode = hart.decode(uop.decodeId)
