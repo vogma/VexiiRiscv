@@ -33,7 +33,7 @@ class AguFrontend(
     layer: LaneLayer,
     host: PluginHost,
     withRvcbm : Boolean = false,
-    withVector : Boolean = false
+    withVector : Boolean = false, vectorElen : Int = 32
   ) extends ExecuteUnitElementSimple.Api(
     layer,
     host.find[SrcPlugin](_.layer == layer),
@@ -75,7 +75,7 @@ class AguFrontend(
   if (withVector) {
     import vexiiriscv.riscv._
     layer.lane.setDecodingDefault(VECTOR, False)
-    for ((op, load) <- vexiiriscv.execute.vector.VectorMemoryOps.all) {
+    for ((op, load) <- vexiiriscv.execute.vector.VectorMemoryOps(vectorElen, Riscv.XLEN.get).all) {
       add(op).srcs(sk.Op.SRC1, sk.SRC1.RF).decode(dec(VECTOR -> True, LOAD -> Bool(load), STORE -> Bool(!load)))
       if (op.resources.contains(IntRegFile -> RS2)) layer(op).addRsSpec(RS2, 0)
       vectorOps += op

@@ -4,8 +4,8 @@ import spinal.core._
 import spinal.lib._
 
 // Steps through the fields of the active elements of [vstart, evl), one per advance, starting at startField.
-// evl, vstart, unmasked, v0 and fields must hold meanwhile.
-class VectorElementWalker(val vlen: Int) extends Component {
+// evl, vstart, unmasked, v0 and fields must hold meanwhile. With split, each field of a wide element takes two halves.
+class VectorElementWalker(val vlen: Int, val split: Boolean = false) extends Component {
   val indexWidth = log2Up(vlen)
   val io = new Bundle {
     val start = in Bool() // load the first active element
@@ -20,6 +20,8 @@ class VectorElementWalker(val vlen: Int) extends Component {
     val field = out UInt(3 bits)
     val last = out Bool() // no active element or field follows; true when none is active
     val any = out Bool()
+    val wide = split generate in(Bool()) // elements take two halves, low first
+    val half = split generate out(Bool())
   }
 
   val active = Bits(vlen bits)
@@ -30,6 +32,7 @@ class VectorElementWalker(val vlen: Int) extends Component {
   val field = Reg(UInt(3 bits)) init(0)
   val last = RegInit(True)
   val any = RegInit(False)
+  val half = split generate RegInit(False)
 
   val above = Bits(vlen bits)
   for (i <- 0 until vlen) above(i) := active(i) && U(i) > index
@@ -43,8 +46,9 @@ class VectorElementWalker(val vlen: Int) extends Component {
     field := io.startField
     last := first === highest
     any := active.orR
+    if (split) half := False
   }
-  when(io.advance) {
+  def nextField(): Unit = {
     field := field + 1
     when(field === io.fields) {
       field := 0
@@ -52,9 +56,18 @@ class VectorElementWalker(val vlen: Int) extends Component {
       last := next === lastIndex
     }
   }
+  when(io.advance) {
+    if (split) {
+      half := io.wide && !half
+      when(!io.wide || half) { nextField() }
+    } else nextField()
+  }
 
   io.index := index
   io.field := field
-  io.last := last && (field === io.fields || !any)
+  if (split) {
+    io.last := last && (!any || field === io.fields && (!io.wide || half))
+    io.half := half
+  } else io.last := last && (field === io.fields || !any)
   io.any := any
 }

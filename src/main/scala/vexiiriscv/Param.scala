@@ -1216,7 +1216,7 @@ class ParamSimple() {
     if(lsuL1Enable){
       val needLlc = extension.withZicbom && (withRvcbmLlc || lsuL1Coherency)
       plugins += new LsuPlugin(
-        withVector = extension.withZve32x,
+        withVector = extension.withZve32x, vectorElen = if (extension.withZve64x) 64 else 32,
         timingParameter = extension.withRvh match {
           case true => lsuHypervisorTiming
           case false => lsuTiming
@@ -1421,7 +1421,7 @@ class ParamSimple() {
     // Vector
     if (extension.withZve32x) {
       plugins += new execute.vector.VectorCsrPlugin(vlen = vlen)
-      plugins += new execute.vector.VectorPlugin(early0, dlen = vectorDlen)
+      plugins += new execute.vector.VectorPlugin(early0, dlen = vectorDlen, elen = if (extension.withZve64x) 64 else 32)
     }
 
     plugins += new WhiteboxerPlugin(

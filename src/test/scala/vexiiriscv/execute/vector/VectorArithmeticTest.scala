@@ -8,7 +8,7 @@ import spinal.lib._
 import scala.collection.mutable.ArrayBuffer
 import scala.util.Random
 
-class VectorArithmeticHarness(p: VectorRegFileParam, xlen: Int) extends Component {
+class VectorArithmeticHarness(p: VectorRegFileParam, xlen: Int, elen: Int = 32) extends Component {
   val io = new Bundle {
     val cmd = slave(Flow(VectorArithmeticCmd(p, xlen)))
     val debug = in Bool()
@@ -22,7 +22,7 @@ class VectorArithmeticHarness(p: VectorRegFileParam, xlen: Int) extends Componen
     val readAddresses = out Vec(UInt(p.addressWidth bits), 3)
   }
   val vrf = new VectorRegFile(p)
-  val arithmetic = new VectorArithmetic(p, xlen)
+  val arithmetic = new VectorArithmetic(p, xlen, elen)
   arithmetic.io.cmd := io.cmd
   arithmetic.io.v0 := vrf.io.v0
   vrf.io.write := arithmetic.io.write
@@ -105,6 +105,9 @@ class VectorArithmeticTest extends AnyFunSuite {
   def extLog2(name: String) = if (name.endsWith("ext2")) 1 else if (name.endsWith("ext4")) 2 else 0
   // NREG of a whole-register move, 0 otherwise
   def nregOf(name: String) = if (name.matches("vmv[1248]r")) name(3).asDigit else 0
+  // Forms whose SEW-64 datapath is not modelled at ELEN 64 yet: fixed point, widening/narrowing, reductions, extensions
+  def noSew64(name: String) = ops.exists(o => o._1 == name && o._3) || roundings.contains(name) || wideKind(name) != 0 ||
+    reductions.contains(name) || extLog2(name) != 0
   def shapeOf(name: String) =
     if (nregOf(name) > 0) VectorShape.WHOLE
     else if (compares.contains(name) || carries.contains(name)) VectorShape.MASK_DST
@@ -113,10 +116,11 @@ class VectorArithmeticTest extends AnyFunSuite {
     else if (wideKind(name) != 0) Seq(VectorShape.WIDE_VV, VectorShape.WIDE_WV, VectorShape.NARROW)(wideKind(name) - 1)
     else extLog2(name) match { case 1 => VectorShape.EXT2; case 2 => VectorShape.EXT4; case _ => VectorShape.SINGLE }
 
-  def run(vlen: Int, xlen: Int): Unit = {
+  def run(vlen: Int, xlen: Int, elen: Int = 32): Unit = {
     val p = VectorRegFileParam(vlen = vlen)
-    SimConfig.compile(new VectorArithmeticHarness(p, xlen)).doSim { dut =>
-      val random = new Random(901 + xlen + vlen)
+    val maxSew = log2Up(elen / 8)
+    SimConfig.compile(new VectorArithmeticHarness(p, xlen, elen)).doSim { dut =>
+      val random = new Random(901 + xlen + vlen + (if (elen == 64) 64 else 0))
       val bytes = Array.fill(32, vlen / 8)(random.nextInt(256))
       val xmask = (BigInt(1) << xlen) - 1
       def word(reg: Int, offset: Int): BigInt =
@@ -245,10 +249,13 @@ class VectorArithmeticTest extends AnyFunSuite {
           (0 until size).map(b => BigInt(bytes(r)(offset + b)) << (8 * b)).reduce(_ | _)
         }
         // Equal scalar and vector elements are rare with random data
-        val scalar = if (vl > 0 && ext == 0 && !maskMm && !whole && random.nextInt(4) == 0) (BigInt(xlen, random) >> width << width) | element(vs2, random.nextInt(vl))
+        val scalar = if (vl > 0 && ext == 0 && !maskMm && !whole && random.nextInt(4) == 0) (BigInt(xlen, random) >> width << width) |
+            element(vs2, random.nextInt(vl)) & xmask
           else BigInt(xlen, random)
         def sextFrom(v: BigInt, bits: Int): BigInt = if (v.testBit(bits - 1)) v - (BigInt(1) << bits) else v
         def sext(v: BigInt): BigInt = sextFrom(v, width)
+        // A scalar narrower than SEW is sign-extended (norm:vop-vx_rs1_sext_sewbits)
+        val scalarValue = sextFrom(scalar, xlen) & mask
         val vxrm = if (vxrm0 >= 0) vxrm0 else random.nextInt(4)
         // v >> d plus the rounding increment of the dropped bits (norm:vxrm_op)
         def roundoff(v: BigInt, d: Int): BigInt = {
@@ -284,7 +291,7 @@ class VectorArithmeticTest extends AnyFunSuite {
           // Mask results: bits below vl, active ones only for compares; every other bit of vd is kept
           val results = for (i <- 0 until vl if maskMm || i >= start && (!masked || withV0(name) || maskBit(i))) yield {
             lazy val a = element(vs2, i)
-            lazy val b = if (scalarOperand) scalar & mask else element(vs1, i)
+            lazy val b = if (scalarOperand) scalarValue else element(vs1, i)
             val c = if (withV0(name) && maskBit(i)) 1 else 0
             val (x, y) = (bitOf(vs2, i), bitOf(vs1, i))
             val bit = name match {
@@ -354,7 +361,7 @@ class VectorArithmeticTest extends AnyFunSuite {
           val updates = ArrayBuffer[(Int, BigInt)]()
           for (i <- start until vl if !masked || maskBit(i)) {
             def ext(v: BigInt) = if (signed) sext(v) else v
-            val b = if (scalarOperand) scalar & mask else element(vs1, i)
+            val b = if (scalarOperand) scalarValue else element(vs1, i)
             val (value, saturated) = if (wk != 3) {
               val a = if (wk == 1) ext(element(vs2, i)) else element(vs2, i, 2 * size)
               (if (op == VectorAluOp.ADD) a + ext(b) else a - ext(b), false)
@@ -388,7 +395,7 @@ class VectorArithmeticTest extends AnyFunSuite {
           val updates = ArrayBuffer[(Int, BigInt)]()
           for (i <- 0 until vl if i >= start && (!scalarWrite || i == 0) && (!masked || withV0(name) || maskBit(i))) {
             val a = element(vs2, i, size >> ext)
-            val b = if (scalarOperand) scalar & mask else element(vs1, i)
+            val b = if (scalarOperand) scalarValue else element(vs1, i)
             val half = BigInt(1) << (width - 1)
             val amount = (b & (width - 1)).toInt
             val m = if (maskBit(i)) 1 else 0
@@ -526,10 +533,10 @@ class VectorArithmeticTest extends AnyFunSuite {
         }
         cases += 1
       }
-      for (sew <- 0 to 2; lmul <- -2 to 3 if (8 << sew) <= 32 * scala.math.pow(2, lmul)) {
+      for (sew <- 0 to maxSew; lmul <- -3 to 3 if (8 << sew) <= elen * scala.math.pow(2, lmul)) {
         val vlmax = ((vlen / (8 << sew)) * scala.math.pow(2, lmul)).toInt
         // Extensions need a source EEW of at least 8 bits
-        for ((name, _, _) <- ops if sew >= extLog2(name) && sizeOk(name, sew, lmul); scalar <- Seq(false, true);
+        for ((name, _, _) <- ops if sew >= extLog2(name) && sizeOk(name, sew, lmul) && (sew < 3 || !noSew64(name)); scalar <- Seq(false, true);
              vl <- Seq(0, 1, vlmax - 1, vlmax).distinct;
              masked <- Seq(false, true))
           execute(name, sew, lmul, vl, 0, masked, scalar)
@@ -537,15 +544,15 @@ class VectorArithmeticTest extends AnyFunSuite {
           execute("vadd", sew, lmul, vlmax, start, true, false)
       }
       // Operands at the limits: random elements rarely reach them exactly, nor equal each other or shift by 0
-      for (sew <- 0 to 2; (name, _, saturate) <- ops if sew >= extLog2(name) && sizeOk(name, sew, 1) && name != "vmv" &&
-           name != "vid" && nregOf(name) == 0;
+      for (sew <- 0 to maxSew; (name, _, saturate) <- ops if sew >= extLog2(name) && sizeOk(name, sew, 1) && name != "vmv" &&
+           name != "vid" && nregOf(name) == 0 && (sew < 3 || !noSew64(name));
            _ <- 0 until (if (saturate || compares.contains(name) || carries.contains(name) || roundings.contains(name)) 4 else 2)) {
         val size = 1 << sew
         // vasub wraps only for INT_MAX - INT_MIN (norm:vasub_vasubu_op_overflow)
         val extremes = name == "vasub" && random.nextBoolean()
         for (reg <- 0 until 32; e <- 0 until vlen / 8 / size) {
-          val limit = (if (extremes) Seq((1L << (8 * size - 1)) - 1, 1L << (8 * size - 1))
-            else Seq(0L, 1L, (1L << (8 * size - 1)) - 1, 1L << (8 * size - 1), (1L << (8 * size)) - 1)).map(BigInt(_))
+          val top = BigInt(1) << (8 * size - 1)
+          val limit = if (extremes) Seq(top - 1, top) else Seq(BigInt(0), BigInt(1), top - 1, top, 2 * top - 1)
           val v = limit(random.nextInt(limit.size))
           for (b <- 0 until size) bytes(reg)(e * size + b) = ((v >> (8 * b)) & 255).toInt
         }
@@ -562,7 +569,7 @@ class VectorArithmeticTest extends AnyFunSuite {
         execute(name, sew, random.nextInt(2), vlen / (8 << sew), 0, random.nextBoolean(), random.nextInt(4) == 0 && !extremes,
           vxrm0 = if (extremes) 0 else -1)
       }
-      for (sew <- 0 to 2; vl <- Seq(0, 1, 3); read <- Seq(false, true))
+      for (sew <- 0 to maxSew; vl <- Seq(0, 1, 3); read <- Seq(false, true))
         execute("vmv", sew, 3, vl, 0, false, true, if (read) VectorShape.SCALAR_READ else VectorShape.SCALAR_WRITE)
       for ((name, _, saturate) <- ops if saturate; outcome <- Seq(false, true))
         assert(saturations((name, outcome)) > 0, s"$name never had saturated = $outcome")
@@ -576,7 +583,7 @@ class VectorArithmeticTest extends AnyFunSuite {
       for ((name, _, _) <- ops if wideKind(name) != 0 || reductions.contains(name))
         assert(outcomes((name, "overlap")) > 0, s"$name never overlapped vd")
       for (name <- reductions) assert(outcomes((name, "inactive")) > 0, s"$name never had only inactive elements")
-      println(s"VectorArithmetic VLEN=$vlen XLEN=$xlen: $cases cases, $writes writes, saturation outcomes " +
+      println(s"VectorArithmetic VLEN=$vlen XLEN=$xlen ELEN=$elen: $cases cases, $writes writes, saturation outcomes " +
         saturations.toSeq.sorted.map { case ((n, o), c) => s"$n/$o=$c" }.mkString(" ") +
         s", $sourceInVd extensions with vs2 in the highest part of vd, mask outcomes " +
         outcomes.toSeq.sorted.map { case ((n, o), c) => s"$n/$o=$c" }.mkString(" ") + ", rounding increments " +
@@ -586,4 +593,6 @@ class VectorArithmeticTest extends AnyFunSuite {
   test("64-bit beats and byte preservation on RV32") { run(128, 32) }
   test("scalar truncation and sign extension on RV64") { run(128, 64) }
   test("larger vector register addressing") { run(256, 64) }
+  test("SEW 64 with sign-extended scalars on RV32") { run(128, 32, 64) }
+  test("SEW 64 and larger vector registers on RV64") { run(256, 64, 64) }
 }

@@ -80,7 +80,7 @@ class LsuPlugin(var layer : LaneLayer,
                 var withLlcFlush : Boolean = false,
                 var storeRs2At : Int = 0, //Note that currently, it only apply for integer store (not float store)
                 var storeBufferSlots : Int = 0,
-                var storeBufferOps : Int = 0, val withVector : Boolean = false) extends FiberPlugin with DBusAccessService with LsuCachelessBusProvider with LsuService with CmoService with VectorLsuService{
+                var storeBufferOps : Int = 0, val withVector : Boolean = false, val vectorElen : Int = 32) extends FiberPlugin with DBusAccessService with LsuCachelessBusProvider with LsuService with CmoService with VectorLsuService{
   import timingParameter._
 
   if(withLlcFlush) assert(withCbm)
@@ -156,7 +156,7 @@ class LsuPlugin(var layer : LaneLayer,
 
     val trapPort = ts.newTrap(layer.lane.getExecuteAge(ctrlAt), Execute.LANE_AGE_WIDTH)
     val flushPort = ss.newFlushPort(layer.lane.getExecuteAge(ctrlAt), laneAgeWidth = Execute.LANE_AGE_WIDTH, withUopId = true)
-    val frontend = new AguFrontend(layer, host, withRvcbm = withCbm, withVector = withVector)
+    val frontend = new AguFrontend(layer, host, withRvcbm = withCbm, withVector = withVector, vectorElen = vectorElen)
     val commitProbe = Flow(LsuCommitProbe()) // Used by the hardware prefetching plugin to learn about the software behavior
     val vector = withVector generate new VectorLsuHooks(LsuPlugin.this, frontend, ds)
     // Extends the instruction specifications done by the AGU with sign extensions and flush behavior
@@ -438,8 +438,8 @@ class LsuPlugin(var layer : LaneLayer,
       bus.virtual := l1.MIXED_ADDRESS
       bus.size    := l1.SIZE
 
-      val HITS = insert(bus.hits)
-      val HIT = insert(bus.hits.orR)
+      val HITS = insert(if (vectorSplit) vector.triggerHits(this, bus) else bus.hits)
+      val HIT = insert(if (vectorSplit) apply(HITS).orR else bus.hits.orR)
     }
 
     // Collect the different request and interface them with the L1 cache as well as the MMU
@@ -651,7 +651,7 @@ class LsuPlugin(var layer : LaneLayer,
 
     // Pre compute a few things to reduce the combinatorial path pressure on the ctrl stage.
     val preCtrl = new elp.Execute(ctrlAt-1){
-      val MISS_ALIGNED = insert((1 to log2Up(LSLEN / 8)).map(i => l1.SIZE === i && l1.MIXED_ADDRESS(i - 1 downto 0) =/= 0).orR)
+      val MISS_ALIGNED = insert(if (withVector) vector.missAligned(this, (1 to log2Up(LSLEN / 8)).map(i => l1.SIZE === i && l1.MIXED_ADDRESS(i - 1 downto 0) =/= 0).orR) else (1 to log2Up(LSLEN / 8)).map(i => l1.SIZE === i && l1.MIXED_ADDRESS(i - 1 downto 0) =/= 0).orR)
       if(withCbm) MISS_ALIGNED clearWhen(l1.CLEAN || l1.INVALID)
       val IS_AMO = insert(SEL && l1.ATOMIC && l1.STORE && l1.LOAD)
     }

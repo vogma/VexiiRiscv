@@ -5,7 +5,8 @@ import spinal.core._
 import scala.collection.mutable
 
 /**
- * Specifies the RISC-V vector instructions of Zve32x: no floating point, no EEW = 64 loads/stores.
+ * Specifies the RISC-V integer vector instructions of Zve64x, including the EEW = 64 loads and stores; no floating point.
+ * A core registers only the memory forms its ELEN and XLEN allow (VectorMemoryOps).
  * Fields the spec fixes for an instruction (vm, vs1, vs2, nf) are part of its key, so other values stay undecoded.
  */
 object Rvv extends AreaObject {
@@ -33,12 +34,12 @@ object Rvv extends AreaObject {
   private def mvx(name : String, f6 : String, vm : String = "-") = opv(name, f6, "110", vm, "-----", "-----", X1)
 
   // LOAD-FP / STORE-FP: nf mew mop vm lumop/rs2/vs2 rs1 width vd/vs3 opcode
-  private def width(eew : Int) = eew match { case 8 => "000"; case 16 => "101"; case 32 => "110" }
+  private def width(eew : Int) = eew match { case 8 => "000"; case 16 => "101"; case 32 => "110"; case 64 => "111" }
   private def nfBits(nf : Int) = String.format("%3s", (nf - 1).toBinaryString).replace(' ', '0')
   private def mem(name : String, store : Boolean, nf : Int, mop : String, vm : String, rs2 : String, eew : Int, resources : Seq[Resource]) =
     define(name, s"${nfBits(nf)}0$mop$vm$rs2-----${width(eew)}-----${if(store) "0100111" else "0000111"}", resources)
 
-  val eews = List(8, 16, 32)
+  val eews = List(8, 16, 32, 64)
   val segFields = 2 to 8
 
   // Configuration

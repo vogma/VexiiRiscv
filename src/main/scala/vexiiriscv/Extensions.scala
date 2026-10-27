@@ -121,6 +121,7 @@ object ExtensionList {
     E("zksed"),
     E("zksh"),
     E("zve32x").depend("zicsr").imply("zvl32b"),
+    E("zve64x").depend("zicsr").imply("zve32x", "zvl64b"),
   ) ++ zvlSizes.map(zvl) ++ Seq(
 
     /* Ss* extensions */

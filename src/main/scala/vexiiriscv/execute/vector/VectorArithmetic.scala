@@ -87,9 +87,11 @@ case class VectorArithmeticCmd(p: VectorRegFileParam, xlen: Int) extends Bundle 
 }
 
 // One step per cycle: issue synchronous reads, compute in X1 and X2, then write the destination word with byte enables.
-class VectorArithmetic(val p: VectorRegFileParam, val xlen: Int) extends Component {
+// ELEN 64 adds 64-bit lanes (sew 3), one element per word.
+class VectorArithmetic(val p: VectorRegFileParam, val xlen: Int, val elen: Int = 32) extends Component {
   require(p.dlen == 64 && p.readPorts >= 3)
   require(xlen == 32 || xlen == 64)
+  require(elen == 32 || elen == 64)
   val io = new Bundle {
     val cmd = slave(Flow(VectorArithmeticCmd(p, xlen)))
     val reads = Vec.fill(3)(master(VrfReadPort(p)))
@@ -139,9 +141,13 @@ class VectorArithmetic(val p: VectorRegFileParam, val xlen: Int) extends Compone
 
   def word(reg: UInt, index: UInt): UInt = ((reg.resize(p.addressWidth) << p.beatWidth) + index).resize(p.addressWidth)
   // Most significant byte of the lane holding byte j
-  def topOf(j: Int): UInt = laneSew.mux(U(0) -> U(j, 3 bits), U(1) -> U(j | 1, 3 bits), default -> U(j | 3, 3 bits))
+  def topOf(j: Int): UInt = if (elen == 64)
+    laneSew.mux(U(0) -> U(j, 3 bits), U(1) -> U(j | 1, 3 bits), U(2) -> U(j | 3, 3 bits), default -> U(7, 3 bits))
+  else laneSew.mux(U(0) -> U(j, 3 bits), U(1) -> U(j | 1, 3 bits), default -> U(j | 3, 3 bits))
   // Byte j is the least significant byte of its lane
-  def boundary(j: Int): Bool = if (j % 4 == 0) True else if (j % 2 == 0) laneSew =/= 2 else laneSew === 0
+  def boundary(j: Int): Bool = if (elen == 64) {
+    if (j == 0) True else if (j == 4) laneSew =/= 3 else if (j % 2 == 0) laneSew <= 1 else laneSew === 0
+  } else if (j % 4 == 0) True else if (j % 2 == 0) laneSew =/= 2 else laneSew === 0
 
   when(io.cmd.valid) {
     command := io.cmd.payload
@@ -219,7 +225,13 @@ class VectorArithmetic(val p: VectorRegFileParam, val xlen: Int) extends Compone
     val foldIndex = RegNext(fold)
     val old = io.reads(2).rsp
 
-    val scalarBeat = command.sew.mux(
+    // A 64-bit lane takes the scalar sign-extended from XLEN (norm:vop-vx_rs1_sext_sewbits)
+    val scalarBeat = if (elen == 64) command.sew.mux(
+      U(0) -> (command.scalar(7 downto 0) #* 8),
+      U(1) -> (command.scalar(15 downto 0) #* 4),
+      U(2) -> (command.scalar(31 downto 0) #* 2),
+      default -> command.scalar.asSInt.resize(64).asBits
+    ) else command.sew.mux(
       U(0) -> (command.scalar(7 downto 0) #* 8),
       U(1) -> (command.scalar(15 downto 0) #* 4),
       default -> (command.scalar(31 downto 0) #* 2)
@@ -305,7 +317,9 @@ class VectorArithmetic(val p: VectorRegFileParam, val xlen: Int) extends Compone
     for (j <- 0 until 8) equal(j) := a(j * 8, 8 bits) === b(j * 8, 8 bits)
     val outcome = Bits(8 bits) // meaningful at the most significant byte of each element
     for (j <- 0 until 8) {
-      val same = command.sew.mux(U(0) -> equal(j), U(1) -> equal(j & 6, 2 bits).andR, default -> equal(j & 4, 4 bits).andR)
+      val same = if (elen == 64) command.sew.mux(U(0) -> equal(j), U(1) -> equal(j & 6, 2 bits).andR, U(2) -> equal(j & 4, 4 bits).andR,
+        default -> equal.andR)
+      else command.sew.mux(U(0) -> equal(j), U(1) -> equal(j & 6, 2 bits).andR, default -> equal(j & 4, 4 bits).andR)
       outcome(j) := command.op.mux(
         U(VectorAluOp.SEQ) -> same,
         U(VectorAluOp.SNE) -> !same,
@@ -318,16 +332,25 @@ class VectorArithmetic(val p: VectorRegFileParam, val xlen: Int) extends Compone
     val bits, actives = Bits(8 bits)
     for (e <- 0 until 8) {
       def at(f: Bits, s: Int, top: Boolean): Bool = if (e < (8 >> s)) f((e << s) + (if (top) (1 << s) - 1 else 0)) else False
-      bits(e) := command.sew.mux(U(0) -> at(outcome, 0, true), U(1) -> at(outcome, 1, true), default -> at(outcome, 2, true))
-      actives(e) := command.sew.mux(U(0) -> at(mask, 0, false), U(1) -> at(mask, 1, false), default -> at(mask, 2, false))
+      if (elen == 64) {
+        bits(e) := command.sew.mux(U(0) -> at(outcome, 0, true), U(1) -> at(outcome, 1, true), U(2) -> at(outcome, 2, true),
+          default -> at(outcome, 3, true))
+        actives(e) := command.sew.mux(U(0) -> at(mask, 0, false), U(1) -> at(mask, 1, false), U(2) -> at(mask, 2, false),
+          default -> at(mask, 3, false))
+      } else {
+        bits(e) := command.sew.mux(U(0) -> at(outcome, 0, true), U(1) -> at(outcome, 1, true), default -> at(outcome, 2, true))
+        actives(e) := command.sew.mux(U(0) -> at(mask, 0, false), U(1) -> at(mask, 1, false), default -> at(mask, 2, false))
+      }
     }
 
     // Sign or zero extension of the selected part of vs2 (norm:vsext_vzext_op)
     val source = ext4 ? a.subdivideIn(16 bits)(part).resize(32) | a.subdivideIn(32 bits)(part(0 downto 0))
     val extended = (command.sew === 1) ? extend(source, 1, 2) | (ext4 ? extend(source, 1, 4) | extend(source, 2, 4))
     // Element indices of the word, truncated to SEW (norm:vid_op_overflow)
-    def indices(bytes: Int): Bits = Cat((0 until 8 / bytes).map(e => (position @@ U(e, log2Up(8 / bytes) bits)).resize(bytes * 8)))
-    val ids = command.sew.mux(U(0) -> indices(1), U(1) -> indices(2), default -> indices(4))
+    def indices(bytes: Int): Bits = if (bytes == 8) position.resize(64).asBits
+      else Cat((0 until 8 / bytes).map(e => (position @@ U(e, log2Up(8 / bytes) bits)).resize(bytes * 8)))
+    val ids = if (elen == 64) command.sew.mux(U(0) -> indices(1), U(1) -> indices(2), U(2) -> indices(4), default -> indices(8))
+      else command.sew.mux(U(0) -> indices(1), U(1) -> indices(2), default -> indices(4))
     val data = command.op.mux(
       U(VectorAluOp.AND) -> (a & b),
       U(VectorAluOp.OR) -> (a | b),
@@ -367,11 +390,17 @@ class VectorArithmetic(val p: VectorRegFileParam, val xlen: Int) extends Compone
     for (j <- 0 until 8) negative(j) := a(j * 8 + 7)
 
     when(valid && scalarRead) {
-      result := command.sew.mux(
+      // A 64-bit element gives its low XLEN bits (norm:vmv-x-s_op)
+      result := (if (elen == 64) command.sew.mux(
+        U(0) -> a(7 downto 0).asSInt.resize(xlen).asBits,
+        U(1) -> a(15 downto 0).asSInt.resize(xlen).asBits,
+        U(2) -> a(31 downto 0).asSInt.resize(xlen).asBits,
+        default -> a(xlen - 1 downto 0)
+      ) else command.sew.mux(
         U(0) -> a(7 downto 0).asSInt.resize(xlen).asBits,
         U(1) -> a(15 downto 0).asSInt.resize(xlen).asBits,
         default -> a(31 downto 0).asSInt.resize(xlen).asBits
-      )
+      ))
     }
   }
 
@@ -400,10 +429,11 @@ class VectorArithmetic(val p: VectorRegFileParam, val xlen: Int) extends Compone
     def lane(i: Int, w: Int) = i - i % w
     // Averaging shifts in bit SEW of the exact result (norm:vaaddu_vaadd_vasubu_vasub_op)
     val fill = Bits(64 bits)
-    for (i <- 0 until 64) fill(i) := average ? upper(topOf(i / 8)) | command.signed && laneSew.mux(
-      U(0) -> data(lane(i, 8) + 7), U(1) -> data(lane(i, 16) + 15), default -> data(lane(i, 32) + 31))
+    for (i <- 0 until 64) fill(i) := average ? upper(topOf(i / 8)) | command.signed && (if (elen == 64) laneSew.mux(
+      U(0) -> data(lane(i, 8) + 7), U(1) -> data(lane(i, 16) + 15), U(2) -> data(lane(i, 32) + 31), default -> data(63))
+      else laneSew.mux(U(0) -> data(lane(i, 8) + 7), U(1) -> data(lane(i, 16) + 15), default -> data(lane(i, 32) + 31)))
     val stages = ArrayBuffer(data)
-    for (k <- 0 until 5) {
+    for (k <- 0 until log2Up(elen)) {
       val s = 1 << k
       val in = stages.last
       val out = Bits(64 bits)
@@ -417,7 +447,8 @@ class VectorArithmetic(val p: VectorRegFileParam, val xlen: Int) extends Compone
             amounts(lane(i, w) + k) ? (left ? l | r) | in(i)
           }
         }
-        out(i) := laneSew.mux(U(0) -> bit(8), U(1) -> bit(16), default -> bit(32))
+        out(i) := (if (elen == 64) laneSew.mux(U(0) -> bit(8), U(1) -> bit(16), U(2) -> bit(32), default -> bit(64))
+          else laneSew.mux(U(0) -> bit(8), U(1) -> bit(16), default -> bit(32)))
       }
       stages += out
     }

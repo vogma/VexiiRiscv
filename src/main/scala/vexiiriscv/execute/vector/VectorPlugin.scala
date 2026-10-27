@@ -41,24 +41,28 @@ object VectorRange {
   val ANY = 0
   val EXT2 = 1 // SEW >= 16; the source EMUL is always legal for a legal vtype
   val EXT4 = 2 // SEW >= 32
-  val WIDE = 3 // SEW <= 16 and LMUL <= 4
-  val WIDE_SCALAR = 4 // SEW <= 16 for a single 2 * SEW element, whatever LMUL
+  val WIDE = 3 // SEW <= ELEN / 2 and LMUL <= 4
+  val WIDE_SCALAR = 4 // SEW <= ELEN / 2 for a single 2 * SEW element, whatever LMUL
+  val NO64 = 5 // SEW < 64 (norm:Zve64_eew64_nsupport_vmulh, norm:Zve64_eew64_nsupport_vsmul)
   def width = 3
 }
 
-case class VectorMemoryDescriptor(indexWidth : Int) extends Bundle {
+case class VectorMemoryDescriptor(indexWidth : Int, split : Boolean = false) extends Bundle {
   val index = UInt(indexWidth bits)
   val field = UInt(3 bits)
   val last, access = Bool()
+  val half = split generate Bool() // upper word of an 8-byte element
 }
 
 /**
  * Vector instructions on one lane layer. Each one waits until every older instruction left the pipeline, is checked
  * against vtype/vstart at E0 and then does all its work there; vset* complete in that cycle.
  * Loads and stores instead issue one LSU micro-op per field of each active element and complete with the last one.
- * withMemory = false leaves the LSU element port to another sequencer.
+ * withMemory = false leaves the LSU element port to another sequencer. ELEN 64 adds SEW 64 and the EEW-64 memory forms;
+ * with a 32-bit LSU each 8-byte element then takes two micro-ops, low word first.
  */
-class VectorPlugin(val layer : LaneLayer, val dlen : Int = 64, var withMemory : Boolean = true) extends FiberPlugin with InitService {
+class VectorPlugin(val layer : LaneLayer, val dlen : Int = 64, var withMemory : Boolean = true, val elen : Int = 32) extends FiberPlugin with InitService {
+  require(elen == 32 || elen == 64)
   override def initHold(): Bool = regFile.vrf.io.initHold
 
   // Initialization must be available before the trap controller finishes building.
@@ -86,6 +90,7 @@ class VectorPlugin(val layer : LaneLayer, val dlen : Int = 64, var withMemory : 
   val OVERLAP_VS1, OVERLAP_VS2 = Payload(UInt(VectorOverlap.width bits))
   val RANGE = Payload(UInt(VectorRange.width bits))
   val MEM = Payload(Bool()) // Element micro-op through the shared LSU
+  val UNSIGNED_IMMEDIATE = Payload(Bool()) // shift and clip amounts are zero-extended (norm:vsll_vsrl_vsra_shamt)
 
   val logic = during setup new Area {
     val elp = layer.lane
@@ -114,6 +119,8 @@ class VectorPlugin(val layer : LaneLayer, val dlen : Int = 64, var withMemory : 
     for (key <- List(EMUL_VD, EMUL_VS1, EMUL_VS2)) elp.setDecodingDefault(key, U(VectorEmul.NONE, VectorEmul.width bits))
     for (key <- checks) elp.setDecodingDefault(key, False)
     ds.addMicroOpDecodingDefault(VECTOR, False)
+    if (elen == 64) elp.setDecodingDefault(UNSIGNED_IMMEDIATE, False)
+    val shiftNames = Set("vsll", "vsrl", "vsra", "vssrl", "vssra", "vnsrl", "vnsra", "vnclipu", "vnclip")
 
     val wb = ifp.access(1)
     def add(op : MicroOp, decodings : (Payload[_ <: BaseType], Any)*) : UopLayerSpec = {
@@ -157,11 +164,12 @@ class VectorPlugin(val layer : LaneLayer, val dlen : Int = 64, var withMemory : 
          if Rvv.all.contains(s"$name.$form") || name == "vmv.v" && form.length == 2) {
       val mnemonic = if (name == "vmv.v") s"vmv.v.${form.last}" else s"$name.$form"
       val vector = form.startsWith("vv")
-      add(Rvv.all(mnemonic), ARITH -> True, ALU_OP -> alu(op), SATURATE -> Bool(saturate), SIGNED -> Bool(signed),
+      val spec = add(Rvv.all(mnemonic), ARITH -> True, ALU_OP -> alu(op), SATURATE -> Bool(saturate), SIGNED -> Bool(signed),
         SCALAR_OPERAND -> Bool(!vector), IMMEDIATE -> Bool(form.startsWith("vi")), MASK_DATA -> Bool(form.length == 3),
         CHECK_VILL -> True, CHECK_VSTART -> True, EMUL_VD -> emul(VectorEmul.L),
         EMUL_VS1 -> emul(if (vector) VectorEmul.L else VectorEmul.NONE),
         EMUL_VS2 -> emul(if (name != "vmv.v") VectorEmul.L else VectorEmul.NONE), MASK_NOT_V0 -> Bool(name != "vmv.v"))
+      if (elen == 64 && shiftNames(name) && form == "vi") spec.addDecoding(UNSIGNED_IMMEDIATE -> True)
     }
     // Extensions: vs2 at SEW / f and EMUL = LMUL / f (norm:vsext_vzext_vs_eew_emul)
     for (f <- Seq(2, 4); signed <- Seq(false, true)) {
@@ -213,11 +221,12 @@ class VectorPlugin(val layer : LaneLayer, val dlen : Int = 64, var withMemory : 
     for ((name, op, signed, saturate) <- Seq(("vnsrl", VectorAluOp.SRL, false, false), ("vnsra", VectorAluOp.SRL, true, false),
          ("vnclipu", VectorAluOp.SSRL, false, true), ("vnclip", VectorAluOp.SSRL, true, true)); form <- Seq("wv", "wx", "wi")) {
       val vector = form == "wv"
-      add(Rvv.all(s"$name.$form"), ARITH -> True, SHAPE -> shape(VectorShape.NARROW), ALU_OP -> alu(op),
+      val spec = add(Rvv.all(s"$name.$form"), ARITH -> True, SHAPE -> shape(VectorShape.NARROW), ALU_OP -> alu(op),
         SIGNED -> Bool(signed), SATURATE -> Bool(saturate), SCALAR_OPERAND -> Bool(!vector), IMMEDIATE -> Bool(form == "wi"),
         CHECK_VILL -> True, CHECK_VSTART -> True, EMUL_VD -> emul(VectorEmul.L),
         EMUL_VS1 -> emul(if (vector) VectorEmul.L else VectorEmul.NONE), EMUL_VS2 -> emul(VectorEmul.W), MASK_NOT_V0 -> True,
         OVERLAP_VS2 -> overlap(VectorOverlap.BASE), RANGE -> U(VectorRange.WIDE, VectorRange.width bits))
+      if (elen == 64 && form == "wi") spec.addDecoding(UNSIGNED_IMMEDIATE -> True)
     }
     // Element arithmetic: name, operation, vs2 signed, vs1 or scalar signed, product subtracted
     val elementOps = Seq(
@@ -240,7 +249,8 @@ class VectorPlugin(val layer : LaneLayer, val dlen : Int = 64, var withMemory : 
         EMUL_VS1 -> emul(if (vector) VectorEmul.L else VectorEmul.NONE), EMUL_VS2 -> emul(VectorEmul.L), MASK_NOT_V0 -> True,
         OVERLAP_VS2 -> overlap(if (wide) VectorOverlap.WIDEN else VectorOverlap.ANY),
         OVERLAP_VS1 -> overlap(if (wide && vector) VectorOverlap.WIDEN else VectorOverlap.ANY),
-        RANGE -> U(if (wide) VectorRange.WIDE else VectorRange.ANY, VectorRange.width bits))
+        RANGE -> U(if (wide) VectorRange.WIDE else if (elen == 64 && (op == VectorElementOp.MULH || op == VectorElementOp.SMUL))
+          VectorRange.NO64 else VectorRange.ANY, VectorRange.width bits))
     }
     // Reductions into element 0 of vd: only vs2 is a group; vd = v0 is legal when masked (norm:vreduction_vd_overlap_vs)
     for ((name, op, signed) <- Seq(("vredsum", VectorAluOp.ADD, false), ("vredand", VectorAluOp.AND, false),
@@ -284,10 +294,11 @@ class VectorPlugin(val layer : LaneLayer, val dlen : Int = 64, var withMemory : 
       SCALAR_OPERAND -> True, SHAPE -> shape(VectorShape.SCALAR_WRITE), CHECK_VILL -> True, CHECK_VSTART -> True)
 
     // The LSU frontend owns these uops (completion, flushes, rs1); masked loads must not overwrite v0
-    val memoryOps = VectorMemoryOps.all
+    val memoryForms = VectorMemoryOps(elen, XLEN.get)
+    val memoryOps = memoryForms.all
     if (withMemory) {
       for ((op, load) <- memoryOps) layer.add(op).addDecoding(SEL -> True, MEM -> True,
-        CHECK_VILL -> Bool(!VectorMemoryOps.whole.exists(_._1 == op)), MASK_NOT_V0 -> Bool(load))
+        CHECK_VILL -> Bool(!memoryForms.whole.exists(_._1 == op)), MASK_NOT_V0 -> Bool(load))
       dp.sequence(memoryOps.map(_._1))
     }
 
@@ -301,7 +312,7 @@ class VectorPlugin(val layer : LaneLayer, val dlen : Int = 64, var withMemory : 
     val vlen = vcs.vlen
     val vlWidth = vcs.vlWidth
     val vrf = regFile.vrf
-    val arithmetic = new VectorArithmetic(vrf.p, XLEN)
+    val arithmetic = new VectorArithmetic(vrf.p, XLEN, elen)
     val element = new VectorElementUnit(vrf.p, XLEN)
     vrf.io.write := arithmetic.io.write
     when(element.io.busy) { vrf.io.write := element.io.write }
@@ -335,8 +346,14 @@ class VectorPlugin(val layer : LaneLayer, val dlen : Int = 64, var withMemory : 
       val shift = S(log2Up(vlen) - 3, 5 bits) + vlmul.asSInt.resize(5) - vsew.resize(5).asSInt
       (U(1, vlWidth bits) << shift.asUInt.resize(log2Up(vlWidth))).resize(vlWidth)
     }
-    // Element size from the memory width code: 8, 16 or 32 bits
-    def sizeOf(uop : Bits) : UInt = uop(Const.funct3Range).mux(B"000" -> U(0, 2 bits), B"101" -> U(1, 2 bits), default -> U(2, 2 bits))
+    // Element size from the memory width code: 8, 16, 32 or, with ELEN 64, 64 bits
+    def sizeOf(uop : Bits) : UInt = if (elen == 64)
+      uop(Const.funct3Range).mux(B"000" -> U(0, 2 bits), B"101" -> U(1, 2 bits), B"111" -> U(3, 2 bits), default -> U(2, 2 bits))
+    else uop(Const.funct3Range).mux(B"000" -> U(0, 2 bits), B"101" -> U(1, 2 bits), default -> U(2, 2 bits))
+    // log2 of the memory EEW in bits
+    def eewLog2Of(width : Bits) : SInt = if (elen == 64)
+      width.mux(B"101" -> S(4, 5 bits), B"110" -> S(5, 5 bits), B"111" -> S(6, 5 bits), default -> S(3, 5 bits))
+    else width.mux(B"101" -> S(4, 5 bits), B"110" -> S(5, 5 bits), default -> S(3, 5 bits))
     def indexed(uop : Bits) : Bool = uop(26)
     def strided(uop : Bits) : Bool = uop(27 downto 26) === B"10"
     def whole(uop : Bits) : Bool = uop(27 downto 26) === 0 && uop(Const.rs2Range) === 8
@@ -348,7 +365,7 @@ class VectorPlugin(val layer : LaneLayer, val dlen : Int = 64, var withMemory : 
     // log2 of the data EMUL: LMUL for indexed, EEW / SEW * LMUL otherwise (norm:vector_ls_indexed_op)
     def dataLog2Of(uop : Bits) : SInt = {
       val lmul = vcs.vtype.vlmul.asSInt.resize(5)
-      val eewLog2 = uop(Const.funct3Range).mux(B"101" -> S(4, 5 bits), B"110" -> S(5, 5 bits), default -> S(3, 5 bits))
+      val eewLog2 = eewLog2Of(uop(Const.funct3Range))
       indexed(uop) ? lmul | (eewLog2 - S(3, 5 bits) - vcs.vtype.vsew.resize(5).asSInt + lmul)
     }
     // Field f of a segment lives in register vd + f * max(EMUL, 1)
@@ -361,7 +378,8 @@ class VectorPlugin(val layer : LaneLayer, val dlen : Int = 64, var withMemory : 
     def groupOffset(index : UInt, size : UInt) : UInt = (index.resize(log2Up(vlen)) << size).resize(log2Up(vlen))
     def wordOf(vreg : UInt, offset : UInt) : UInt =
       ((vreg.resize(vrf.p.addressWidth) << vrf.p.beatWidth) + (offset >> log2Up(vrf.p.beatBytes)).resized).resize(vrf.p.addressWidth)
-    val DESCRIPTOR = Payload(VectorMemoryDescriptor(vcs.vstartWidth))
+    val split = withMemory && lsu.vectorSplit
+    val DESCRIPTOR = Payload(VectorMemoryDescriptor(vcs.vstartWidth, split))
 
     // log2 EMUL of an operand class; classes without a group check as one register
     def emulOf(cls : UInt, lmul : SInt, nreg : SInt) : SInt = cls.mux(
@@ -399,7 +417,7 @@ class VectorPlugin(val layer : LaneLayer, val dlen : Int = 64, var withMemory : 
         val imm = Decode.UOP(17 downto 15)
         val nreg = imm(2) ? S(3, 4 bits) | (imm(1) ? S(2, 4 bits) | (imm(0) ? S(1, 4 bits) | S(0, 4 bits)))
         val width = Decode.UOP(Const.funct3Range)
-        val eewLog2 = width.mux(B"101" -> S(4, 5 bits), B"110" -> S(5, 5 bits), default -> S(3, 5 bits))
+        val eewLog2 = eewLog2Of(width)
         val emul = eewLog2 - S(3, 5 bits) - vtype.vsew.resize(5).asSInt + lmul.resize(5)
         val emulOk = emul >= S(-3) && emul <= S(3)
 
@@ -437,11 +455,19 @@ class VectorPlugin(val layer : LaneLayer, val dlen : Int = 64, var withMemory : 
         val disjoint = OVERLAP_VS2 === VectorOverlap.DISJOINT && overlapped(vd, vdLog2, vs2, vs2Log2) ||
           OVERLAP_VS1 === VectorOverlap.DISJOINT && overlapped(vd, vdLog2, vs1, vs1Log2)
         val indexRange = EMUL_VS1 === VectorEmul.INDEX16 && (vs1Log2 < -3 || vs1Log2 > 3)
-        val range = RANGE.mux(
+        val wideSew = log2Up(elen / 8)
+        val range = if (elen == 64) RANGE.mux(
           U(VectorRange.EXT2) -> (vtype.vsew === 0),
           U(VectorRange.EXT4) -> (vtype.vsew < 2),
-          U(VectorRange.WIDE) -> (vtype.vsew === 2 || vtype.vlmul === B"011"),
-          U(VectorRange.WIDE_SCALAR) -> (vtype.vsew === 2),
+          U(VectorRange.WIDE) -> (vtype.vsew === wideSew || vtype.vlmul === B"011"),
+          U(VectorRange.WIDE_SCALAR) -> (vtype.vsew === wideSew),
+          U(VectorRange.NO64) -> (vtype.vsew === 3),
+          default -> False
+        ) else RANGE.mux(
+          U(VectorRange.EXT2) -> (vtype.vsew === 0),
+          U(VectorRange.EXT4) -> (vtype.vsew < 2),
+          U(VectorRange.WIDE) -> (vtype.vsew === wideSew || vtype.vlmul === B"011"),
+          U(VectorRange.WIDE_SCALAR) -> (vtype.vsew === wideSew),
           default -> False
         )
         val illegal = vill || vstart || group || maskOverlap || mem || widen || baseVs2 || baseVs1 || disjoint || indexRange || range
@@ -481,14 +507,15 @@ class VectorPlugin(val layer : LaneLayer, val dlen : Int = 64, var withMemory : 
         bits := VSET_REG ? rs2 | (VSET_IMM ? Decode.UOP(29 downto 20).resize(XLEN) | Decode.UOP(30 downto 20).resize(XLEN))
         val vsew = bits(5 downto 3).asUInt
         val vlmul = bits(2 downto 0)
+        // SEW <= LMUL * ELEN; LMUL 100 is reserved (norm:vtype_lmul_fval_rsv)
         val lmulOk = vlmul.mux(
           B"100" -> False,
-          B"101" -> False,
-          B"110" -> (vsew === 0),
-          B"111" -> (vsew <= 1),
+          B"101" -> (if (elen == 64) vsew === 0 else False),
+          B"110" -> (if (elen == 64) vsew <= 1 else vsew === 0),
+          B"111" -> (if (elen == 64) vsew <= 2 else vsew <= 1),
           default -> True
         )
-        val typeOk = bits(XLEN - 1 downto 8) === 0 && vsew <= 2 && lmulOk
+        val typeOk = bits(XLEN - 1 downto 8) === 0 && vsew <= log2Up(elen / 8) && lmulOk
         val vlmax = vlmaxOf(vsew, vlmul)
         val oldVlmax = vtype.vill ? U(0, vlWidth bits) | vlmaxOf(vtype.vsew, vtype.vlmul)
 
@@ -525,7 +552,8 @@ class VectorPlugin(val layer : LaneLayer, val dlen : Int = 64, var withMemory : 
         arithmetic.io.cmd.sew := vtype.vsew.resized
         arithmetic.io.cmd.shape := SHAPE
         arithmetic.io.cmd.op := ALU_OP
-        arithmetic.io.cmd.scalar := IMMEDIATE ? Decode.UOP(Const.rs1Range).asSInt.resize(XLEN).asBits | up(elp(IntRegFile, RS1))
+        arithmetic.io.cmd.scalar := IMMEDIATE ? (if (elen == 64) UNSIGNED_IMMEDIATE ? Decode.UOP(Const.rs1Range).resize(XLEN) |
+          Decode.UOP(Const.rs1Range).asSInt.resize(XLEN).asBits else Decode.UOP(Const.rs1Range).asSInt.resize(XLEN).asBits) | up(elp(IntRegFile, RS1))
         arithmetic.io.cmd.scalarOperand := SCALAR_OPERAND
         arithmetic.io.cmd.unmasked := vm
         arithmetic.io.cmd.maskData := MASK_DATA
@@ -571,7 +599,7 @@ class VectorPlugin(val layer : LaneLayer, val dlen : Int = 64, var withMemory : 
     val memory = withMemory generate new Area {
       val port = lsuPort
       val seq = dp.logic.sequencer.port
-      val walker = new VectorElementWalker(vlen)
+      val walker = new VectorElementWalker(vlen, split)
       val resume = RegInit(False) // an element retries after REDO or a TLB refill
       val resumeField = Reg(UInt(3 bits)) init(0) // the field it retries from
       // Fault-only-first: the trap controller may turn the exception of an element past 0 into a trim,
@@ -596,12 +624,14 @@ class VectorPlugin(val layer : LaneLayer, val dlen : Int = 64, var withMemory : 
       walker.io.v0 := vrf.io.v0
       walker.io.fields := fieldsOf(seq.uop)
       walker.io.startField := resumeField
+      if (split) walker.io.wide := dataSize(seq.uop) === 3
       // A candidate leaves only by fire or cancel, so an uncancelled sample belongs to the current candidate
       val prepared = RegNext(walker.io.start && !seq.cancel) init(False)
       seq.ready := !seq.first || prepared && port.storeBufferEmpty
       seq.last := walker.io.last
 
-      val descriptor = VectorMemoryDescriptor(vcs.vstartWidth)
+      val descriptor = VectorMemoryDescriptor(vcs.vstartWidth, split)
+      if (split) descriptor.half := walker.io.half
       descriptor.index := walker.io.index
       descriptor.field := walker.io.field
       descriptor.last := walker.io.last
@@ -635,13 +665,27 @@ class VectorPlugin(val layer : LaneLayer, val dlen : Int = 64, var withMemory : 
         port.cmd.valid := isValid && MEM
         val indexOffset = groupOffset(d.index, sizeOf(Decode.UOP))
         val indexWord = vrf.io.reads(0).rsp >> (indexOffset.resize(log2Up(vrf.p.beatBytes)) << 3)
-        val indexElement = sizeOf(Decode.UOP).mux(
+        val indexElement = if (elen == 64 && XLEN.get == 64) sizeOf(Decode.UOP).mux(
+          U(0) -> indexWord(7 downto 0).asUInt.resize(XLEN),
+          U(1) -> indexWord(15 downto 0).asUInt.resize(XLEN),
+          U(2) -> indexWord(31 downto 0).asUInt.resize(XLEN),
+          default -> indexWord(63 downto 0).asUInt.resize(XLEN))
+        else sizeOf(Decode.UOP).mux(
           U(0) -> indexWord(7 downto 0).asUInt.resize(XLEN),
           U(1) -> indexWord(15 downto 0).asUInt.resize(XLEN),
           default -> indexWord(31 downto 0).asUInt.resize(XLEN))
-        port.cmd.address := (up(elp(IntRegFile, RS1)).asUInt + apply(read.OFFSET) + (indexed(Decode.UOP) ? indexElement | U(0, XLEN bits))).resized
-        port.cmd.size := size.resized
-        port.cmd.storeData := (word >> (offset.resize(log2Up(vrf.p.beatBytes)) << 3)).resize(LSLEN)
+        if (split) {
+          // The upper word of a split element is at A + 4 and in bytes 4-7 of its VRF word
+          val upper = U(d.half) << 2
+          port.cmd.address := (up(elp(IntRegFile, RS1)).asUInt + apply(read.OFFSET) + (indexed(Decode.UOP) ? indexElement | U(0, XLEN bits)) + upper).resized
+          port.cmd.size := ((size === 3) ? U(2, 2 bits) | size).resized
+          port.cmd.storeData := (word >> ((offset.resize(log2Up(vrf.p.beatBytes)) | upper.resized) << 3)).resize(LSLEN)
+          port.cmd.wide := size === 3 && !d.half
+        } else {
+          port.cmd.address := (up(elp(IntRegFile, RS1)).asUInt + apply(read.OFFSET) + (indexed(Decode.UOP) ? indexElement | U(0, XLEN bits))).resized
+          port.cmd.size := size.resized
+          port.cmd.storeData := (word >> (offset.resize(log2Up(vrf.p.beatBytes)) << 3)).resize(LSLEN)
+        }
         port.cmd.access := d.access && !illegal // an illegal micro-op only carries its trap
         port.cmd.last := d.last || illegal
         val ILLEGAL = insert(illegal)
@@ -664,6 +708,17 @@ class VectorPlugin(val layer : LaneLayer, val dlen : Int = 64, var withMemory : 
         )
         val bytes = size.mux(U(0) -> B"0001", U(1) -> B"0011", default -> B"1111")
         write.mask := (bytes.resize(vrf.p.beatBytes) << offset.resize(log2Up(vrf.p.beatBytes))).resize(vrf.p.beatBytes)
+        if (elen == 64) when(size === 3) { write.mask := B(0xff, vrf.p.beatBytes bits) }
+        // 8-byte elements: one LSU word, or with a 32-bit LSU the held low word and the upper half's word
+        if (elen == 64 && !split) when(size === 3) { write.data := rsp.data(63 downto 0) }
+        val low = split generate Reg(Bits(32 bits))
+        if (split) {
+          when(rsp.valid && rsp.load && !d.half) { low := rsp.data(31 downto 0) }
+          when(size === 3) {
+            write.valid clearWhen(!d.half)
+            write.data := rsp.data(31 downto 0) ## low
+          }
+        }
 
         // Any element trap restarts at that element (norm:vector_ls_vstart); the last one completes the instruction
         when(rsp.valid && legal) {

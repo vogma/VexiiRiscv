@@ -6,7 +6,7 @@ import spinal.lib.misc.pipeline._
 import vexiiriscv.Global
 import vexiiriscv.decode.{Decode, DecoderService}
 import vexiiriscv.execute.vector.{VectorCsrService, VectorLsuElement}
-import vexiiriscv.misc.Trap
+import vexiiriscv.misc.{LsuTriggerBus, PrivilegedPlugin, Trap}
 import vexiiriscv.riscv.{Const, Riscv}
 import vexiiriscv.schedule.DispatchPlugin
 
@@ -19,7 +19,7 @@ class VectorLsuHooks(lsu: LsuPlugin, frontend: AguFrontend, ds: DecoderService) 
   require(addressAt == 0 && ctrlAt == wbAt, "vector elements require E0 address capture and control-stage writeback")
   lsu.vectorLsuLock.await()
   val port = lsu.vectorLsuPort
-  val ELEMENT = Payload(VectorLsuElement())
+  val ELEMENT = Payload(VectorLsuElement(lsu.vectorSplit))
   val DECODE_VECTOR = Payload(Bool())
   for (uop <- frontend.vectorOps) {
     layer(uop).mayFlushUpTo(ctrlAt).setCompletion(ctrlAt)
@@ -51,6 +51,29 @@ class VectorLsuHooks(lsu: LsuPlugin, frontend: AguFrontend, ds: DecoderService) 
 
   def msbFailed(e: CtrlLaneApi, scalar: UInt, extension: Bool): Bool =
     address(e, scalar).dropLow(Global.MIXED_WIDTH).asBools.map(_ =/= extension).orR
+
+  // The low word of a split 8-byte element also needs bit 2 of its address clear
+  def missAligned(e: CtrlLaneApi, scalar: Bool): Bool =
+    if (lsu.vectorSplit) scalar || e(VECTOR) && e(ELEMENT).wide && e(ELEMENT).address(2) else scalar
+
+  // The low word of a split 8-byte element matches the triggers at both word addresses, so neither half accesses memory
+  def triggerHits(e: CtrlLaneApi, bus: LsuTriggerBus): Bits = {
+    val pp = lsu.host[PrivilegedPlugin]
+    if (!lsu.vectorSplit || !pp.p.debugTriggersLsu || pp.p.debugTriggers == 0) bus.hits else new Area {
+      val slots = pp.logic.harts(0).trigger.slots
+      val upper = B(bus.virtual + 4)
+      val raw = slots.map { s =>
+        val m = s.tdata2.lsu.matcher
+        val maskHit = (~((upper & m.mask) ^ (s.tdata2.value & m.mask))).andR
+        val cmp = U(upper) < U(s.tdata2.value)
+        val upperOk = s.tdata1.matcher.mux(0 -> maskHit, 1 -> maskHit, 2 -> !cmp, 3 -> cmp, default -> False)
+        s.tdata2.enabled && s.tdata2.lsu.sizeOk && s.tdata2.lsu.virtualTrigger && (m.ok || upperOk)
+      }
+      val broken = slots.indices.scanLeft(False)((b, i) => slots(i).tdata1.chain && (b || !raw(i))).dropRight(1)
+      val span = Cat(slots.indices.map(i => raw(i) && !broken(i) && !slots(i).tdata1.chain).reverse)
+      val hits = (e(VECTOR) && e(ELEMENT).wide) ? span | bus.hits
+    }.hits
+  }
 
   def storeData(e: CtrlLaneApi, data: Bits): Unit = {
     when(e(VECTOR)) { data := e(ELEMENT).storeData }
