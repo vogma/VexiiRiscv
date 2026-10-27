@@ -56,6 +56,10 @@ class VectorLsuHooks(lsu: LsuPlugin, frontend: AguFrontend, ds: DecoderService) 
   def missAligned(e: CtrlLaneApi, scalar: Bool): Bool =
     if (lsu.vectorSplit) scalar || e(VECTOR) && e(ELEMENT).wide && e(ELEMENT).address(2) else scalar
 
+  // The IO bus is 32 bits wide: an 8-byte element in an IO region takes an access fault on its low word
+  def ioFault(e: CtrlLaneApi, fault: Bool): Unit =
+    when(e(VECTOR) && e(ELEMENT).wide) { fault := True }
+
   // The low word of a split 8-byte element matches the triggers at both word addresses, so neither half accesses memory
   def triggerHits(e: CtrlLaneApi, bus: LsuTriggerBus): Bits = {
     val pp = lsu.host[PrivilegedPlugin]

@@ -9,7 +9,7 @@ import vexiiriscv.Global.PC_WIDTH
 import vexiiriscv._
 import vexiiriscv.decode.Decode
 import vexiiriscv.execute.lsu._
-import vexiiriscv.execute.vector.VectorPlugin
+import vexiiriscv.execute.vector.{VectorLsuService, VectorPlugin}
 import vexiiriscv.fetch.FetchPipelinePlugin
 import vexiiriscv.memory.{MmuPlugin, PmpPlugin, PmpService}
 import vexiiriscv.misc.{PerformanceCounterPlugin, PrivilegedPlugin}
@@ -316,6 +316,8 @@ class VexiiRiscvProbe(cpu : VexiiRiscv, kb : Option[konata.Backend], var withRvl
           asidWidth = cpu.host.get[MmuPlugin].map(_.asidWidth).getOrElse(0),
           memoryViewId = hartId
         )
+        // RV32 with 8-byte vector elements: IO elements take an access fault where Spike performs the access
+        if (cpu.host.get[VectorLsuService].exists(s => s.withVector && s.vectorElen == 64) && get(Riscv.LSLEN) < 64) tracer.setPolicy(hartId, "ioWideFault=1")
         val pc = if(xlen == 32) 0x80000000l else 0x80000000l
         tracer.setPc(hartId, pc)
       }

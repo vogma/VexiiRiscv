@@ -669,7 +669,7 @@ class LsuPlugin(var layer : LaneLayer,
 
       val CACHED_RSP = insert(cached.rsp)
       val IO_RSP = insert(io.rsp)
-      IO_RSP.fault.setWhen(l1.ATOMIC || FROM_ACCESS)
+      IO_RSP.fault.setWhen(l1.ATOMIC || FROM_ACCESS); if (vectorSplit) vector.ioFault(this, IO_RSP.fault)
       val IO = insert(CACHED_RSP.fault && !IO_RSP.fault && !FENCE && !FROM_PREFETCH)
       val FROM_LSU_MSB_FAILED = insert(FROM_LSU && (if (withVector) vector.msbFailed(this, srcp.ADD_SUB.asUInt, tpk.ADDRESS_EXTENSION) else srcp.ADD_SUB.dropLow(Global.MIXED_WIDTH).asBools.map(_ =/= tpk.ADDRESS_EXTENSION).orR))
       MMU_PAGE_FAULT := tpk.PAGE_FAULT
