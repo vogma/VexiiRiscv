@@ -792,8 +792,8 @@ class LsuPlugin(var layer : LaneLayer,
         val addressCheck = address === l1.PHYSICAL_ADDRESS
 
         when(!elp.isFreezed() && isValid && FROM_LSU && l1.SEL && !lsuTrap && !onPma.IO) {
-          when(l1.STORE && (isSc || addressCheck)){
-            reserved := False // SC always clears the reservation; other stores only clear a matching reservation
+          when(l1.STORE) { // All stores (including AMO) stay here so they never reach the LR capture below
+            reserved clearWhen(isSc || addressCheck) // SC always clears the reservation; other stores only clear a matching reservation
           } elsewhen(apply(l1.ATOMIC)) {
             capture := True // Load Reserve
           }
@@ -848,7 +848,7 @@ class LsuPlugin(var layer : LaneLayer,
         trapPort.valid := False
         trapPort.hartId := Global.HART_ID
         trapPort.laneAge := Execute.LANE_AGE
-        trapPort.tval := l1.MIXED_ADDRESS.asBits.resized //PC RESIZED
+        trapPort.tval := Global.expendPc(l1.MIXED_ADDRESS, Global.TVAL_WIDTH).asBits //PC RESIZED
         trapPort.tval2 := tpk.TRANSLATED.asBits.dropLow(2).resized
         trapPort.exception.assignDontCare()
         trapPort.code.assignDontCare()
@@ -921,6 +921,10 @@ class LsuPlugin(var layer : LaneLayer,
           trapPort.code := CSR.MCAUSE_ENUM.LOAD_ACCESS_FAULT
           trapPort.code(1) setWhen (STORE)
           trapPort.code(3) setWhen (!tpk.BYPASS_TRANSLATION)
+          if (Global.TVAL_WIDTH.get > Global.VIRTUAL_WIDTH.get) {
+            // Only flip when the mark when it is in translation
+            trapPort.tval(Global.VIRTUAL_WIDTH.get) := !l1.MIXED_ADDRESS.msb
+          }
         }
         if(pp.implementHypervisor) when(!MMU_FAILURE) {
           when(stpk.PAGE_FAULT) {
@@ -954,7 +958,7 @@ class LsuPlugin(var layer : LaneLayer,
           trapPort.code := l1.STORE.mux[Bits](CSR.MCAUSE_ENUM.STORE_MISALIGNED, CSR.MCAUSE_ENUM.LOAD_MISALIGNED).andMask(preCtrl.MISS_ALIGNED).resized
         }
 
-        when(onTrigger.HIT) {
+        when(onTrigger.HIT && !onPma.FROM_LSU_MSB_FAILED) {
           lsuTrap := True
           trapPort.exception := False
           trapPort.code := TrapReason.DEBUG_TRIGGER

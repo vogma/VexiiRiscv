@@ -523,7 +523,7 @@ class PrivilegedPlugin(val p : PrivilegedParam, val hartIds : Seq[Int]) extends 
 
             val execute = for (laneId <- 0 until Decode.LANES) yield new dpp.LaneArea(pcBreakMatchAt, laneId) {
               val chainBroken = Bool()
-              val hitNoChain = enabled && tdata1.execute && U(value) === Global.PC && !chainBroken
+              val hitNoChain = enabled && tdata1.execute && Global.expendPc(value.asUInt, Global.PC_WIDTH) === Global.PC && !chainBroken
               PC_TRIGGER_HITS(slotId) := hitNoChain && !tdata1.chain
             }
 
@@ -744,6 +744,8 @@ class PrivilegedPlugin(val p : PrivilegedParam, val hartIds : Seq[Int]) extends 
 
         val tval2 = p.withHypervisor generate crs.readWriteRam(CSR.MTVAL2)
         val tinst = p.withHypervisor generate crs.readWriteRam(CSR.MTINST)
+
+        if (XLEN.get == 32) api.allowCsr(CsrListFilter(Seq(CSR.MIDELEGH,CSR.MEDELEGH, CSR.MSTATUSH)), True)
 
         spec.addInterrupt(ip.mtip && ie.mtie, id = 7, privilege = PrivilegeMode.M, delegators = Nil)
         spec.addInterrupt(ip.msip && ie.msie, id = 3, privilege = PrivilegeMode.M, delegators = Nil)
