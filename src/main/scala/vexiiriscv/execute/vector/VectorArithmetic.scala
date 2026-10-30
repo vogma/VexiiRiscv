@@ -87,6 +87,48 @@ case class VectorArithmeticCmd(p: VectorRegFileParam, xlen: Int) extends Bundle 
   val nreg = UInt(4 bits) // WHOLE: 1, 2, 4 or 8 registers
 }
 
+// Shape and op properties of a command, registered with it so the datapath does not decode them
+case class VectorArithmeticFlags() extends Bundle {
+  val scalarRead, scalarWrite, ext2, ext4, ext8, maskDst, maskMm, maskScan, whole = Bool()
+  val wideVv, widening, narrow, wreduce, reduce = Bool()
+  val index, subtract, average, rounding, shift, left, rsub, min, merge = Bool()
+  val dstSew, laneSew = UInt(2 bits)
+}
+
+object VectorArithmeticFlags {
+  def apply(c: VectorArithmeticCmd, elen: Int): VectorArithmeticFlags = {
+    val f = VectorArithmeticFlags()
+    def op(ops: Int*): Bool = ops.map(c.op === _).orR
+    f.scalarRead := c.shape === VectorShape.SCALAR_READ
+    f.scalarWrite := c.shape === VectorShape.SCALAR_WRITE
+    f.ext2 := c.shape === VectorShape.EXT2
+    f.ext4 := c.shape === VectorShape.EXT4
+    f.ext8 := (if (elen == 64) c.shape === VectorShape.EXT8 else False)
+    f.maskDst := c.shape === VectorShape.MASK_DST
+    f.maskMm := c.shape === VectorShape.MASK_MM
+    f.maskScan := op(VectorAluOp.MSBF, VectorAluOp.MSIF, VectorAluOp.MSOF)
+    f.whole := c.shape === VectorShape.WHOLE
+    f.wideVv := c.shape === VectorShape.WIDE_VV
+    f.widening := f.wideVv || c.shape === VectorShape.WIDE_WV
+    f.narrow := c.shape === VectorShape.NARROW
+    f.wreduce := c.shape === VectorShape.WREDUCE
+    f.reduce := f.wreduce || c.shape === VectorShape.REDUCE
+    f.dstSew := c.sew + U(f.widening || f.wreduce)
+    f.laneSew := c.sew + U(f.widening || f.narrow || f.wreduce)
+    f.index := c.op === VectorAluOp.INDEX
+    f.subtract := op(VectorAluOp.SUB, VectorAluOp.RSUB, VectorAluOp.MIN, VectorAluOp.MAX,
+      VectorAluOp.SLT, VectorAluOp.SLE, VectorAluOp.SGT, VectorAluOp.ASUB)
+    f.average := op(VectorAluOp.AADD, VectorAluOp.ASUB)
+    f.rounding := f.average || c.op === VectorAluOp.SSRL
+    f.shift := op(VectorAluOp.SLL, VectorAluOp.SRL) || f.rounding
+    f.left := c.op === VectorAluOp.SLL
+    f.rsub := c.op === VectorAluOp.RSUB
+    f.min := c.op === VectorAluOp.MIN
+    f.merge := c.op === VectorAluOp.MERGE
+    f
+  }
+}
+
 // One step per cycle: issue synchronous reads, compute in X1 and X2, then write the destination word with byte enables.
 // ELEN 64 adds 64-bit lanes (sew 3), one element per word.
 class VectorArithmetic(val p: VectorRegFileParam, val xlen: Int, val elen: Int = 32) extends Component {
@@ -104,31 +146,29 @@ class VectorArithmetic(val p: VectorRegFileParam, val xlen: Int, val elen: Int =
   }
 
   val command = Reg(VectorArithmeticCmd(p, xlen))
-  val scalarRead = command.shape === VectorShape.SCALAR_READ
-  val scalarWrite = command.shape === VectorShape.SCALAR_WRITE
-  val ext2 = command.shape === VectorShape.EXT2
-  val ext4 = command.shape === VectorShape.EXT4
-  val ext8 = if (elen == 64) command.shape === VectorShape.EXT8 else False
-  val maskDst = command.shape === VectorShape.MASK_DST
-  val maskMm = command.shape === VectorShape.MASK_MM
-  val maskScan = command.op === VectorAluOp.MSBF || command.op === VectorAluOp.MSIF || command.op === VectorAluOp.MSOF
-  val whole = command.shape === VectorShape.WHOLE
-  val wideVv = command.shape === VectorShape.WIDE_VV
-  val widening = wideVv || command.shape === VectorShape.WIDE_WV
-  val narrow = command.shape === VectorShape.NARROW
-  val wreduce = command.shape === VectorShape.WREDUCE
-  val reduce = wreduce || command.shape === VectorShape.REDUCE
+  val flags = Reg(VectorArithmeticFlags())
+  val scalarRead = flags.scalarRead
+  val scalarWrite = flags.scalarWrite
+  val ext2 = flags.ext2
+  val ext4 = flags.ext4
+  val ext8 = flags.ext8
+  val maskDst = flags.maskDst
+  val maskMm = flags.maskMm
+  val maskScan = flags.maskScan
+  val whole = flags.whole
+  val wideVv = flags.wideVv
+  val widening = flags.widening
+  val narrow = flags.narrow
+  val wreduce = flags.wreduce
+  val reduce = flags.reduce
   // log2 bytes of a destination element (of a source element for reductions), and of the adder and shifter lanes
-  val dstSew = command.sew + U(widening || wreduce)
-  val laneSew = command.sew + U(widening || narrow || wreduce)
-  val index = command.op === VectorAluOp.INDEX
-  val subtract = command.op === VectorAluOp.SUB || command.op === VectorAluOp.RSUB ||
-    command.op === VectorAluOp.MIN || command.op === VectorAluOp.MAX ||
-    command.op === VectorAluOp.SLT || command.op === VectorAluOp.SLE || command.op === VectorAluOp.SGT ||
-    command.op === VectorAluOp.ASUB
-  val average = command.op === VectorAluOp.AADD || command.op === VectorAluOp.ASUB
-  val rounding = average || command.op === VectorAluOp.SSRL
-  val shift = command.op === VectorAluOp.SLL || command.op === VectorAluOp.SRL || rounding
+  val dstSew = flags.dstSew
+  val laneSew = flags.laneSew
+  val index = flags.index
+  val subtract = flags.subtract
+  val average = flags.average
+  val rounding = flags.rounding
+  val shift = flags.shift
   val running = RegInit(False)
   val busy = RegInit(False)
   val saturated = RegInit(False)
@@ -150,9 +190,29 @@ class VectorArithmetic(val p: VectorRegFileParam, val xlen: Int, val elen: Int =
   def boundary(j: Int): Bool = if (elen == 64) {
     if (j == 0) True else if (j == 4) laneSew =/= 3 else if (j % 2 == 0) laneSew <= 1 else laneSew === 0
   } else if (j % 4 == 0) True else if (j % 2 == 0) laneSew =/= 2 else laneSew === 0
+  // a + b per lane on one carry chain, with a guard bit below each byte: (1, 0) passes the carry of the byte
+  // below, (c, c) starts a lane with carry-in c. Returns the sum and the carry out of each byte.
+  def laneAdd(a: Bits, b: Bits, carryIn: Bits): (Bits, Bits) = {
+    def spread(bytes: Bits, guards: Bits): UInt = Cat((0 until 8).map(j => bytes(j * 8, 8 bits) ## guards(j))).asUInt
+    val guardA, guardB = Bits(8 bits)
+    for (j <- 0 until 8) {
+      guardA(j) := !boundary(j) || carryIn(j)
+      guardB(j) := boundary(j) && carryIn(j)
+    }
+    val total = spread(a, guardA).resize(73) + spread(b, guardB).resize(73)
+    val sumOut = Bits(64 bits)
+    val carryOut = Bits(8 bits)
+    for (j <- 0 until 8) {
+      sumOut(j * 8, 8 bits) := total(j * 9 + 1, 8 bits).asBits
+      // A passing guard sums to the inverted carry, a starting one to the carry itself
+      carryOut(j) := (if (j == 7) total(72) else boundary(j + 1) === total((j + 1) * 9))
+    }
+    (sumOut, carryOut)
+  }
 
   when(io.cmd.valid) {
     command := io.cmd.payload
+    flags := VectorArithmeticFlags(io.cmd.payload, elen)
     running := True
     busy := True
     saturated := False
@@ -283,28 +343,26 @@ class VectorArithmetic(val p: VectorRegFileParam, val xlen: Int, val elen: Int =
     val a = reduce ? reduceA | (wideVv ? widen(io.reads(0).rsp) | io.reads(0).rsp)
     val narrowB = command.scalarOperand ? scalarBeat | io.reads(1).rsp
     val b = reduce ? reduceB | ((widening || narrow) ? widen(narrowB) | narrowB)
-    val left = (command.op === VectorAluOp.RSUB) ? b | a
-    val right = (command.op === VectorAluOp.RSUB) ? a | b
-    val sum = Bits(64 bits)
-    val carries = Vec(Bool(), 9)
+    val left = flags.rsub ? b | a
+    val right = flags.rsub ? a | b
+    val rhs = right ^ B(64 bits, default -> subtract)
+    // Carry-in, or borrow-in for subtraction, of each lane from v0 (norm:vadc_vsbc_op)
+    val carryIn = Bits(8 bits)
+    for (j <- 0 until 8) carryIn(j) := subtract ^ (command.maskData && selects(j))
+    val (sum, carries) = laneAdd(left, rhs, carryIn)
     // Per byte, meaningful at the most significant byte of each element: the result does not fit SEW bits
     val overflow = Bits(8 bits)
     // Unsigned or signed vs2 < vs1, meaningful at the most significant byte of each element
     val less = Bits(8 bits)
     // Bit SEW of the exact sum or difference, meaningful at the most significant byte of each element
     val upper = Bits(8 bits)
-    carries(0) := subtract
     for (j <- 0 until 8) {
-      // Carry-in, or borrow-in for subtraction, from v0 (norm:vadc_vsbc_op)
-      val carry = boundary(j) ? (subtract ^ (command.maskData && selects(j))) | carries(j)
-      val rhs = right(j * 8, 8 bits) ^ B(8 bits, default -> subtract)
-      val value = left(j * 8, 8 bits).asUInt.resize(9) + rhs.asUInt.resize(9) + carry.asUInt
-      sum(j * 8, 8 bits) := value(7 downto 0).asBits
-      carries(j + 1) := value.msb
       val leftSign = left(j * 8 + 7)
-      overflow(j) := command.signed ? (leftSign === rhs.msb && value(7) =/= leftSign) | (value.msb ^ subtract)
-      less(j) := command.signed ? (value(7) ^ overflow(j)) | overflow(j)
-      upper(j) := command.signed ? (leftSign ^ rhs.msb ^ value.msb) | (value.msb ^ subtract)
+      val rhsSign = rhs(j * 8 + 7)
+      val sign = sum(j * 8 + 7)
+      overflow(j) := command.signed ? (leftSign === rhsSign && sign =/= leftSign) | (carries(j) ^ subtract)
+      less(j) := command.signed ? (sign ^ overflow(j)) | overflow(j)
+      upper(j) := command.signed ? (leftSign ^ rhsSign ^ carries(j)) | (carries(j) ^ subtract)
     }
     // Averaging shifts every element right by one; a 64-bit lane reads the amount of its low word
     val one = command.sew.mux(U(0) -> B(BigInt("0101010101010101", 16), 64 bits),
@@ -312,8 +370,8 @@ class VectorArithmetic(val p: VectorRegFileParam, val xlen: Int, val elen: Int =
     val amounts = average ? one | b
     val selected = Bits(64 bits)
     for (j <- 0 until 8) {
-      val takeA = (command.op === VectorAluOp.MIN) === less(topOf(j))
-      val takeB = (command.op === VectorAluOp.MERGE) ? selects(j) | !takeA
+      val takeA = flags.min === less(topOf(j))
+      val takeB = flags.merge ? selects(j) | !takeA
       selected(j * 8, 8 bits) := takeB ? b(j * 8, 8 bits) | a(j * 8, 8 bits)
     }
 
@@ -436,7 +494,7 @@ class VectorArithmetic(val p: VectorRegFileParam, val xlen: Int, val elen: Int =
 
     // Segmented shifter, one stage per amount bit; only the low lg2 of the lane width count
     // (norm:vsll_vsrl_vsra_shamt, norm:vnsrl_vnsra_shamt, norm:vnclipu_vnclip_shamt)
-    val left = command.op === VectorAluOp.SLL
+    val left = flags.left
     def lane(i: Int, w: Int) = i - i % w
     // Averaging shifts in bit SEW of the exact result (norm:vaaddu_vaadd_vasubu_vasub_op)
     val fill = Bits(64 bits)
@@ -481,14 +539,7 @@ class VectorArithmetic(val p: VectorRegFileParam, val xlen: Int, val elen: Int =
     }
     val increment = rounding ? (if (elen == 64) laneSew.mux(U(0) -> increments(8), U(1) -> increments(16), U(2) -> increments(32),
       default -> increments(64)) else laneSew.mux(U(0) -> increments(8), U(1) -> increments(16), default -> increments(32))) | B(0, 8 bits)
-    val rounded = Bits(64 bits)
-    val roundCarries = Vec(Bool(), 9)
-    roundCarries(0) := False
-    for (j <- 0 until 8) {
-      val sum = stages.last(j * 8, 8 bits).asUInt.resize(9) + (boundary(j) ? increment(j) | roundCarries(j)).asUInt
-      rounded(j * 8, 8 bits) := sum(7 downto 0).asBits
-      roundCarries(j + 1) := sum.msb
-    }
+    val rounded = laneAdd(stages.last, B(0, 64 bits), increment)._1
     val base = shift ? rounded | data
 
     val clipped = Bits(8 bits)

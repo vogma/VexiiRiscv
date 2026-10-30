@@ -11,6 +11,7 @@ import vexiiriscv.decode.{Decode, DecoderService}
 import vexiiriscv.execute._
 import vexiiriscv.execute.lsu.LsuPlugin
 import vexiiriscv.misc.{InflightService, PrivilegedPlugin, TrapPlugin, TrapReason, TrapService}
+import vexiiriscv.regfile.RegfileService
 import vexiiriscv.riscv.Riscv._
 import vexiiriscv.riscv._
 import vexiiriscv.schedule.{DispatchPlugin, ReschedulePlugin}
@@ -105,10 +106,14 @@ class VectorPlugin(val layer : LaneLayer, val dlen : Int = 64, var withMemory : 
     val lsu = host[LsuPlugin]
     val ioRetainer = retains(elp.uopLock, ifp.elaborationLock, dp.elaborationLock, ds.elaborationLock, sp.elaborationLock, ts.trapLock)
     val lsuRetainer = withMemory generate retains(lsu.vectorLsuLock)
+    val irf = host.find[RegfileService](_.rfSpec == IntRegFile)
+    val rfRetainer = withMemory generate retains(irf.elaborationLock)
     val buildBefore = retains(elp.pipelineLock)
     awaitBuild()
     val lsuPort = withMemory generate lsu.newVectorLsuPort()
     if (withMemory) lsuRetainer.release()
+    val strideRead = withMemory generate irf.newRead(false)
+    if (withMemory) rfRetainer.release()
 
     val checks = List(VSET, VSET_IMM, VSET_REG, CHECK_VILL, CHECK_VSTART, MASK_NOT_V0, MEM,
       ARITH, SCALAR_OPERAND, IMMEDIATE, SIGNED, SATURATE, MASK_DATA, ELEMENT, SIGNED_VS1, NEGATE)
@@ -625,8 +630,6 @@ class VectorPlugin(val layer : LaneLayer, val dlen : Int = 64, var withMemory : 
       val triggerAddress = Reg(UInt(XLEN bits))
       val trimIndex = Reg(UInt(vcs.vstartWidth bits)) init(0)
       val inflight = host.list[InflightService].map(_.hasInflight(0)).orR
-      // Older instructions have left, so vl, vstart and v0 are final; the first micro-op uses that sample
-      walker.io.start := seq.valid && seq.first && !inflight && !seq.fire
       walker.io.advance := seq.fire
       val count = UInt(vlWidth bits)
       val nreg = seq.uop(31 downto 29).asUInt.resize(vlWidth) + 1
@@ -634,12 +637,27 @@ class VectorPlugin(val layer : LaneLayer, val dlen : Int = 64, var withMemory : 
       when(maskMemory(seq.uop)) { count := ((vcs.vl.resize(vlWidth + 1) + 7) >> 3).resized }
       when(whole(seq.uop)) { count := ((nreg << (log2Up(vlen) - 3)) >> sizeOf(seq.uop)).resized }
       when(trim) { count := 0 }
-      walker.io.evl := count
+      // Older instructions have left, so vl, vstart and v0 are final; the first micro-op uses that sample
+      // The walker takes evl and vm sampled a cycle earlier, so it starts only once both held for that cycle
+      val evl = RegNext(count)
+      val unmasked = RegNext(seq.uop(25))
+      walker.io.start := seq.valid && seq.first && !inflight && !seq.fire && evl === count && unmasked === seq.uop(25)
+      walker.io.evl := evl
       walker.io.vstart := vcs.vstart
-      walker.io.unmasked := seq.uop(25)
+      walker.io.unmasked := unmasked
       walker.io.v0 := vrf.io.v0
       walker.io.fields := fieldsOf(seq.uop)
       walker.io.startField := resumeField
+      // The stride is read from the register file while the walker starts, so the offset multiply does not wait on the
+      // lane bypass. No older instruction is in flight then, so every register write has landed.
+      for (wb <- host.list[WriteBackPlugin] if wb.rf == IntRegFile) wb.lane match {
+        case lane: ExecuteLanePlugin => assert(lane.executeAt + wb.writeAt <= lane.trapAt, "register writes must land while in flight")
+        case _ =>
+      }
+      val stride = Reg(Bits(XLEN bits))
+      strideRead.valid := True // read every cycle; only the read of the start cycle is kept
+      strideRead.address := seq.uop(Const.rs2Range).asUInt.resized
+      when(RegNext(walker.io.start) init(False)) { stride := strideRead.data }
       if (split) walker.io.wide := dataSize(seq.uop) === 3
       // A candidate leaves only by fire or cancel, so an uncancelled sample belongs to the current candidate
       val prepared = RegNext(walker.io.start && !seq.cancel) init(False)
@@ -663,7 +681,7 @@ class VectorPlugin(val layer : LaneLayer, val dlen : Int = 64, var withMemory : 
         val fieldTerm = (field.resize(XLEN) << size).resize(XLEN)
         val term = UInt(XLEN bits)
         term := ((index * (fieldsOf(Decode.UOP).resize(4) + 1) + field).resize(XLEN) << size).resized
-        when(strided(Decode.UOP)) { term := ((index * apply(elp(IntRegFile, RS2)).asUInt).resize(XLEN) + fieldTerm).resized }
+        when(strided(Decode.UOP)) { term := ((index * stride.asUInt).resize(XLEN) + fieldTerm).resized }
         when(indexed(Decode.UOP)) { term := fieldTerm }
         val OFFSET = insert(term)
         indexRead.valid := !elp.isFreezed() && isValid && MEM && indexed(Decode.UOP)
