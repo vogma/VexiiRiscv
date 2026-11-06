@@ -35,6 +35,7 @@ class VectorLsuHookDriver extends FiberPlugin {
       port.cmd.storeData := B(BigInt("89abcdef", 16), LSLEN bits)
       port.cmd.access := Decode.UOP(Const.rdRange).asUInt =/= 31
       port.cmd.last := Decode.UOP(Const.rdRange).asUInt =/= 30
+      if (port.cmd.beats != null) { port.cmd.beats.enable := False; port.cmd.beats.mask := 0 }
     }
     // The LSU builds the stage areas after the port has been registered.
     lsu.logic.get

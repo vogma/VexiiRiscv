@@ -6,7 +6,7 @@ import spinal.lib.misc.pipeline._
 import vexiiriscv.Global
 import vexiiriscv.decode.{Decode, DecoderService}
 import vexiiriscv.execute.vector.{VectorCsrService, VectorLsuElement}
-import vexiiriscv.misc.{LsuTriggerBus, PrivilegedPlugin, Trap}
+import vexiiriscv.misc.{AddressToMask, LsuTriggerBus, PrivilegedPlugin, Trap, TrapReason}
 import vexiiriscv.riscv.{Const, Riscv}
 import vexiiriscv.schedule.DispatchPlugin
 
@@ -19,7 +19,7 @@ class VectorLsuHooks(lsu: LsuPlugin, frontend: AguFrontend, ds: DecoderService) 
   require(addressAt == 0 && ctrlAt == wbAt, "vector elements require E0 address capture and control-stage writeback")
   lsu.vectorLsuLock.await()
   val port = lsu.vectorLsuPort
-  val ELEMENT = Payload(VectorLsuElement(lsu.vectorSplit))
+  val ELEMENT = Payload(VectorLsuElement(lsu.vectorSplit, lsu.vectorBeat))
   val DECODE_VECTOR = Payload(Bool())
   for (uop <- frontend.vectorOps) {
     layer(uop).mayFlushUpTo(ctrlAt).setCompletion(ctrlAt)
@@ -79,19 +79,39 @@ class VectorLsuHooks(lsu: LsuPlugin, frontend: AguFrontend, ds: DecoderService) 
     }.hits
   }
 
+  // A beat enables its elements' bytes; a store-buffer retry uses the mask its store was pushed with
+  def l1Mask(e: CtrlLaneApi, cmd: LsuL1Cmd, stored: Bits): Bits = {
+    val mask = CombInit(AddressToMask(cmd.address, cmd.size, LSLEN / 8))
+    when(cmd.op === LsuL1CmdOpcode.LSU && e(VECTOR) && e(ELEMENT).beats.enable) { mask := e(ELEMENT).beats.mask }
+    if (stored != null) when(cmd.op === LsuL1CmdOpcode.STORE_BUFFER) { mask := stored }
+    mask
+  }
+
   def storeData(e: CtrlLaneApi, data: Bits): Unit = {
     when(e(VECTOR)) { data := e(ELEMENT).storeData }
   }
 
-  def complete(e: CtrlLaneApi, trap: Bool, trapPort: Flow[Trap], data: Bits, storeBufferEmpty: Bool): Unit = {
+  // noBeat: outside a TLB refill or hazard, the word is not cacheable or one of the LSU's exception or trigger causes is set
+  def complete(e: CtrlLaneApi, trap: Bool, trapPort: Flow[Trap], data: Bits, storeBufferEmpty: Bool, raw: Bits, noBeat: Bool): Unit = {
     val element = e(ELEMENT)
     when(e.isValid && e(SEL) && e(VECTOR) && !element.last) { e.bypass(Global.COMMIT) := False }
     // Empty instructions finish without any cache, translation or IO access.
     when(e(VECTOR) && !element.access) { trap := False }
+    // A beat never traps: an exception, a trigger hit or a non-cacheable word retries the rest element-wise
+    val fallback = lsu.vectorBeat generate (e(VECTOR) && element.beats.enable && element.access && noBeat)
+    if (lsu.vectorBeat) when(fallback) {
+      trap := True
+      trapPort.exception := False
+      trapPort.code := TrapReason.REDO
+    }
     port.foreach { p =>
       p.storeBufferEmpty := storeBufferEmpty
       p.rsp.valid := e.down.isFiring && e(SEL) && e(VECTOR)
       p.rsp.data := data
+      if (lsu.vectorBeat) {
+        p.rsp.raw := raw
+        p.rsp.fallback := fallback
+      }
       p.rsp.load := e(LOAD)
       p.rsp.access := element.access
       p.rsp.last := element.last

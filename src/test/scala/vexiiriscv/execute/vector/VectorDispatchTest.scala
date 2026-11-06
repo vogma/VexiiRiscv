@@ -68,6 +68,7 @@ class VectorSequenceDriver extends FiberPlugin {
       port.cmd.storeData := (U(0x40, 8 bits) + d.index.resize(8)).asBits #* (LSLEN / 8)
       port.cmd.access := d.access
       port.cmd.last := d.last
+      if (port.cmd.beats != null) { port.cmd.beats.enable := False; port.cmd.beats.mask := 0 }
       ADDRESS := port.cmd.address
     }
 

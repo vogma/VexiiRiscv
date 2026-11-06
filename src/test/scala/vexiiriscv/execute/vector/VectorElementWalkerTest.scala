@@ -85,7 +85,80 @@ class VectorElementWalkerTest extends AnyFunSuite {
     }
   }
 
+  // Chunks: the expected (first element, active positions) list comes from a direct model of the chunk rule, a chunk
+  // being the active elements of [i, b) with b the next VRF-word (8 bytes) or LSU-word (lsuBytes) boundary after i.
+  def runChunks(vlen: Int, lsuBytes: Int): Unit = {
+    SimConfig.compile(new VectorElementWalker(vlen, chunks = true)).doSim { dut =>
+      val random = new Random(91 + vlen + lsuBytes)
+      dut.clockDomain.forkStimulus(10)
+      dut.io.start #= false
+      dut.io.advance #= false
+      dut.io.chunk #= false
+      dut.io.fields #= 0
+      dut.io.startField #= 0
+      dut.clockDomain.waitSampling()
+      var cases, uops = 0
+      for (iteration <- 0 until 3000) {
+        val w = random.nextInt(log2Up(lsuBytes))
+        val epw = 8 >> w
+        val o = random.nextInt(lsuBytes >> w) << w
+        val vl = if (iteration % 4 == 0) Seq(0, 1, vlen - 1, vlen)(random.nextInt(4)) else random.nextInt(vlen + 1)
+        val vstart = if (iteration % 3 == 0) 0 else random.nextInt(vlen)
+        val unmasked = random.nextBoolean()
+        val v0 = random.nextInt(3) match {
+          case 0 => (BigInt(1) << vlen) - 1
+          case 1 => BigInt(vlen, random)
+          case _ => BigInt(vlen, random) & BigInt(vlen, random) & BigInt(vlen, random)
+        }
+        def boundary(j: Int) = j % epw == 0 || (o + (j << w)) % lsuBytes == 0
+        val active = (0 until vlen).filter(j => j >= vstart && j < vl && (unmasked || v0.testBit(j)))
+        val expected = ArrayBuffer[(Int, Int)]()
+        var rest = active
+        while (rest.nonEmpty) {
+          val i = rest.head
+          val b = (i + 1 to vlen).find(boundary).get
+          val chunk = rest.takeWhile(_ < b)
+          expected += ((i, chunk.map(j => 1 << (j % epw)).sum))
+          rest = rest.drop(chunk.size)
+        }
+        for (pos <- 0 until 8) dut.io.table(pos) #= (1 to (pos % epw)).count(m => (o + (m << w)) % lsuBytes == 0)
+        dut.io.wordMask #= epw - 1
+        dut.io.evl #= vl
+        dut.io.vstart #= vstart
+        dut.io.unmasked #= unmasked
+        dut.io.v0 #= v0
+        dut.io.start #= true
+        dut.clockDomain.waitSampling()
+        dut.io.start #= false
+        dut.io.chunk #= true
+        while (random.nextInt(3) == 0) dut.clockDomain.waitSampling()
+        val seen = ArrayBuffer[(Int, Int)]()
+        var done = false
+        while (!done) {
+          sleep(1)
+          val any = dut.io.any.toBoolean
+          assert(any == expected.nonEmpty, s"any: vl=$vl vstart=$vstart")
+          if (any) seen += ((dut.io.index.toInt, dut.io.chunkActive.toInt))
+          done = dut.io.last.toBoolean
+          assert(seen.size <= expected.size.max(1), s"too many chunks: vl=$vl vstart=$vstart w=$w o=$o: $seen vs $expected")
+          dut.io.advance #= true
+          dut.clockDomain.waitSampling()
+          dut.io.advance #= false
+        }
+        dut.io.chunk #= false
+        assert(seen == expected, s"vl=$vl vstart=$vstart w=$w o=$o unmasked=$unmasked: got $seen, expected $expected")
+        cases += 1
+        uops += expected.size
+      }
+      println(s"VLEN=$vlen LSU bytes=$lsuBytes chunk cases=$cases micro-ops=$uops")
+    }
+  }
+
   test("element walker VLEN 128") { run(128) }
+  test("chunk walker VLEN 128, 8-byte LSU") { runChunks(128, 8) }
+  test("chunk walker VLEN 128, 4-byte LSU") { runChunks(128, 4) }
+  test("chunk walker VLEN 256, 8-byte LSU") { runChunks(256, 8) }
+  test("chunk walker VLEN 256, 4-byte LSU") { runChunks(256, 4) }
   test("element walker VLEN 256") { run(256) }
   test("element walker with split wide elements VLEN 128") { run(128, split = true) }
   test("element walker with split wide elements VLEN 256") { run(256, split = true) }

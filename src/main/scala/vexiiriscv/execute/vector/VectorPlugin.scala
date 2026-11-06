@@ -50,11 +50,16 @@ object VectorRange {
   def width = 3
 }
 
-case class VectorMemoryDescriptor(indexWidth : Int, split : Boolean = false) extends Bundle {
+case class VectorMemoryDescriptor(indexWidth : Int, split : Boolean = false, beat : Boolean = false) extends Bundle {
   val index = UInt(indexWidth bits)
   val field = UInt(3 bits)
   val last, access = Bool()
   val half = split generate Bool() // upper word of an 8-byte element
+  val beats = beat generate new Bundle {
+    val enable = Bool() // a chunk of whole elements in one VRF word and one aligned LSU word
+    val mask = Bits(8 bits) // the chunk's active bytes in the VRF word
+    val rotate = UInt(3 bits) // VRF byte (q + rotate) mod 8 goes to memory lane q
+  }
 }
 
 /**
@@ -391,7 +396,12 @@ class VectorPlugin(val layer : LaneLayer, val dlen : Int = 64, var withMemory : 
     def wordOf(vreg : UInt, offset : UInt) : UInt =
       ((vreg.resize(vrf.p.addressWidth) << vrf.p.beatWidth) + (offset >> log2Up(vrf.p.beatBytes)).resized).resize(vrf.p.addressWidth)
     val split = withMemory && lsu.vectorSplit
-    val DESCRIPTOR = Payload(VectorMemoryDescriptor(vcs.vstartWidth, split))
+    val beats = withMemory && lsu.vectorBeat
+    val DESCRIPTOR = Payload(VectorMemoryDescriptor(vcs.vstartWidth, split, beats))
+    val lsuBytes = LSLEN.get / 8
+    // Unit-stride forms without segments; whole-register and mask transfers count their nf as registers
+    def unitStride(uop : Bits) : Bool = uop(27 downto 26) === 0 && (whole(uop) || maskMemory(uop) ||
+      (uop(Const.rs2Range) === 0 || faultOnlyFirst(uop)) && uop(31 downto 29) === 0)
 
     // log2 EMUL of an operand class; classes without a group check as one register
     def emulOf(cls : UInt, lmul : SInt, nreg : SInt) : SInt = cls.mux(Seq[(Any, SInt)](
@@ -620,7 +630,7 @@ class VectorPlugin(val layer : LaneLayer, val dlen : Int = 64, var withMemory : 
     val memory = withMemory generate new Area {
       val port = lsuPort
       val seq = dp.logic.sequencer.port
-      val walker = new VectorElementWalker(vlen, split)
+      val walker = new VectorElementWalker(vlen, split, beats)
       val resume = RegInit(False) // an element retries after REDO or a TLB refill
       val resumeField = Reg(UInt(3 bits)) init(0) // the field it retries from
       // Fault-only-first: the trap controller may turn the exception of an element past 0 into a trim,
@@ -657,19 +667,71 @@ class VectorPlugin(val layer : LaneLayer, val dlen : Int = 64, var withMemory : 
       val stride = Reg(Bits(XLEN bits))
       strideRead.valid := True // read every cycle; only the read of the start cycle is kept
       strideRead.address := seq.uop(Const.rs2Range).asUInt.resized
-      when(RegNext(walker.io.start) init(False)) { stride := strideRead.data }
+      val sampled = RegNext(walker.io.start) init(False)
+      when(sampled) { stride := strideRead.data }
       if (split) walker.io.wide := dataSize(seq.uop) === 3
       // A candidate leaves only by fire or cancel, so an uncancelled sample belongs to the current candidate
       val prepared = RegNext(walker.io.start && !seq.cancel) init(False)
       seq.ready := !seq.first || prepared && port.storeBufferEmpty
       seq.last := walker.io.last
 
-      val descriptor = VectorMemoryDescriptor(vcs.vstartWidth, split)
+      // Beats: unit-stride forms with EEW below the LSU width read the base (rs1) on the stride port. Its low bits,
+      // one cycle after the sample, set the chunk boundaries, so the first micro-op waits one more cycle.
+      val beat = beats generate new Area {
+        val elementwise = RegInit(False) // a beat failed: the rest of the instruction goes element-wise
+        val refill = RegInit(False) // a beat waits for the page walker; a walk fault also sends it element-wise
+        val armed = {
+          val pp = host[PrivilegedPlugin]
+          if (pp.p.debugTriggersLsu && pp.p.debugTriggers > 0) pp.logic.harts(0).trigger.slots.map(s =>
+            (s.tdata1.m || s.tdata1.s || s.tdata1.u) && (s.tdata1.load || s.tdata1.store)).orR else False
+        }
+        val size = sizeOf(seq.uop)
+        val eligible = unitStride(seq.uop) && size < log2Up(lsuBytes) && !elementwise && !armed
+        when(unitStride(seq.uop)) { strideRead.address := seq.uop(Const.rs1Range).asUInt.resized }
+        val candidate = RegNextWhen(eligible, walker.io.start) init(False)
+        val ready = RegNext(prepared && walker.io.start && !seq.cancel) init(False)
+        when(candidate && !ready) { seq.ready := !seq.first }
+
+        val chunk = RegInit(False)
+        val wordMask = Reg(UInt(3 bits)) init(0)
+        val table = Reg(Vec.fill(8)(UInt(2 bits)))
+        val offset = strideRead.data(log2Up(lsuBytes) - 1 downto 0).asUInt
+        val aligned = (offset & ((U(1, 3 bits) << size) - 1).resized) === 0
+        when(walker.io.start) { chunk := False }
+        when(sampled) {
+          chunk := candidate && aligned
+          wordMask := U(7, 3 bits) >> size
+          // Chunk number of each element position: the LSU-word boundaries after the word's first element
+          for (pos <- 0 until 8) {
+            val k = U(pos, 3 bits) & (U(7, 3 bits) >> size)
+            val ends = (1 until 8).map(m => U(m, 3 bits) <= k && (offset + (U(m, 5 bits) << size)).resize(log2Up(lsuBytes)) === 0)
+            table(pos) := CountOne(ends).resize(2)
+          }
+        }
+        walker.io.chunk := chunk
+        walker.io.wordMask := wordMask
+        walker.io.table := table
+      }
+
+      val descriptor = VectorMemoryDescriptor(vcs.vstartWidth, split, beats)
       if (split) descriptor.half := walker.io.half
       descriptor.index := walker.io.index
       descriptor.field := walker.io.field
       descriptor.last := walker.io.last
       descriptor.access := walker.io.any // otherwise a single finish micro-op
+      if (beats) {
+        // Bytes of the chunk's elements, and the rotation from VRF byte p(i) to memory lane q(i) of its first element
+        val size = sizeOf(seq.uop)
+        val active = walker.io.chunkActive
+        descriptor.beats.enable := beat.chunk
+        descriptor.beats.mask := size.mux(
+          0 -> active,
+          1 -> Cat((0 until 8).map(p => active(p >> 1))),
+          default -> Cat((0 until 8).map(p => active(p >> 2))))
+        val p0 = (walker.io.index << size).resize(3)
+        val q0 = (stride(log2Up(lsuBytes) - 1 downto 0).asUInt + p0).resize(log2Up(lsuBytes))
+        descriptor.beats.rotate := p0 - q0.resize(3)
+      }
       elp.ctrl(0).up(DESCRIPTOR) := descriptor
 
       // Store data: read the element's word one stage before the LSU captures it; the response holds over freezes
@@ -720,6 +782,15 @@ class VectorPlugin(val layer : LaneLayer, val dlen : Int = 64, var withMemory : 
           port.cmd.size := size.resized
           port.cmd.storeData := (word >> (offset.resize(log2Up(vrf.p.beatBytes)) << 3)).resize(LSLEN)
         }
+        if (beats) {
+          port.cmd.beats.enable := d.beats.enable
+          port.cmd.beats.mask := d.beats.mask.rotateRight(d.beats.rotate << 0).resize(lsuBytes)
+          when(d.beats.enable) {
+            port.cmd.address := ((up(elp(IntRegFile, RS1)).asUInt + apply(read.OFFSET)) & ~U(lsuBytes - 1, XLEN bits)).resized
+            port.cmd.size := U(log2Up(lsuBytes), widthOf(port.cmd.size) bits)
+            port.cmd.storeData := word.rotateRight(d.beats.rotate << 3).resize(LSLEN)
+          }
+        }
         port.cmd.access := d.access && !illegal // an illegal micro-op only carries its trap
         port.cmd.last := d.last || illegal
         val ILLEGAL = insert(illegal)
@@ -754,10 +825,19 @@ class VectorPlugin(val layer : LaneLayer, val dlen : Int = 64, var withMemory : 
           }
         }
 
+        // A beat writes the chunk's bytes, rotated from the aligned memory word (doubled when narrower than a VRF word)
+        if (beats) when(d.beats.enable) {
+          val doubled = if (lsuBytes == 8) rsp.raw else rsp.raw ## rsp.raw
+          write.data := doubled.rotateLeft(d.beats.rotate << 3)
+          write.mask := d.beats.mask
+        }
+
         // Any element trap restarts at that element (norm:vector_ls_vstart); the last one completes the instruction
         when(rsp.valid && legal) {
           val refill = !rsp.trap.exception && rsp.trap.code === TrapReason.MMU_REFILL
-          val arm = rsp.trap.valid && faultOnlyFirst(Decode.UOP) && d.index =/= 0 && (rsp.trap.exception || refill)
+          val arm = rsp.trap.valid && faultOnlyFirst(Decode.UOP) && d.index =/= 0 && (rsp.trap.exception || refill) &&
+            (if (beats) !d.beats.enable else True)
+          if (beats) beat.refill := rsp.trap.valid && refill && d.beats.enable
           armed := arm
           when(rsp.trap.valid && !rsp.trap.exception && rsp.trap.code === TrapReason.DEBUG_TRIGGER) {
             triggerPending := True
@@ -769,6 +849,7 @@ class VectorPlugin(val layer : LaneLayer, val dlen : Int = 64, var withMemory : 
             trimIndex := d.index
             val retry = !rsp.trap.exception && (rsp.trap.code === TrapReason.REDO || refill)
             resume := retry || arm
+            if (beats) when(rsp.fallback) { beat.elementwise := True }
             // A retry continues at the faulting field; an architectural trap restarts the element from its first field
             resumeField := retry ? d.field | U(0, 3 bits)
           } elsewhen(rsp.last) {
@@ -776,6 +857,7 @@ class VectorPlugin(val layer : LaneLayer, val dlen : Int = 64, var withMemory : 
             vcs.vstartWrite.payload := 0
             resume := False
             resumeField := 0
+            if (beats) beat.elementwise := False
             // norm:vector_ff_op: vl := index of the faulting element, vtype unchanged
             when(trim) {
               vcs.configWrite.valid := True
@@ -803,6 +885,10 @@ class VectorPlugin(val layer : LaneLayer, val dlen : Int = 64, var withMemory : 
         memory.armed := False
         memory.trim := False
         memory.triggerPending := False
+        if (beats) {
+          memory.beat.elementwise := False
+          memory.beat.refill := False
+        }
       }
       when(tp.api.harts(0).rvTrap) { clear() }
       if (pp.p.withDebug) {
@@ -841,6 +927,15 @@ class VectorPlugin(val layer : LaneLayer, val dlen : Int = 64, var withMemory : 
         when(memory.armed && rsp.valid && (rsp.pageFault || rsp.accessFault)) {
           rsp.ready := True
           convert()
+        }
+        // The walk of a beat failed: refetch, and the element-wise retry raises the fault or trim of its element
+        if (beats) when(memory.beat.refill && rsp.valid && (rsp.pageFault || rsp.accessFault)) {
+          rsp.ready := True
+          trap.pending.state.exception := False
+          host[TrapPlugin].api.harts(0).redo := True
+          memory.beat.elementwise := True
+          memory.beat.refill := False
+          fsm.goto(fsm.JUMP)
         }
       }
     }

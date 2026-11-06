@@ -207,8 +207,8 @@ class WhiteboxerPlugin(withOutputs : Boolean) extends FiberPlugin{
       val size = UInt(Riscv.LSU_SIZE_WIDTH bits)
       val address = Global.PHYSICAL_ADDRESS()
       val data = Bits(Riscv.LSLEN bits)
-      val amo = Bool()
-      SimPublic(fire, hartId, uopId, storeId, size, address, data, amo)
+      val amo = Bool(); val mask = host.get[LsuPlugin].exists(_.vectorBeat) generate Bits(Riscv.LSLEN / 8 bits) // enabled bytes
+      SimPublic(fire, hartId, uopId, storeId, size, address, data, amo); if (mask != null) SimPublic(mask)
 
       val lcp = host.get[LsuCachelessPlugin] map (p => new Area {
         val c = p.logic.forkCtrl
@@ -232,7 +232,7 @@ class WhiteboxerPlugin(withOutputs : Boolean) extends FiberPlugin{
         address := c(LsuL1.PHYSICAL_ADDRESS)
         data := c(LsuL1.WRITE_DATA)
         storeId := c(Decode.STORE_ID)
-        amo := False
+        amo := False; if (mask != null) mask := c(LsuL1.MASK)
         if(p.withVector) when(c(AguPlugin.VECTOR)) {
           fire := c.storeFire && c(p.logic.vector.ELEMENT).access && !c(TRAP)
         }
@@ -470,7 +470,7 @@ class WhiteboxerPlugin(withOutputs : Boolean) extends FiberPlugin{
       val size = storeCommit.size.simProxy()
       val address = storeCommit.address.simProxy()
       val data = storeCommit.data.simProxy()
-      val amo = storeCommit.amo.simProxy()
+      val amo = storeCommit.amo.simProxy(); val mask = if (storeCommit.mask != null) storeCommit.mask.simProxy() else null
     }
 
     class StoreConditionalProxy {

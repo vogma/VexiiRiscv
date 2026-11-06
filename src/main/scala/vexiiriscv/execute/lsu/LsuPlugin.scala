@@ -39,11 +39,11 @@ case class LsuL1Cmd() extends Bundle {
   val storeId = Decode.STORE_ID()
 }
 
-case class StoreBufferOp() extends Bundle {
+case class StoreBufferOp(withMask : Boolean = false) extends Bundle {
   val address = Global.PHYSICAL_ADDRESS()
   val data = LsuL1.WRITE_DATA()
   val size = LsuL1.SIZE()
-  val storeId = Decode.STORE_ID()
+  val storeId = Decode.STORE_ID(); val mask = withMask generate LsuL1.MASK() // byte mask of vector builds with beats
 }
 
 case class LsuTimingParameter(var addressAt : Int = 0,
@@ -80,7 +80,7 @@ class LsuPlugin(var layer : LaneLayer,
                 var withLlcFlush : Boolean = false,
                 var storeRs2At : Int = 0, //Note that currently, it only apply for integer store (not float store)
                 var storeBufferSlots : Int = 0,
-                var storeBufferOps : Int = 0, val withVector : Boolean = false, val vectorElen : Int = 32) extends FiberPlugin with DBusAccessService with LsuCachelessBusProvider with LsuService with CmoService with VectorLsuService{
+                var storeBufferOps : Int = 0, val withVector : Boolean = false, val vectorElen : Int = 32, val vectorBeat : Boolean = false) extends FiberPlugin with DBusAccessService with LsuCachelessBusProvider with LsuService with CmoService with VectorLsuService{
   import timingParameter._
 
   if(withLlcFlush) assert(withCbm)
@@ -111,11 +111,11 @@ class LsuPlugin(var layer : LaneLayer,
   case class StoreBufferPush() extends Bundle {
     val slotOh = Bits(storeBufferSlots bits) // Specifies which address slots if being concerned
     val tag = Bits(tagWidth bits)
-    val op = StoreBufferOp()
+    val op = StoreBufferOp(vectorBeat)
   }
   case class StoreBufferPop() extends Bundle {
     val ptr = SB_PTR()
-    val op = StoreBufferOp()
+    val op = StoreBufferOp(vectorBeat)
   }
 
   val logic = during setup new Area{
@@ -325,7 +325,7 @@ class LsuPlugin(var layer : LaneLayer,
       val pop = Stream(StoreBufferPop()) // To retry a failed store
 
       val ops = new Area {
-        val mem = Mem.fill(storeBufferOps)(StoreBufferOp())
+        val mem = Mem.fill(storeBufferOps)(StoreBufferOp(vectorBeat))
         val pushPtr, popPtr, freePtr = Reg(SB_PTR) init (0)
         val full = (pushPtr ^ freePtr ^ storeBufferOps) === 0 // Assumes storeBufferOps is a power of 2
         val occupancy = pushPtr - freePtr
@@ -577,7 +577,7 @@ class LsuPlugin(var layer : LaneLayer,
       l1.SEL := arbiter.io.output.valid
       if(withLlcFlush) l1.SEL clearWhen(arbiter.io.output.clean || arbiter.io.output.invalidate) //Avoid enabling the L1 cache on flush
       l1.MIXED_ADDRESS := arbiter.io.output.address
-      l1.MASK := AddressToMask(arbiter.io.output.address, arbiter.io.output.size, Riscv.LSLEN / 8)
+      l1.MASK := (if (vectorBeat) vector.l1Mask(this, arbiter.io.output, if (withStoreBuffer) storeBuffer.pop.op.mask else null) else AddressToMask(arbiter.io.output.address, arbiter.io.output.size, Riscv.LSLEN / 8))
       l1.SIZE := arbiter.io.output.size
       l1.LOAD := arbiter.io.output.load
       l1.EXECUTE := arbiter.io.output.execute
@@ -973,7 +973,7 @@ class LsuPlugin(var layer : LaneLayer,
         storeBuffer.push.op.address := l1.PHYSICAL_ADDRESS
         storeBuffer.push.op.data := LsuL1.WRITE_DATA
         storeBuffer.push.op.size := LsuL1.SIZE
-        storeBuffer.push.op.storeId := Decode.STORE_ID
+        storeBuffer.push.op.storeId := Decode.STORE_ID; if (vectorBeat) storeBuffer.push.op.mask := l1.MASK
       }
 
       when(FENCE || FROM_PREFETCH){
@@ -1036,7 +1036,7 @@ class LsuPlugin(var layer : LaneLayer,
           fenceTrap.doIt := True
         }
       }
-      if (withVector) vector.complete(this, lsuTrap, trapPort, loadData.RESULT, if (withStoreBuffer) storeBuffer.empty else True)
+      if (withVector) vector.complete(this, lsuTrap, trapPort, loadData.RESULT, if (withStoreBuffer) storeBuffer.empty else True, l1.READ_DATA, !tpk.REFILL && !tpk.HAZARD && (onPma.CACHED_RSP.fault || l1.FAULT || pmpPort.ACCESS_FAULT || MMU_PAGE_FAULT || tpk.ACCESS_FAULT || onPma.FROM_LSU_MSB_FAILED || preCtrl.MISS_ALIGNED || onTrigger.HIT))
       when(isValid && SEL) {
         val t = when(lsuTrap) {
           trapPort.valid := True

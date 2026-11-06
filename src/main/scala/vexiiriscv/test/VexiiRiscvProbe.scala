@@ -340,10 +340,11 @@ class VexiiRiscvProbe(cpu : VexiiRiscv, kb : Option[konata.Backend], var withRvl
   }
 
 
-  class VectorAccess(val id: Int, val address: Long, val data: Array[Byte]) {
+  // enabled: byte enables of the access, all bytes by default
+  class VectorAccess(val id: Int, val address: Long, val data: Array[Byte], enabled: Long = -1) {
     val length = data.length
     val mask = Array.fill((length + 7) / 8)(0.toByte)
-    for(i <- 0 until length) mask(i / 8) = (mask(i / 8) | (1 << (i % 8))).toByte
+    for(i <- 0 until length if (enabled >> i & 1) != 0) mask(i / 8) = (mask(i / 8) | (1 << (i % 8))).toByte
     var broadcast, checked = false
   }
 
@@ -600,7 +601,9 @@ class VexiiRiscvProbe(cpu : VexiiRiscv, kb : Option[konata.Backend], var withRvl
         val record = hart.openVector(uop)
         require(!hart.vectorStores.contains(uop.storeSqId), "vector store ID reused before broadcast")
         val id = (scalarStoreIds until vectorStoreIdEnd).find(!hart.liveVectorStoreIds.contains(_)).get
-        val access = new VectorAccess(id, address, uop.storeData.clone())
+        // A full-width store may be a beat whose byte mask enables only its elements
+        val enabled = if (storeCommit.mask != null && bytes == get(Riscv.LSLEN) / 8) storeCommit.mask.toLong else -1l
+        val access = new VectorAccess(id, address, uop.storeData.clone(), enabled)
         record.stores += access
         hart.vectorStores(uop.storeSqId) = access
         hart.liveVectorStoreIds += id

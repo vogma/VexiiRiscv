@@ -156,6 +156,17 @@ object TestBench extends App {
         override def isExecutable: Boolean = true
       }
     )
+    // A non-cacheable window of the RAM-backed IO device that takes only 1- to 4-byte accesses
+    if (param.narrowIoWindow) {
+      def ioRegion(base: Long, size: Long, maxBytes: Int) = new PmaRegion {
+        override def mapping: AddressMapping = SizeMapping(base, size)
+        override def transfers: MemoryTransfers = M2sTransfers(get = SizeRange(1, maxBytes), putFull = SizeRange(1, maxBytes))
+        override def isMain: Boolean = false
+        override def isExecutable: Boolean = false
+      }
+      regions(1) = ioRegion(0x10000000L, 0x21000L, 64)
+      regions.insert(2, ioRegion(0x10021000L, 0x1000L, 4), ioRegion(0x10022000L, 0x10000000L - 0x22000L, 64))
+    }
     def imsicRegion(addressMapping: SizeMapping) = new PmaRegion {
       override def mapping: AddressMapping = addressMapping
       override def transfers: MemoryTransfers = M2sTransfers(

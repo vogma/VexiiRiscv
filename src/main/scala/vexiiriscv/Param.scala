@@ -188,6 +188,8 @@ class ParamSimple() {
   var withImplicitPtwTlb = false
   var vlen = 128
   var vectorDlen = 64
+  var vectorBeatMemory = true
+  var narrowIoWindow = false
   val prefetcherRptParam = new PrefetcherRptParam()
 
   var fetchTsp = MmuStorageParameter(
@@ -910,6 +912,12 @@ class ParamSimple() {
       .text("Set the vector register length VLEN in bits (with zve32x in --with-isa); default: 128.")
     opt[Int]("vector-dlen").action { (v, c) => vectorDlen = v }
       .text("Set the vector datapath width DLEN in bits; default: 64.")
+    opt[Unit]("vector-beat-memory").action { (v, c) => vectorBeatMemory = true }
+      .text("Move unit-stride vector memory data in LSU-wide words (with a vector subset); the default.")
+    opt[Unit]("no-vector-beat-memory").action { (v, c) => vectorBeatMemory = false }
+      .text("Move vector memory data one element per LSU access.")
+    opt[Unit]("narrow-io-window").action { (v, c) => narrowIoWindow = true }
+      .text("TestBench only: the IO window 0x10021000-0x10021FFF takes accesses of at most 4 bytes.")
     opt[Unit]("dual-issue").action { (v, c) =>
       decoders = 2
       lanes = 2
@@ -1216,7 +1224,7 @@ class ParamSimple() {
     if(lsuL1Enable){
       val needLlc = extension.withZicbom && (withRvcbmLlc || lsuL1Coherency)
       plugins += new LsuPlugin(
-        withVector = extension.withZve32x, vectorElen = if (extension.withZve64x) 64 else 32,
+        withVector = extension.withZve32x, vectorElen = if (extension.withZve64x) 64 else 32, vectorBeat = extension.withZve32x && vectorBeatMemory,
         timingParameter = extension.withRvh match {
           case true => lsuHypervisorTiming
           case false => lsuTiming
