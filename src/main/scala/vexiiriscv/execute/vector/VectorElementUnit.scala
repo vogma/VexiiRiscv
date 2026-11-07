@@ -45,6 +45,7 @@ case class VectorElementCmd(p: VectorRegFileParam, xlen: Int) extends Bundle {
 // finish in t+4 and write in t+5. Division serializes active elements; inactive elements take a cycle and no reads.
 // With ELEN 64 an active SEW-64 multiply takes three passes of the 33 x 33 multiplier, reading its element in each,
 // and the divider, iota counts, gather indices and permuted data are 64 bits wide.
+// vcpop and vfirst take one 64-bit mask word per cycle: read in t, mask in t+1, count and find in t+2.
 class VectorElementUnit(val p: VectorRegFileParam, val xlen: Int, val elen: Int = 32) extends Component {
   require(p.dlen == 64 && p.readPorts >= 3)
   require(xlen == 32 || xlen == 64)
@@ -63,7 +64,8 @@ class VectorElementUnit(val p: VectorRegFileParam, val xlen: Int, val elen: Int 
   def is(op: Int): Bool = command.op === op
   val widen = is(VectorElementOp.WMUL) || is(VectorElementOp.WMACC)
   val divide = is(VectorElementOp.DIV) || is(VectorElementOp.REM)
-  val scan = is(VectorElementOp.CPOP) || is(VectorElementOp.FIRST) || is(VectorElementOp.IOTA)
+  val wordScan = is(VectorElementOp.CPOP) || is(VectorElementOp.FIRST)
+  val scan = wordScan || is(VectorElementOp.IOTA)
   val permute = command.op >= VectorElementOp.SLIDEUP
   val count = Reg(UInt(log2Up(p.vlen) + 1 bits)) init(0)
   val result = Reg(Bits(xlen bits))
@@ -100,10 +102,11 @@ class VectorElementUnit(val p: VectorRegFileParam, val xlen: Int, val elen: Int 
 
   val issue = new Area {
     val advance = running && !divPending && !permute
-    val active = advance && command.vl =/= 0 && (command.unmasked || io.v0(index))
+    val active = advance && command.vl =/= 0 && (wordScan || command.unmasked || io.v0(index))
     // An element moves on after its third pass, or at once if inactive
     val step = if (elen == 64) advance && (!split || !active || pass === 2) else advance
-    val last = step && (command.vl === 0 || index.resize(offsetWidth) + 1 >= command.vl)
+    val stride = wordScan ? U(p.dlen, offsetWidth bits) | U(1, offsetWidth bits)
+    val last = step && (command.vl === 0 || index.resize(offsetWidth) + stride >= command.vl)
     val offset = (index.resize(offsetWidth) << command.sew).resize(offsetWidth)
     val vdOffset = widen ? (offset << 1).resize(offsetWidth) | offset
 
@@ -117,7 +120,7 @@ class VectorElementUnit(val p: VectorRegFileParam, val xlen: Int, val elen: Int 
     when(active && divide) { divPending := True }
     if (elen == 64) when(advance) { pass := step ? U(0, 2 bits) | pass + 1 }
     when(step) {
-      index := index + 1
+      index := (index.resize(offsetWidth) + stride).resized
       when(last) { running := False }
     }
   }
@@ -158,12 +161,28 @@ class VectorElementUnit(val p: VectorRegFileParam, val xlen: Int, val elen: Int 
     val mulX = if (elen == 64) split ? ((pass === 2) ? hi(x) | lo(x)) | x(32 downto 0) else x
     val mulY = if (elen == 64) split ? ((pass === 1) ? hi(y) | lo(y)) | y(32 downto 0) else y
     val hit = io.reads(0).rsp(maskBit)
-    when(valid && scan) {
-      count := count + hit.asUInt
-      when(is(VectorElementOp.CPOP)) { result := (count + hit.asUInt).resize(xlen).asBits }
-      when(is(VectorElementOp.FIRST) && hit && result.msb) { result := elementIndex.resize(xlen).asBits }
-    }
+    when(valid && is(VectorElementOp.IOTA)) { count := count + hit.asUInt }
+    // Mask word from element elementIndex: body bits below vl, active under v0
+    val remaining = command.vl - elementIndex.resize(offsetWidth)
+    val ones = B(p.dlen bits, default -> True)
+    val body = (remaining >= p.dlen) ? ones | ~(ones |<< remaining(log2Up(p.dlen) - 1 downto 0))
+    val enabled = command.unmasked ? ones | io.v0.subdivideIn(p.dlen bits)((elementIndex >> log2Up(p.dlen)).resized)
+    val maskWord = io.reads(0).rsp & body & enabled
     val overflow = x === intMin && y === intMin // the only vsmul product that does not fit (norm:vsmul_op)
+  }
+
+  val wordCount = new Area {
+    val valid = RegNext(x1.valid && wordScan) init(False)
+    val bits = RegNext(x1.maskWord)
+    val base = RegNext(x1.elementIndex)
+    val total = count + CountOne(bits).resize(count.getWidth)
+    when(valid) {
+      count := total
+      when(is(VectorElementOp.CPOP)) { result := total.resize(xlen).asBits }
+      when(is(VectorElementOp.FIRST) && bits.orR && result.msb) {
+        result := (base + OHToUInt(OHMasking.first(bits)).resize(base.getWidth)).resize(xlen).asBits
+      }
+    }
   }
 
   // Unsigned division of magnitudes, then restore the quotient or remainder sign

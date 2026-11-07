@@ -169,6 +169,9 @@ class VectorScanTest extends AnyFunSuite {
           assert(dut.io.done.toBoolean, s"$name timeout vl=$vl")
           assert(!dut.io.saturated.toBoolean)
           if (vl == 0) assert(readCount == 0 && writeCount == 0)
+          // vcpop and vfirst read each 64-bit mask word once and finish two cycles after the last read
+          val words = (vl + 63) / 64
+          if (scalar) assert(readCount == words && cycles == scala.math.max(words, 1) + 2, s"$name vl=$vl: $readCount reads, $cycles cycles")
           if (scalar) {
             val value = if (name == "vcpop") BigInt(count) else BigInt(first) & ((BigInt(1) << xlen) - 1)
             assert(dut.io.result.toBigInt == value, s"$name scalar ${dut.io.result.toBigInt} != $value")
