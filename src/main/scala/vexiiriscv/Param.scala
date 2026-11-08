@@ -191,6 +191,7 @@ class ParamSimple() {
   var vectorBeatMemory = true
   var vectorQueue = 0
   var vectorBeatSlides = false
+  var vectorBeatCompress = false
   var narrowIoWindow = false
   val prefetcherRptParam = new PrefetcherRptParam()
 
@@ -622,6 +623,7 @@ class ParamSimple() {
     if (extension.withZve32x) r += s"vd${vectorDlen}"
     if (extension.withZve32x && vectorQueue > 0) r += s"vq${vectorQueue}"
     if (extension.withZve32x && vectorBeatSlides) r += "vbs"
+    if (extension.withZve32x && vectorBeatCompress) r += "vbc"
     if (privParam.withImsic) r += s"if${privParam.imsicInterrupts}gf${privParam.guestExternalInterruptFiles}"
     if (privParam.withDebug) r += s"pdbg"
     if (privParam.withExternalInterrupt) r += "nei"
@@ -926,6 +928,8 @@ class ParamSimple() {
       .text("Set the vector arithmetic queue depth (1 to 4) and enable the queue; 0 (the default) keeps vector instructions synchronous.")
     opt[Unit]("vector-beat-slides").action { (v, c) => vectorBeatSlides = true }
       .text("Run vslide* and vrgather.vx/.vi in the beat unit, one destination word per cycle.")
+    opt[Unit]("vector-beat-compress").action { (v, c) => vectorBeatCompress = true }
+      .text("Run vcompress.vm in the beat unit, one source word per cycle; requires --vector-beat-slides.")
     opt[Unit]("narrow-io-window").action { (v, c) => narrowIoWindow = true }
       .text("TestBench only: the IO window 0x10021000-0x10021FFF takes accesses of at most 4 bytes.")
     opt[Unit]("dual-issue").action { (v, c) =>
@@ -1441,7 +1445,7 @@ class ParamSimple() {
     if (extension.withZve32x) {
       plugins += new execute.vector.VectorCsrPlugin(vlen = vlen, withAccessHold = vectorQueue > 0)
       plugins += new execute.vector.VectorPlugin(early0, dlen = vectorDlen, elen = if (extension.withZve64x) 64 else 32, queueDepth = vectorQueue,
-        beatSlides = vectorBeatSlides)
+        beatSlides = vectorBeatSlides, beatCompress = vectorBeatCompress)
     }
 
     plugins += new WhiteboxerPlugin(

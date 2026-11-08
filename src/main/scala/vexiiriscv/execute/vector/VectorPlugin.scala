@@ -72,8 +72,10 @@ case class VectorMemoryDescriptor(indexWidth : Int, split : Boolean = false, bea
  * it retires there and runs later. Every reader of its results waits until nothing is outstanding.
  */
 class VectorPlugin(val layer : LaneLayer, val dlen : Int = 64, var withMemory : Boolean = true, val elen : Int = 32,
-                   val queueDepth : Int = 0, val beatSlides : Boolean = false) extends FiberPlugin with InitService {
+                   val queueDepth : Int = 0, val beatSlides : Boolean = false, val beatCompress : Boolean = false)
+  extends FiberPlugin with InitService {
   require(elen == 32 || elen == 64)
+  require(!beatCompress || beatSlides, "beat compress requires beat slides")
   require(queueDepth >= 0 && queueDepth <= 4)
   override def initHold(): Bool = regFile.vrf.io.initHold
 
@@ -103,6 +105,7 @@ class VectorPlugin(val layer : LaneLayer, val dlen : Int = 64, var withMemory : 
   val RANGE = Payload(UInt(VectorRange.width bits))
   val MEM = Payload(Bool()) // Element micro-op through the shared LSU
   val UNSIGNED_IMMEDIATE = Payload(Bool()) // shift and clip amounts are zero-extended (norm:vsll_vsrl_vsra_shamt)
+  val BEAT_COMPRESS = Payload(Bool()) // vcompress.vm in the beat unit
 
   val logic = during setup new Area {
     val elp = layer.lane
@@ -136,6 +139,7 @@ class VectorPlugin(val layer : LaneLayer, val dlen : Int = 64, var withMemory : 
     for (key <- checks) elp.setDecodingDefault(key, False)
     ds.addMicroOpDecodingDefault(VECTOR, False)
     if (elen == 64 || beatSlides) elp.setDecodingDefault(UNSIGNED_IMMEDIATE, False)
+    if (beatCompress) elp.setDecodingDefault(BEAT_COMPRESS, False)
     val shiftNames = Set("vsll", "vsrl", "vsra", "vssrl", "vssra", "vnsrl", "vnsra", "vnclipu", "vnclip")
 
     val wb = ifp.access(1)
@@ -304,7 +308,8 @@ class VectorPlugin(val layer : LaneLayer, val dlen : Int = 64, var withMemory : 
       val disjoint = gather || compress || name == "vslideup" || name == "vslide1up"
       // With beat slides, slides and scalar-index gathers run in the beat unit, immediates zero-extended
       val beat = beatSlides && (name.startsWith("vslide") || name == "vrgather" && !vector)
-      val spec = add(Rvv.all(s"$name.$form"), ELEMENT -> Bool(!beat), ELEMENT_OP -> U(op, VectorElementOp.width bits),
+      val beatPack = beatCompress && compress
+      val spec = add(Rvv.all(s"$name.$form"), ELEMENT -> Bool(!beat && !beatPack), ELEMENT_OP -> U(op, VectorElementOp.width bits),
         SCALAR_OPERAND -> Bool(!vector && !compress), IMMEDIATE -> Bool(form == "vi"),
         CHECK_VILL -> True, CHECK_VSTART -> True, EMUL_VD -> emul(VectorEmul.L), EMUL_VS2 -> emul(VectorEmul.L),
         EMUL_VS1 -> emul(if (name == "vrgatherei16") VectorEmul.INDEX16 else if (vector) VectorEmul.L else VectorEmul.NONE),
@@ -312,6 +317,8 @@ class VectorPlugin(val layer : LaneLayer, val dlen : Int = 64, var withMemory : 
         OVERLAP_VS1 -> overlap(if (vector || compress) VectorOverlap.DISJOINT else VectorOverlap.ANY))
       if (beat) spec.addDecoding(ARITH -> True, SHAPE -> shape(if (gather) VectorShape.SPLAT else VectorShape.SLIDE),
         UNSIGNED_IMMEDIATE -> Bool(form == "vi"))
+      // SINGLE shape and the ADD default keep the vs2 read; the beat unit passes the raw word on
+      if (beatPack) spec.addDecoding(ARITH -> True, BEAT_COMPRESS -> True)
     }
     add(Rvv.all("vmv.x.s"), ARITH -> True, SHAPE -> shape(VectorShape.SCALAR_READ), CHECK_VILL -> True, CHECK_VSTART -> True)
     add(Rvv.all("vmv.s.x"), ARITH -> True, ALU_OP -> alu(VectorAluOp.MOVE),
@@ -337,8 +344,8 @@ class VectorPlugin(val layer : LaneLayer, val dlen : Int = 64, var withMemory : 
     val vlen = vcs.vlen
     val vlWidth = vcs.vlWidth
     val vrf = regFile.vrf
-    val arithmetic = new VectorArithmetic(vrf.p, XLEN, elen, beatSlides)
-    val element = new VectorElementUnit(vrf.p, XLEN, elen, beatSlides)
+    val arithmetic = new VectorArithmetic(vrf.p, XLEN, elen, beatSlides, beatCompress)
+    val element = new VectorElementUnit(vrf.p, XLEN, elen, beatSlides, beatCompress)
     vrf.io.write := arithmetic.io.write
     when(element.io.busy) { vrf.io.write := element.io.write }
     arithmetic.io.v0 := vrf.io.v0
@@ -561,14 +568,14 @@ class VectorPlugin(val layer : LaneLayer, val dlen : Int = 64, var withMemory : 
 
       val decoupled = queueDepth > 0
       val queue = decoupled generate new Area {
-        val q = new VectorQueue(vrf.p, XLEN, queueDepth, beatSlides)
+        val q = new VectorQueue(vrf.p, XLEN, queueDepth, beatSlides, beatCompress)
         val pp = host[PrivilegedPlugin]
         val forceSync = if (pp.p.withDebug) pp.logic.harts(0).debugMode || pp.logic.harts(0).debug.dcsr.step else False
         // Everything without a scalar result; in debug mode or while stepping, everything runs synchronously
         val queued = (ARITH && SHAPE =/= VectorShape.SCALAR_READ ||
           ELEMENT && ELEMENT_OP =/= VectorElementOp.CPOP && ELEMENT_OP =/= VectorElementOp.FIRST) && !forceSync
         val accept = fire && queued
-        val e0Arith = Flow(VectorArithmeticCmd(vrf.p, XLEN, beatSlides))
+        val e0Arith = Flow(VectorArithmeticCmd(vrf.p, XLEN, beatSlides, beatCompress))
         val e0Element = Flow(VectorElementCmd(vrf.p, XLEN))
         q.push.valid := accept
         q.push.element := ELEMENT
@@ -610,6 +617,7 @@ class VectorPlugin(val layer : LaneLayer, val dlen : Int = 64, var withMemory : 
           // funct6 bit 0 selects down; the OPMVX forms are vslide1up and vslide1down
           armCmd.slide := (Decode.UOP(Const.funct3Range) === B"110") ## Decode.UOP(26)
         }
+        if (beatCompress) armCmd.compress := BEAT_COMPRESS
         elemCmd.valid := sel && ELEMENT && !legality.illegal && !started
         elemCmd.vd := vd
         elemCmd.vs1 := vs1

@@ -46,7 +46,8 @@ case class VectorElementCmd(p: VectorRegFileParam, xlen: Int) extends Bundle {
 // With ELEN 64 an active SEW-64 multiply takes three passes of the 33 x 33 multiplier, reading its element in each,
 // and the divider, iota counts, gather indices and permuted data are 64 bits wide.
 // vcpop and vfirst take one 64-bit mask word per cycle: read in t, mask in t+1, count and find in t+2.
-class VectorElementUnit(val p: VectorRegFileParam, val xlen: Int, val elen: Int = 32, val slides: Boolean = false) extends Component {
+class VectorElementUnit(val p: VectorRegFileParam, val xlen: Int, val elen: Int = 32, val slides: Boolean = false,
+                        val beatCompress: Boolean = false) extends Component {
   require(p.dlen == 64 && p.readPorts >= 3)
   require(xlen == 32 || xlen == 64)
   require(elen == 32 || elen == 64)
@@ -311,7 +312,8 @@ class VectorElementUnit(val p: VectorRegFileParam, val xlen: Int, val elen: Int 
   // Gather indices are read first; the following cycle reads the selected data word.
   val permutation = new Area {
     val gather = is(VectorElementOp.GATHER) || is(VectorElementOp.GATHEREI16)
-    val compress = is(VectorElementOp.COMPRESS)
+    // With beat compress, vcompress runs in the beat unit
+    val compress = if (beatCompress) False else is(VectorElementOp.COMPRESS)
     val vectorIndex = gather && !command.scalarOperand
     val indexSew = is(VectorElementOp.GATHEREI16) ? U(1, 2 bits) | command.sew
     val advance = running && permute

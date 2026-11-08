@@ -8,9 +8,10 @@ import spinal.lib._
 import scala.collection.mutable.ArrayBuffer
 import scala.util.Random
 
-class VectorArithmeticHarness(p: VectorRegFileParam, xlen: Int, elen: Int = 32, slides: Boolean = false) extends Component {
+class VectorArithmeticHarness(p: VectorRegFileParam, xlen: Int, elen: Int = 32, slides: Boolean = false,
+                              beatCompress: Boolean = false) extends Component {
   val io = new Bundle {
-    val cmd = slave(Flow(VectorArithmeticCmd(p, xlen, slides)))
+    val cmd = slave(Flow(VectorArithmeticCmd(p, xlen, slides, beatCompress)))
     val debug = in Bool()
     val access = slave(Flow(VrfWriteCmd(p)))
     val readAddress = in UInt(p.addressWidth bits)
@@ -22,7 +23,7 @@ class VectorArithmeticHarness(p: VectorRegFileParam, xlen: Int, elen: Int = 32, 
     val readAddresses = out Vec(UInt(p.addressWidth bits), 3)
   }
   val vrf = new VectorRegFile(p)
-  val arithmetic = new VectorArithmetic(p, xlen, elen, slides)
+  val arithmetic = new VectorArithmetic(p, xlen, elen, slides, beatCompress)
   arithmetic.io.cmd := io.cmd
   arithmetic.io.v0 := vrf.io.v0
   vrf.io.write := arithmetic.io.write

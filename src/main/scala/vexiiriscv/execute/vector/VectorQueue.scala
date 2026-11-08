@@ -4,9 +4,10 @@ import spinal.core._
 import spinal.lib._
 
 // One accepted arithmetic instruction: the command of the unit that runs it and its tag
-case class VectorQueueEntry(p: VectorRegFileParam, xlen: Int, tagWidth: Int, slides: Boolean = false) extends Bundle {
+case class VectorQueueEntry(p: VectorRegFileParam, xlen: Int, tagWidth: Int, slides: Boolean = false,
+                            beatCompress: Boolean = false) extends Bundle {
   val element = Bool()
-  val arith = VectorArithmeticCmd(p, xlen, slides)
+  val arith = VectorArithmeticCmd(p, xlen, slides, beatCompress)
   val elem = VectorElementCmd(p, xlen)
   val tag = UInt(tagWidth bits)
 }
@@ -16,14 +17,14 @@ case class VectorQueueEntry(p: VectorRegFileParam, xlen: Int, tagWidth: Int, sli
  * once no instruction runs, so at most depth + 1 are outstanding and they complete in accept order.
  * full and idle are registered from the next state, so they are exact in every cycle.
  */
-class VectorQueue(p: VectorRegFileParam, xlen: Int, val depth: Int, slides: Boolean = false) extends Area {
+class VectorQueue(p: VectorRegFileParam, xlen: Int, val depth: Int, slides: Boolean = false, beatCompress: Boolean = false) extends Area {
   require(depth >= 1 && depth <= 4)
   val tagWidth = 3 // 2^3 > depth + 1, so no tag is reused while outstanding
 
-  val push = Flow(VectorQueueEntry(p, xlen, tagWidth, slides)) // accept; the queue sets its tag
+  val push = Flow(VectorQueueEntry(p, xlen, tagWidth, slides, beatCompress)) // accept; the queue sets its tag
   val done = Bool() // the running unit's done
 
-  val entries = Vec.fill(depth)(Reg(VectorQueueEntry(p, xlen, tagWidth, slides)))
+  val entries = Vec.fill(depth)(Reg(VectorQueueEntry(p, xlen, tagWidth, slides, beatCompress)))
   val count = Reg(UInt(log2Up(depth + 1) bits)) init(0)
   val ptrWidth = log2Up(depth) max 1
   val readPtr, writePtr = Reg(UInt(ptrWidth bits)) init(0)
