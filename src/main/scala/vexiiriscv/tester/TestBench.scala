@@ -27,6 +27,7 @@ import vexiiriscv.fetch.{FetchCachelessPlugin, FetchL1Plugin, PcService}
 import vexiiriscv.misc.{EmbeddedRiscvJtag, ImsicPlugin, PrivilegedPlugin, TrapPlugin}
 import vexiiriscv.execute.vector.VectorPlugin
 import vexiiriscv.test.WhiteboxerPlugin
+import vexiiriscv.test.VectorReportSignals
 import vexiiriscv.regfile.RegFilePlugin
 import vexiiriscv.riscv.{IntRegFile, Riscv}
 import vexiiriscv.test.konata.Backend
@@ -73,6 +74,12 @@ class TestBenchDut(plugins : scala.collection.Seq[scala.collection.Seq[Hostable]
   val vectorSystem = Fiber patch {
     cores.map(core => core.rework { core.database on {
       core.host.get[VectorPlugin].filter(_.withMemory).map(plugin => new VectorSystemSignals(core, plugin).setName("vectorSystem"))
+    }})
+  }
+
+  val vectorReports = Fiber patch {
+    cores.map(core => core.rework { core.database on {
+      core.host.get[VectorPlugin].map(plugin => new VectorReportSignals(plugin).setName("vectorReports"))
     }})
   }
 
@@ -278,6 +285,9 @@ class TestOptions {
   var dbusBaseLatency = 0
   var seed = 2
   var vectorSystemTrace = false
+  var vectorDeferReports = -1
+  var vectorDeferEarly = false
+  var vectorDeferFault = ""
   var vectorIrqInject = false
   var jtagRemote = false
   var spawnProcess = Option.empty[String]
@@ -360,6 +370,14 @@ class TestOptions {
       .text("Schedule CLINT inputs during labelled vector interrupt tests.")
     opt[Unit]("vector-system-trace").action { (v, c) => vectorSystemTrace = true }
       .text("Record vector execution, retry and enabled interrupt events.")
+    opt[Int]("vector-defer-reports").validate(v => if(v >= 0 && v < Int.MaxValue) success else failure("vector report delay must be nonnegative and below Int.MaxValue"))
+      .action { (v, c) => vectorDeferReports = v }
+      .text("Delay tagged vector arithmetic reports by up to this many cycles, preserving FIFO order.")
+    opt[Unit]("vector-defer-early").action { (v, c) => vectorDeferEarly = true }
+      .text("Buffer tagged vector effects from execution until their owning commit.")
+    opt[String]("vector-defer-fault").validate(v => if(v.nonEmpty && vexiiriscv.test.VectorTraceBuffer.faults.contains(v)) success else failure("unknown vector report fault"))
+      .action { (v, c) => vectorDeferFault = v }
+      .text("Inject one vector report error: missing, duplicate, wrong-tag, late, before-defer.")
     opt[Unit]("jtag-remote").unbounded().action { (v, c) => jtagRemote = true }
       .text("Enable remote JTAG; requires --debug-jtag-tap.")
     opt[Int]("memory-latency").action { (v, c) => dbusBaseLatency = v; ibusBaseLatency = v }
@@ -373,6 +391,7 @@ class TestOptions {
     opt[String]("spawn-process").unbounded().action { (v, c) => spawnProcess = Some(v) }
       .text("Start an external command and finish the simulation from its exit status.")
     checkConfig { _ => if(passPolicy == "all" && failPolicy == "all") failure("--pass-policy and --fail-policy cannot both be all") else success }
+    checkConfig { _ => if(vectorDeferFault.nonEmpty && !vectorDeferEarly) failure("--vector-defer-fault requires --vector-defer-early") else success }
   }
 
   def test(compiled : SimCompiled[TestBenchDut]): Unit = {
@@ -414,7 +433,10 @@ class TestOptions {
     val probes = duts.cores.zipWithIndex.map { case (dut, i) =>
       val konataBackend = traceKonata.option(new Backend(new File(currentTestPath(), s"konata$i.log")))
       delayed(1)(konataBackend.foreach(_.spinalSimFlusher(10 * 10000))) // Delayed to ensure this is registered last
-      val probe = new VexiiRiscvProbe(dut, konataBackend, withRvls)
+      val probe = new VexiiRiscvProbe(dut, konataBackend, withRvls, duts.vectorReports.get(i))
+      probe.vectorDeferReports = vectorDeferReports
+      probe.vectorDeferEarly = vectorDeferEarly
+      probe.vectorDeferFault = vectorDeferFault
       if (withRvlsCheck) probe.add(rvls)
       probe.enabled = withProbe
       probe.trace = false

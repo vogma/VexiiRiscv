@@ -62,11 +62,16 @@ object VexiiRiscvProbe {
  *
  * It also keep a trace of various performance metrics, as the IPC, branch miss rate, ...
  */
-class VexiiRiscvProbe(cpu : VexiiRiscv, kb : Option[konata.Backend], var withRvls : Boolean = true) {
+class VexiiRiscvProbe(cpu : VexiiRiscv, kb : Option[konata.Backend], var withRvls : Boolean = true,
+                     vectorReportSignals: Option[VectorReportSignals] = None) {
   var enabled = true
   var trace = true
   var checkLiveness = true
   var livenessThreshold = 32000l
+  var vectorDeferReports = -1
+  var vectorDeferEarly = false
+  var vectorDeferFault = ""
+  def withVectorDeferral = vectorDeferReports >= 0 || vectorDeferEarly
   var backends = ArrayBuffer[TraceBackend]()
   val commitsCallbacks = ArrayBuffer[(Int, Long) => Unit]()
   val autoStoreBroadcast = cpu.host.get[LsuCachelessPlugin].nonEmpty
@@ -170,6 +175,10 @@ class VexiiRiscvProbe(cpu : VexiiRiscv, kb : Option[konata.Backend], var withRvl
 
   def finish(): Unit = {
     require(harts.forall(_.vectorRecord == null), "unfinished vector instruction at end of run")
+    if(withVectorDeferral) harts.foreach { hart =>
+      hart.vectorReports.drain()
+      println(s"Vector reports hart ${hart.hartId}: ${hart.vectorReports.stats}")
+    }
     backends.foreach(_.finish())
   }
 
@@ -259,9 +268,18 @@ class VexiiRiscvProbe(cpu : VexiiRiscv, kb : Option[konata.Backend], var withRvl
     var vectorRecord: VectorRecord = null
     val vectorStores = mutable.Map[Int, VectorAccess]()
     val liveVectorStoreIds = mutable.Set[Int]()
+    lazy val vectorReports = new VectorTraceBuffer(hartId, () => backends.toVector, math.max(0, vectorDeferReports), 0x564543L + hartId, vectorDeferFault)
+
+    def vectorTag(uop: MicroOpCtx): Int = {
+      if(uop.vectorTag == -1) uop.vectorTag = vectorReports.accept()
+      uop.vectorTag
+    }
 
     def openVector(uop: MicroOpCtx): VectorRecord = {
-      if(vectorRecord == null) vectorRecord = new VectorRecord(uop.pc, uop.instruction)
+      if(vectorRecord == null) {
+        if(withVectorDeferral) vectorReports.drain()
+        vectorRecord = new VectorRecord(uop.pc, uop.instruction)
+      }
       require(vectorRecord.pc == uop.pc && vectorRecord.instruction == uop.instruction, "vector retry changed instruction identity")
       vectorRecord
     }
@@ -401,6 +419,8 @@ class VexiiRiscvProbe(cpu : VexiiRiscv, kb : Option[konata.Backend], var withRvl
     var scFailure = false
 
     var vectorValid = false
+    var vectorTag = -1
+    var vectorVxsat = 0
     val vectorCsrWrites = ArrayBuffer[(Int, Long)]() // Implicit vl, vtype, vstart updates
     val vectorWrites = ArrayBuffer[(Int, Array[Byte], Array[Byte])]()
     val ioAccesses = ArrayBuffer[TraceIo]() // Reported when this uop retires
@@ -481,6 +501,8 @@ class VexiiRiscvProbe(cpu : VexiiRiscv, kb : Option[konata.Backend], var withRvl
       isSc = false
       lsuAmo = false
       vectorValid = false
+      vectorTag = -1
+      vectorVxsat = 0
       vectorCsrWrites.clear()
       vectorWrites.clear()
       ioAccesses.clear()
@@ -652,6 +674,11 @@ class VexiiRiscvProbe(cpu : VexiiRiscv, kb : Option[konata.Backend], var withRvl
     })
 
     for (v <- vwb) {
+      if(vectorDeferEarly && vectorReportSignals.get.unitStart.toBoolean) {
+        val hart = harts(0)
+        val uop = hart.microOp(v.uopId.toInt)
+        if(VectorTraceBuffer.queued(uop.instruction)) hart.vectorTag(uop)
+      }
       if (v.vrfWriteValid.toBoolean) {
         val address = v.vrfWriteAddress.toInt
         val reg = address * vectorBeatBytes / vectorBytes
@@ -665,11 +692,25 @@ class VexiiRiscvProbe(cpu : VexiiRiscv, kb : Option[konata.Backend], var withRvl
         }
         val write = (reg, mask, vectorShadow(reg).clone())
         if(v.memoryComplete.toBoolean) harts(0).openVector(harts(0).microOp(v.memoryUopId.toInt)).writes += write
-        else harts(0).microOp(v.uopId.toInt).vectorWrites += write
+        else {
+          val hart = harts(0)
+          val uop = hart.microOp(v.uopId.toInt)
+          if(vectorDeferEarly && VectorTraceBuffer.queued(uop.instruction)) {
+            hart.vectorReports.write(hart.vectorTag(uop), reg, mask, write._3)
+          } else uop.vectorWrites += write
+        }
+      }
+      if(vectorDeferEarly && vectorReportSignals.get.unitDone.toBoolean) {
+        val hart = harts(0)
+        val uop = hart.microOp(v.uopId.toInt)
+        if(VectorTraceBuffer.queued(uop.instruction)) {
+          hart.vectorReports.complete(hart.vectorTag(uop), (v.vxsat.toBoolean || vectorReportSignals.get.unitSaturated.toBoolean).toInt)
+        }
       }
       if (v.fire.toBoolean) {
         val uop = harts(0).microOp(v.uopId.toInt)
         uop.vectorValid = true
+        uop.vectorVxsat = (v.vxsat.toBoolean || v.vxsatSet.toBoolean).toInt
         if (v.configValid.toBoolean && !v.memoryComplete.toBoolean) {
           uop.vectorCsrWrites += 0xC20 -> v.configVl.toLong
           uop.vectorCsrWrites += 0xC21 -> v.configVtype.toLong
@@ -849,6 +890,12 @@ class VexiiRiscvProbe(cpu : VexiiRiscv, kb : Option[konata.Backend], var withRvl
         import hart._
         val uopId = hart.microOpRetirePtr
         val uop = hart.microOp(uopId)
+        val deferred = withVectorDeferral && uop.didCommit && uop.vectorValid && VectorTraceBuffer.queued(uop.instruction)
+        if(withVectorDeferral && uop.didCommit) {
+          val config = (uop.instruction & 0x707F) == 0x7057
+          val vectorObserver = isVectorInstruction(uop.instruction) && !config && !deferred
+          if(vectorObserver || uop.csrValid && VectorTraceBuffer.csrObserver(uop.csrAddress, uop.csrWriteDone)) hart.vectorReports.drain()
+        }
         for (io <- uop.ioAccesses) backends.foreach(_.ioAccess(hartId, io))
         if (uop.spawned) {
           val fetch = hart.fetch(uop.fetchId)
@@ -886,9 +933,18 @@ class VexiiRiscvProbe(cpu : VexiiRiscv, kb : Option[konata.Backend], var withRvl
               if (uop.csrReadDone) backends.foreach(_.readRf(hartId, 4, uop.csrAddress, uop.csrReadData))
               if (uop.csrWriteDone) backends.foreach(_.writeRf(hartId, 4, uop.csrAddress, uop.csrWriteData))
             }
-            for ((address, value) <- uop.vectorCsrWrites) backends.foreach(_.writeRf(hartId, 5, address, BigInt(value).toBytes(64)))
-            for ((reg, mask, data) <- uop.vectorWrites) backends.foreach(_.writeVrf(hartId, reg, mask, data))
+            for ((address, value) <- uop.vectorCsrWrites if !deferred || address != 0x009) backends.foreach(_.writeRf(hartId, 5, address, BigInt(value).toBytes(64)))
+            if(deferred) hart.vectorReports.beforeCommit(hart.vectorTag(uop))
+            else for ((reg, mask, data) <- uop.vectorWrites) backends.foreach(_.writeVrf(hartId, reg, mask, data))
             if(uop.commit) backends.foreach(_.commit(hartId, uop.pc, uop.instruction))
+            if(deferred) {
+              hart.vectorReports.afterCommit(uop.vectorTag, cycle)
+              if(!vectorDeferEarly) {
+                for((reg, mask, data) <- uop.vectorWrites) hart.vectorReports.write(uop.vectorTag, reg, mask, data)
+                hart.vectorReports.complete(uop.vectorTag, uop.vectorVxsat)
+              }
+              hart.vectorReports.tick(cycle)
+            }
             if (autoStoreBroadcast && !nativeCacheless && uop.storeValid) {
               backends.foreach(_.storeBroadcast(hartId, uop.storeSqId))
             }
@@ -914,6 +970,7 @@ class VexiiRiscvProbe(cpu : VexiiRiscv, kb : Option[konata.Backend], var withRvl
 
   // Synchronous traps of vector instructions also report the written xepc/xtval
   def emitTrap(hart : HartCtx, interrupt : Boolean, cause : Int, epc : Long, tval : Long): Unit = {
+    if(withVectorDeferral) hart.vectorReports.drain()
     if(hart.vectorRecord != null) {
       require(!interrupt && pcExtends(epc) == pcExtends(hart.vectorRecord.pc), "trap changed open vector identity")
       hart.emitVector()
@@ -945,6 +1002,7 @@ class VexiiRiscvProbe(cpu : VexiiRiscv, kb : Option[konata.Backend], var withRvl
       checkCommits()
       if(!autoStoreBroadcast) checkBroadcasts()
       checkTraps()
+      if(withVectorDeferral) harts.foreach(_.vectorReports.tick(cycle))
     }
     cycle += 1l
     if ((cycle & 0x3FFFl) == 0) flush()
