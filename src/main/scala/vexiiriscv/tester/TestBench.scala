@@ -437,6 +437,7 @@ class TestOptions {
       probe.vectorDeferReports = vectorDeferReports
       probe.vectorDeferEarly = vectorDeferEarly
       probe.vectorDeferFault = vectorDeferFault
+      require(!(probe.vectorQueue && vectorDeferEarly), "--vector-defer-early models a queue the RTL already has")
       if (withRvlsCheck) probe.add(rvls)
       probe.enabled = withProbe
       probe.trace = false
@@ -587,6 +588,12 @@ class TestOptions {
         case "all" => hartIds.forall(states(_) == -1)
         case "any" => hartIds.exists(states(_) == -1)
       }
+      // Accepted vector instructions may still run at the pass symbol; their effects are checked once they complete
+      def afterVectorDrain(body: => Unit, polls: Int = 0): Unit = {
+        if(probes.forall(_.vectorIdle)) body
+        else if(polls > 1000000) simFailure("the vector queue did not drain after the pass symbol")
+        else delayed(10)(afterVectorDrain(body, polls + 1))
+      }
       def scheduleTerminal(): Unit = {
         if(!terminalScheduled && (failReached || passReached)) {
           terminalScheduled = true
@@ -595,7 +602,7 @@ class TestOptions {
               val failed = hartIds.filter(states(_) == -1).map(hartId => s"$hartId=${failSymbols(hartId)}").mkString(", ")
               simFailure(s"Software reached the fail symbol on hart(s): $failed")
             } else if(passReached) {
-              checkedSuccess()
+              afterVectorDrain(checkedSuccess())
             }
           }
         }

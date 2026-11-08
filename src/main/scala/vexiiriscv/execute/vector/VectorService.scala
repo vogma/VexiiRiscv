@@ -41,4 +41,6 @@ trait VectorCsrService {
   def vstartWrite : Flow[UInt]
   def vxsatSet : Bool                       // vxsat := 1
   def setDirty : Bool                       // mstatus.VS := Dirty
+  def accessHold : Bool                     // hold vxsat/vcsr accesses and mstatus/sstatus writes; null without the hold
+  def accessHalted : Bool                   // an access waits on accessHold in this cycle; null without the hold
 }

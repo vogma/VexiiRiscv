@@ -189,6 +189,7 @@ class ParamSimple() {
   var vlen = 128
   var vectorDlen = 64
   var vectorBeatMemory = true
+  var vectorQueue = 0
   var narrowIoWindow = false
   val prefetcherRptParam = new PrefetcherRptParam()
 
@@ -618,6 +619,7 @@ class ParamSimple() {
     if (withIterativeShift) r += "isft"
     if (extension.withDiv) r += s"d${divRadix}${divImpl}${if(divArea)"Area" else ""}"
     if (extension.withZve32x) r += s"vd${vectorDlen}"
+    if (extension.withZve32x && vectorQueue > 0) r += s"vq${vectorQueue}"
     if (privParam.withImsic) r += s"if${privParam.imsicInterrupts}gf${privParam.guestExternalInterruptFiles}"
     if (privParam.withDebug) r += s"pdbg"
     if (privParam.withExternalInterrupt) r += "nei"
@@ -916,6 +918,10 @@ class ParamSimple() {
       .text("Move unit-stride vector memory data in LSU-wide words (with a vector subset); the default.")
     opt[Unit]("no-vector-beat-memory").action { (v, c) => vectorBeatMemory = false }
       .text("Move vector memory data one element per LSU access.")
+    opt[Unit]("vector-decoupled").action { (v, c) => vectorQueue = vectorQueue max 1 }
+      .text("Queue vector arithmetic without a scalar result and let it finish after it retires; depth 1 unless --vector-queue.")
+    opt[Int]("vector-queue").action { (v, c) => vectorQueue = v }
+      .text("Set the vector arithmetic queue depth (1 to 4) and enable the queue; 0 (the default) keeps vector instructions synchronous.")
     opt[Unit]("narrow-io-window").action { (v, c) => narrowIoWindow = true }
       .text("TestBench only: the IO window 0x10021000-0x10021FFF takes accesses of at most 4 bytes.")
     opt[Unit]("dual-issue").action { (v, c) =>
@@ -969,6 +975,7 @@ class ParamSimple() {
       assert(vectorDlen == 64, s"only DLEN = 64 is supported, got $vectorDlen")
       assert(lsuL1Enable, "the vector unit needs the LSU L1 (--lsu-l1)")
       assert(!extension.withHypervisor, "the vector unit does not support the hypervisor extension")
+      assert(vectorQueue >= 0 && vectorQueue <= 4, s"the vector queue depth must be 0 to 4, got $vectorQueue")
     } else {
       assert(zvlActive.isEmpty, "zvl*b needs a vector extension")
     }
@@ -1428,8 +1435,8 @@ class ParamSimple() {
 
     // Vector
     if (extension.withZve32x) {
-      plugins += new execute.vector.VectorCsrPlugin(vlen = vlen)
-      plugins += new execute.vector.VectorPlugin(early0, dlen = vectorDlen, elen = if (extension.withZve64x) 64 else 32)
+      plugins += new execute.vector.VectorCsrPlugin(vlen = vlen, withAccessHold = vectorQueue > 0)
+      plugins += new execute.vector.VectorPlugin(early0, dlen = vectorDlen, elen = if (extension.withZve64x) 64 else 32, queueDepth = vectorQueue)
     }
 
     plugins += new WhiteboxerPlugin(

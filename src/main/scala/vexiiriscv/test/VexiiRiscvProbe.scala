@@ -71,7 +71,13 @@ class VexiiRiscvProbe(cpu : VexiiRiscv, kb : Option[konata.Backend], var withRvl
   var vectorDeferReports = -1
   var vectorDeferEarly = false
   var vectorDeferFault = ""
-  def withVectorDeferral = vectorDeferReports >= 0 || vectorDeferEarly
+  // A vector arithmetic queue in the RTL: its accepted instructions report their effects by tag after the commit
+  val vectorQueue = cpu.host.get[VectorPlugin].exists(_.queueDepth > 0)
+  def withVectorDeferral = vectorDeferReports >= 0 || vectorDeferEarly || vectorQueue
+  def vectorIdle = vwb.forall(v => v.queueIdle == null || v.queueIdle.toBoolean)
+  // Cycles in which each queue coverage event of the RTL was seen
+  val vectorQueueEventNames = List("full", "acceptPop", "acceptComplete", "otherFreeze", "csrHold", "trapHold", "debugHold", "xretHold")
+  val vectorQueueEvents = Array.fill(vectorQueueEventNames.size)(0L)
   var backends = ArrayBuffer[TraceBackend]()
   val commitsCallbacks = ArrayBuffer[(Int, Long) => Unit]()
   val autoStoreBroadcast = cpu.host.get[LsuCachelessPlugin].nonEmpty
@@ -179,6 +185,7 @@ class VexiiRiscvProbe(cpu : VexiiRiscv, kb : Option[konata.Backend], var withRvl
       hart.vectorReports.drain()
       println(s"Vector reports hart ${hart.hartId}: ${hart.vectorReports.stats}")
     }
+    if(vectorQueue) println("Vector queue events: " + vectorQueueEventNames.zip(vectorQueueEvents).map { case (n, c) => s"$n=$c" }.mkString(" "))
     backends.foreach(_.finish())
   }
 
@@ -674,6 +681,16 @@ class VexiiRiscvProbe(cpu : VexiiRiscv, kb : Option[konata.Backend], var withRvl
     })
 
     for (v <- vwb) {
+      if(vectorQueue) {
+        val events = v.queueEvents.toInt
+        if(events != 0) for(i <- vectorQueueEvents.indices if (events >> i & 1) != 0) vectorQueueEvents(i) += 1
+      }
+      if(vectorQueue && v.queueAccept.toBoolean) {
+        val hart = harts(0)
+        val uop = hart.microOp(v.uopId.toInt)
+        require(uop.vectorTag == -1, "vector instruction accepted twice")
+        require(hart.vectorTag(uop) == v.queueAcceptTag.toInt, "vector queue tag differs from the accept order")
+      }
       if(vectorDeferEarly && vectorReportSignals.get.unitStart.toBoolean) {
         val hart = harts(0)
         val uop = hart.microOp(v.uopId.toInt)
@@ -695,7 +712,9 @@ class VexiiRiscvProbe(cpu : VexiiRiscv, kb : Option[konata.Backend], var withRvl
         else {
           val hart = harts(0)
           val uop = hart.microOp(v.uopId.toInt)
-          if(vectorDeferEarly && VectorTraceBuffer.queued(uop.instruction)) {
+          if(vectorQueue && v.queueRunning.toBoolean) {
+            hart.vectorReports.write(v.queueRunningTag.toInt, reg, mask, write._3)
+          } else if(vectorDeferEarly && VectorTraceBuffer.queued(uop.instruction)) {
             hart.vectorReports.write(hart.vectorTag(uop), reg, mask, write._3)
           } else uop.vectorWrites += write
         }
@@ -707,6 +726,9 @@ class VexiiRiscvProbe(cpu : VexiiRiscv, kb : Option[konata.Backend], var withRvl
           hart.vectorReports.complete(hart.vectorTag(uop), (v.vxsat.toBoolean || vectorReportSignals.get.unitSaturated.toBoolean).toInt)
         }
       }
+      if(vectorQueue && v.queueComplete.toBoolean) {
+        harts(0).vectorReports.complete(v.queueRunningTag.toInt, (v.vxsat.toBoolean || v.vxsatSet.toBoolean).toInt)
+      }
       if (v.fire.toBoolean) {
         val uop = harts(0).microOp(v.uopId.toInt)
         uop.vectorValid = true
@@ -717,7 +739,7 @@ class VexiiRiscvProbe(cpu : VexiiRiscv, kb : Option[konata.Backend], var withRvl
         }
         if (v.vstartValid.toBoolean && !v.memoryComplete.toBoolean) uop.vectorCsrWrites += 0x008 -> v.vstartValue.toLong
         // Saturation only ever sets the sticky vxsat; report it when it changes
-        if (v.vxsatSet.toBoolean && !v.vxsat.toBoolean) uop.vectorCsrWrites += 0x009 -> 1L
+        if (v.vxsatSet.toBoolean && !v.vxsat.toBoolean && !(vectorQueue && v.queueComplete.toBoolean)) uop.vectorCsrWrites += 0x009 -> 1L
       }
       if(v.memoryComplete.toBoolean && v.vstartValid.toBoolean) {
         val hart = harts(0)
@@ -890,7 +912,8 @@ class VexiiRiscvProbe(cpu : VexiiRiscv, kb : Option[konata.Backend], var withRvl
         import hart._
         val uopId = hart.microOpRetirePtr
         val uop = hart.microOp(uopId)
-        val deferred = withVectorDeferral && uop.didCommit && uop.vectorValid && VectorTraceBuffer.queued(uop.instruction)
+        val deferred = withVectorDeferral && uop.didCommit && uop.vectorValid &&
+          (if(vectorQueue) uop.vectorTag != -1 else VectorTraceBuffer.queued(uop.instruction))
         if(withVectorDeferral && uop.didCommit) {
           val config = (uop.instruction & 0x707F) == 0x7057
           val vectorObserver = isVectorInstruction(uop.instruction) && !config && !deferred
@@ -939,7 +962,7 @@ class VexiiRiscvProbe(cpu : VexiiRiscv, kb : Option[konata.Backend], var withRvl
             if(uop.commit) backends.foreach(_.commit(hartId, uop.pc, uop.instruction))
             if(deferred) {
               hart.vectorReports.afterCommit(uop.vectorTag, cycle)
-              if(!vectorDeferEarly) {
+              if(!vectorDeferEarly && !vectorQueue) {
                 for((reg, mask, data) <- uop.vectorWrites) hart.vectorReports.write(uop.vectorTag, reg, mask, data)
                 hart.vectorReports.complete(uop.vectorTag, uop.vectorVxsat)
               }

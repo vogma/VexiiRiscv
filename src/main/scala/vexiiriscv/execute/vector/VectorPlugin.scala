@@ -68,9 +68,13 @@ case class VectorMemoryDescriptor(indexWidth : Int, split : Boolean = false, bea
  * Loads and stores instead issue one LSU micro-op per field of each active element and complete with the last one.
  * withMemory = false leaves the LSU element port to another sequencer. ELEN 64 adds SEW 64 and the EEW-64 memory forms;
  * with a 32-bit LSU each 8-byte element then takes two micro-ops, low word first.
+ * queueDepth > 0 instead accepts arithmetic without a scalar result into a queue of that depth when it leaves E0;
+ * it retires there and runs later. Every reader of its results waits until nothing is outstanding.
  */
-class VectorPlugin(val layer : LaneLayer, val dlen : Int = 64, var withMemory : Boolean = true, val elen : Int = 32) extends FiberPlugin with InitService {
+class VectorPlugin(val layer : LaneLayer, val dlen : Int = 64, var withMemory : Boolean = true, val elen : Int = 32,
+                   val queueDepth : Int = 0) extends FiberPlugin with InitService {
   require(elen == 32 || elen == 64)
+  require(queueDepth >= 0 && queueDepth <= 4)
   override def initHold(): Bool = regFile.vrf.io.initHold
 
   // Initialization must be available before the trap controller finishes building.
@@ -551,56 +555,94 @@ class VectorPlugin(val layer : LaneLayer, val dlen : Int = 64, var withMemory : 
         RESULT := ELEMENT ? element.io.result | ((SHAPE === VectorShape.SCALAR_READ) ? arithmetic.io.result | vl.resize(XLEN).asBits)
       }
 
+      val decoupled = queueDepth > 0
+      val queue = decoupled generate new Area {
+        val q = new VectorQueue(vrf.p, XLEN, queueDepth)
+        val pp = host[PrivilegedPlugin]
+        val forceSync = if (pp.p.withDebug) pp.logic.harts(0).debugMode || pp.logic.harts(0).debug.dcsr.step else False
+        // Everything without a scalar result; in debug mode or while stepping, everything runs synchronously
+        val queued = (ARITH && SHAPE =/= VectorShape.SCALAR_READ ||
+          ELEMENT && ELEMENT_OP =/= VectorElementOp.CPOP && ELEMENT_OP =/= VectorElementOp.FIRST) && !forceSync
+        val accept = fire && queued
+        val e0Arith = Flow(VectorArithmeticCmd(vrf.p, XLEN))
+        val e0Element = Flow(VectorElementCmd(vrf.p, XLEN))
+        q.push.valid := accept
+        q.push.element := ELEMENT
+        q.push.arith := e0Arith.payload
+        q.push.elem := e0Element.payload
+        q.done := arithmetic.io.done || element.io.done
+        // A unit takes the queue head on a pop, or a synchronizing command from E0 once nothing is outstanding
+        val syncGo = q.idle && !queued
+        arithmetic.io.cmd.valid := q.pop && !q.head.element || e0Arith.valid && syncGo
+        arithmetic.io.cmd.payload := q.pop ? q.head.arith | e0Arith.payload
+        element.io.cmd.valid := q.pop && q.head.element || e0Element.valid && syncGo
+        element.io.cmd.payload := q.pop ? q.head.elem | e0Element.payload
+      }
+
       val sequencer = new Area {
         val started, completed = RegInit(False)
-        arithmetic.io.cmd.valid := sel && ARITH && !legality.illegal && !started
-        arithmetic.io.cmd.vd := vd
-        arithmetic.io.cmd.vs1 := vs1
-        arithmetic.io.cmd.vs2 := vs2
-        arithmetic.io.cmd.vl := vcs.vl
-        arithmetic.io.cmd.vstart := vcs.vstart
-        arithmetic.io.cmd.sew := vtype.vsew.resized
-        arithmetic.io.cmd.shape := SHAPE
-        arithmetic.io.cmd.op := ALU_OP
-        arithmetic.io.cmd.scalar := IMMEDIATE ? (if (elen == 64) UNSIGNED_IMMEDIATE ? Decode.UOP(Const.rs1Range).resize(XLEN) |
+        def armCmd = if (decoupled) queue.e0Arith else arithmetic.io.cmd
+        def elemCmd = if (decoupled) queue.e0Element else element.io.cmd
+        armCmd.valid := sel && ARITH && !legality.illegal && !started
+        armCmd.vd := vd
+        armCmd.vs1 := vs1
+        armCmd.vs2 := vs2
+        armCmd.vl := vcs.vl
+        armCmd.vstart := vcs.vstart
+        armCmd.sew := vtype.vsew.resized
+        armCmd.shape := SHAPE
+        armCmd.op := ALU_OP
+        armCmd.scalar := IMMEDIATE ? (if (elen == 64) UNSIGNED_IMMEDIATE ? Decode.UOP(Const.rs1Range).resize(XLEN) |
           Decode.UOP(Const.rs1Range).asSInt.resize(XLEN).asBits else Decode.UOP(Const.rs1Range).asSInt.resize(XLEN).asBits) | up(elp(IntRegFile, RS1))
-        arithmetic.io.cmd.scalarOperand := SCALAR_OPERAND
-        arithmetic.io.cmd.unmasked := vm
-        arithmetic.io.cmd.maskData := MASK_DATA
-        arithmetic.io.cmd.signed := SIGNED
-        arithmetic.io.cmd.saturate := SATURATE
-        arithmetic.io.cmd.vxrm := vcs.vxrm
-        arithmetic.io.cmd.nreg := Decode.UOP(17 downto 15).asUInt.resize(4) + 1
-        element.io.cmd.valid := sel && ELEMENT && !legality.illegal && !started
-        element.io.cmd.vd := vd
-        element.io.cmd.vs1 := vs1
-        element.io.cmd.vs2 := vs2
-        element.io.cmd.vl := vcs.vl
-        element.io.cmd.vlmax := vlmaxOf(vtype.vsew, vtype.vlmul)
-        element.io.cmd.sew := vtype.vsew.resized
-        element.io.cmd.op := ELEMENT_OP
-        element.io.cmd.scalar := IMMEDIATE ? Decode.UOP(19 downto 15).resize(XLEN) | up(elp(IntRegFile, RS1))
-        element.io.cmd.scalarOperand := SCALAR_OPERAND
-        element.io.cmd.unmasked := vm
-        element.io.cmd.signed := SIGNED
-        element.io.cmd.signedVs1 := SIGNED_VS1
-        element.io.cmd.negate := NEGATE
-        element.io.cmd.vxrm := vcs.vxrm
+        armCmd.scalarOperand := SCALAR_OPERAND
+        armCmd.unmasked := vm
+        armCmd.maskData := MASK_DATA
+        armCmd.signed := SIGNED
+        armCmd.saturate := SATURATE
+        armCmd.vxrm := vcs.vxrm
+        armCmd.nreg := Decode.UOP(17 downto 15).asUInt.resize(4) + 1
+        elemCmd.valid := sel && ELEMENT && !legality.illegal && !started
+        elemCmd.vd := vd
+        elemCmd.vs1 := vs1
+        elemCmd.vs2 := vs2
+        elemCmd.vl := vcs.vl
+        elemCmd.vlmax := vlmaxOf(vtype.vsew, vtype.vlmul)
+        elemCmd.sew := vtype.vsew.resized
+        elemCmd.op := ELEMENT_OP
+        elemCmd.scalar := IMMEDIATE ? Decode.UOP(19 downto 15).resize(XLEN) | up(elp(IntRegFile, RS1))
+        elemCmd.scalarOperand := SCALAR_OPERAND
+        elemCmd.unmasked := vm
+        elemCmd.signed := SIGNED
+        elemCmd.signedVs1 := SIGNED_VS1
+        elemCmd.negate := NEGATE
+        elemCmd.vxrm := vcs.vxrm
         val unit = ARITH || ELEMENT
         // An illegal uop is held for one cycle before it leaves for its trap, which keeps the checks out of the freeze
         val illegalHeld = RegInit(False)
-        elp.freezeWhen(sel && unit && !illegalHeld && !completed)
+        // A queued uop waits only for room in the queue; the others until their unit is done
+        def hold = if (decoupled) sel && unit && (queue.queued ? queue.q.full | !illegalHeld && !completed) else sel && unit && !illegalHeld && !completed
+        elp.freezeWhen(hold)
         when(sel && legality.illegal) { illegalHeld := True }
         when(isReady) { illegalHeld := False }
         assert(!(sel && illegalHeld && !legality.illegal), "vector legality changed while the uop was held in E0")
-        when(arithmetic.io.cmd.valid || element.io.cmd.valid) { started := True }
-        when(arithmetic.io.done || element.io.done) { completed := True }
+        def unitStarts = if (decoupled) (armCmd.valid || elemCmd.valid) && queue.syncGo else arithmetic.io.cmd.valid || element.io.cmd.valid
+        def unitDone = if (decoupled) (arithmetic.io.done || element.io.done) && !queue.q.running else arithmetic.io.done || element.io.done
+        when(unitStarts) { started := True }
+        when(unitDone) { completed := True }
         when(fire && unit) {
           started := False
           completed := False
           vcs.vstartWrite.valid := True
           vcs.vstartWrite.payload := 0
           when(ARITH ? arithmetic.io.saturated | element.io.saturated) { vcs.vxsatSet := True }
+        }
+        // An accepted uop never writes vstart (it is 0 already); its vxsat is set when it completes
+        if (decoupled) {
+          when(queue.accept) {
+            vcs.vstartWrite.valid := False
+            vcs.vxsatSet := False
+          }
+          when(queue.q.complete && (queue.q.runningElement ? element.io.saturated | arithmetic.io.saturated)) { vcs.vxsatSet := True }
         }
       }
     }
@@ -652,6 +694,8 @@ class VectorPlugin(val layer : LaneLayer, val dlen : Int = 64, var withMemory : 
       val evl = RegNext(count)
       val unmasked = RegNext(seq.uop(25))
       walker.io.start := seq.valid && seq.first && !inflight && !seq.fire && evl === count && unmasked === seq.uop(25)
+      // Memory starts only once no accepted arithmetic is outstanding
+      if (e0.decoupled) when(!e0.queue.q.idle) { walker.io.start := False }
       walker.io.evl := evl
       walker.io.vstart := vcs.vstart
       walker.io.unmasked := unmasked
@@ -875,6 +919,37 @@ class VectorPlugin(val layer : LaneLayer, val dlen : Int = 64, var withMemory : 
     }
     buildBefore.release()
 
+    // Traps, debug entry, xRET and the vector CSR accesses wait until every accepted instruction completed
+    if (e0.decoupled) {
+      when(!e0.queue.q.idle) { host[TrapPlugin].api.harts(0).holdPrivChange := True }
+      vcs.accessHold := !e0.queue.q.idle
+    }
+
+    // Simulation checks of the queue's ordering rules, and coverage events for the probe
+    val queueChecks = e0.decoupled generate new Area {
+      val q = e0.queue.q
+      val hold = host[TrapPlugin].api.harts(0).holdPrivChange
+      val trap = host[TrapPlugin].logic.harts(0).trap
+      val fsm = trap.fsm
+      val applies = List(fsm.TRAP_APPLY, fsm.XRET_APPLY) ++ Option(fsm.ENTER_DEBUG)
+      assert(!(applies.map(fsm.isActive(_)).orR && !q.idle), "trap, debug entry or xRET applied while vector instructions are outstanding")
+      assert(!(e0.queue.accept && e0.isCancel), "vector instruction accepted while cancelled")
+      val unitStart = arithmetic.io.cmd.valid || element.io.cmd.valid
+      assert(!(unitStart && (q.running || arithmetic.io.busy || element.io.busy)), "vector unit started while another instruction runs")
+      assert(!(q.done && !q.running && !(e0.sequencer.started && !e0.sequencer.completed)), "vector unit done without a running instruction")
+      if (withMemory) assert(!(memory.seq.fire && !q.idle), "vector memory micro-op issued while arithmetic is outstanding")
+      val xret = !trap.pending.state.exception && trap.pending.state.code === TrapReason.PRIV_RET
+      val events = Bits(8 bits)
+      events(0) := q.full
+      events(1) := e0.queue.accept && q.pop
+      events(2) := e0.queue.accept && q.complete
+      events(3) := e0.sel && e0.queue.queued && !e0.isReady && !q.full // frozen by another source
+      events(4) := vcs.accessHalted
+      events(5) := hold && fsm.isActive(fsm.TRAP_WAIT)
+      events(6) := (if (fsm.ENTER_DEBUG_WAIT != null) hold && fsm.isActive(fsm.ENTER_DEBUG_WAIT) else False)
+      events(7) := hold && fsm.isActive(fsm.COMPUTE) && xret
+    }
+
     // Interrupts and debug halts wait until the retried instruction commits or traps
     val interruptHold = withMemory generate new Area {
       val tp = host[TrapPlugin]
@@ -962,6 +1037,14 @@ class VectorPlugin(val layer : LaneLayer, val dlen : Int = 64, var withMemory : 
       val vxrm = CombInit(vcs.vxrm).simPublic()
       val vxsat = CombInit(vcs.vxsat).simPublic()
       val vxsatSet = CombInit(vcs.vxsatSet).simPublic()
+      // Accepted instructions: accept (with the tag it gets), the running one, its completion, and nothing outstanding
+      val queueAccept = e0.decoupled generate CombInit(e0.queue.accept).simPublic()
+      val queueAcceptTag = e0.decoupled generate CombInit(e0.queue.q.nextTag).simPublic()
+      val queueRunning = e0.decoupled generate CombInit(e0.queue.q.running).simPublic()
+      val queueRunningTag = e0.decoupled generate CombInit(e0.queue.q.runningTag).simPublic()
+      val queueComplete = e0.decoupled generate CombInit(e0.queue.q.complete).simPublic()
+      val queueIdle = e0.decoupled generate CombInit(e0.queue.q.idle).simPublic()
+      val queueEvents = e0.decoupled generate CombInit(queueChecks.events).simPublic()
 
       val trap = host[TrapPlugin].logic.harts(0).trap
       val trapEpc = CombInit(trap.pending.pc).simPublic()

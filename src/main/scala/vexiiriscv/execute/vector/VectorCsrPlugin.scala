@@ -11,8 +11,9 @@ import vexiiriscv.riscv._
 /**
  * Provide mstatus.VS (also visible in sstatus) and the vector CSRs: vstart, vxsat, vxrm, vcsr (alias of vxrm and
  * vxsat), and the read-only vl, vtype, vlenb. The vector CSRs are illegal to access while VS is Off.
+ * withAccessHold adds accessHold: while set, vxsat/vcsr accesses and mstatus/sstatus writes wait.
  */
-class VectorCsrPlugin(val vlen : Int) extends FiberPlugin with VectorCsrService with VectorDirtyService {
+class VectorCsrPlugin(val vlen : Int, val withAccessHold : Boolean = false) extends FiberPlugin with VectorCsrService with VectorDirtyService {
   val api = during build new Area {
     val vs = RegInit(U(0, 2 bits))
     val enable = vs =/= 0
@@ -31,6 +32,8 @@ class VectorCsrPlugin(val vlen : Int) extends FiberPlugin with VectorCsrService 
     val vstartWrite = Flow(UInt(vstartWidth bits)).setIdle()
     val vxsatSet = False
     val gotDirty = False
+    val accessHold = withAccessHold generate Bool() // driven by the vector unit
+    val accessHalted = withAccessHold generate False // a held access waits in this cycle
   }
 
   override def vs : UInt = api.vs
@@ -45,6 +48,8 @@ class VectorCsrPlugin(val vlen : Int) extends FiberPlugin with VectorCsrService 
   override def vxsatSet : Bool = api.vxsatSet
   override def setDirty : Bool = api.gotDirty
   override def gotDirty() : Bool = api.gotDirty
+  override def accessHold : Bool = api.accessHold
+  override def accessHalted : Bool = api.accessHalted
 
   val logic = during setup new Area {
     val cp = host[CsrService]
@@ -87,6 +92,15 @@ class VectorCsrPlugin(val vlen : Int) extends FiberPlugin with VectorCsrService 
       api.vstart := api.vstartWrite.payload
     }
     api.vxsat setWhen(api.vxsatSet)
+
+    if (withAccessHold) {
+      val held = List(CSR.VXSAT, CSR.VCSR)
+      val status = CSR.MSTATUS :: (if (pp.p.withSupervisor) List(CSR.SSTATUS) else Nil)
+      cp.onRead(CsrListFilter(held), false) { when(api.accessHold) { cp.bus.read.doHalt(); api.accessHalted := True } }
+      cp.onWrite(CsrListFilter(held ++ status), false) { when(api.accessHold) { cp.bus.write.doHalt(); api.accessHalted := True } }
+      cp.onRead(CsrListFilter(held), true) { assert(!api.accessHold, "vxsat or vcsr read while vector instructions are outstanding") }
+      cp.onWrite(CsrListFilter(held ++ status), true) { assert(!api.accessHold, "vector or status CSR written while vector instructions are outstanding") }
+    }
 
     buildBefore.release()
 
