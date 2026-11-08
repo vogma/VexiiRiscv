@@ -28,6 +28,7 @@ import vexiiriscv.misc.{EmbeddedRiscvJtag, ImsicPlugin, PrivilegedPlugin, TrapPl
 import vexiiriscv.execute.vector.VectorPlugin
 import vexiiriscv.test.WhiteboxerPlugin
 import vexiiriscv.test.VectorReportSignals
+import vexiiriscv.test.VectorPerformanceSignals
 import vexiiriscv.regfile.RegFilePlugin
 import vexiiriscv.riscv.{IntRegFile, Riscv}
 import vexiiriscv.test.konata.Backend
@@ -64,7 +65,7 @@ class VectorSystemSignals(core: VexiiRiscv, plugin: VectorPlugin) extends Area {
   val vl = tap(core.host[vexiiriscv.execute.vector.VectorCsrService].vl)
 }
 
-class TestBenchDut(plugins : scala.collection.Seq[scala.collection.Seq[Hostable]]) extends Component {
+class TestBenchDut(plugins : scala.collection.Seq[scala.collection.Seq[Hostable]], vectorPerfTrace: Boolean = false) extends Component {
   val cores = plugins.map(VexiiRiscv(_))
 
   val signal = Fiber patch {
@@ -80,6 +81,12 @@ class TestBenchDut(plugins : scala.collection.Seq[scala.collection.Seq[Hostable]
   val vectorReports = Fiber patch {
     cores.map(core => core.rework { core.database on {
       core.host.get[VectorPlugin].map(plugin => new VectorReportSignals(plugin).setName("vectorReports"))
+    }})
+  }
+
+  val vectorPerformance = Fiber patch {
+    cores.map(core => core.rework { core.database on {
+      if(vectorPerfTrace) Some(new VectorPerformanceSignals(core.host[VectorPlugin]).setName("vectorPerformance")) else None
     }})
   }
 
@@ -201,14 +208,14 @@ object TestBench extends App {
     ret
   }
 
-  def makeDut(param : ParamSimple, cpuCount : Int): TestBenchDut = {
+  def makeDut(param : ParamSimple, cpuCount : Int, vectorPerfTrace: Boolean = false): TestBenchDut = {
     require(cpuCount >= 1, "cpuCount must be at least 1")
     if (cpuCount > 1) {
       require(param.fetchBus == FetchBusEnum.native, "Only native fetch bus supported multicore TestBench")
       require(param.lsuBus == LsuBusEnum.native, "Only native LSU bus supported multicore TestBench")
       if (param.lsuL1Enable) require(param.lsuL1Bus == LsuL1BusEnum.native, "Only native LSU L1 bus supported multicore TestBench")
     }
-    new TestBenchDut((0 until cpuCount).map(hartId => paramToPlugins(param, hartId * param.hartCount, cpuCount * param.hartCount)))
+    new TestBenchDut((0 until cpuCount).map(hartId => paramToPlugins(param, hartId * param.hartCount, cpuCount * param.hartCount)), vectorPerfTrace)
   }
 
   def doIt(param : ParamSimple = new ParamSimple()) {
@@ -239,7 +246,7 @@ object TestBench extends App {
 
     println(s"With Vexiiriscv parm :\n - ${param.getName()}")
     val compiled = TestBench.synchronized { // To avoid to many calls at the same time
-      simConfig.compile(makeDut(param, cpuCount))
+      simConfig.compile(makeDut(param, cpuCount, testOpt.vectorPerfTrace))
     }
     testOpt.test(compiled)
     Thread.sleep(10)
@@ -285,6 +292,7 @@ class TestOptions {
   var dbusBaseLatency = 0
   var seed = 2
   var vectorSystemTrace = false
+  var vectorPerfTrace = false
   var vectorDeferReports = -1
   var vectorDeferEarly = false
   var vectorDeferFault = ""
@@ -370,6 +378,8 @@ class TestOptions {
       .text("Schedule CLINT inputs during labelled vector interrupt tests.")
     opt[Unit]("vector-system-trace").action { (v, c) => vectorSystemTrace = true }
       .text("Record vector execution, retry and enabled interrupt events.")
+    opt[Unit]("vector-perf-trace").action { (v, c) => vectorPerfTrace = true }
+      .text("Record queued vector commands, execution and boundary waits (requires a vector queue).")
     opt[Int]("vector-defer-reports").validate(v => if(v >= 0 && v < Int.MaxValue) success else failure("vector report delay must be nonnegative and below Int.MaxValue"))
       .action { (v, c) => vectorDeferReports = v }
       .text("Delay tagged vector arithmetic reports by up to this many cycles, preserving FIFO order.")
@@ -688,6 +698,27 @@ class TestOptions {
       onSimEnd { out.close() }
     }
 
+
+    if(vectorPerfTrace) duts.cores.indices.foreach { i =>
+      val v = duts.vectorPerformance.get(i).get
+      val out = new PrintWriter(new File(currentTestPath(), s"vector-perf$i.csv"))
+      out.println("cycle,event,pc,tag,value")
+      var previous = -1
+      // Keep the same edge counter as the pipeline trace.
+      def event(name: String, tag: Int = -1, value: BigInt = 0): Unit =
+        out.println(s"${probes(i).cycle},$name,${v.pc.toBigInt.toString(16)},$tag,$value")
+      cd.onSamplings {
+        val state = v.state.toInt
+        if(state != previous) { event("state", value = BigInt(state)); previous = state }
+        if(v.complete.toBoolean) event("complete", v.completeTag.toInt)
+        if(v.accept.toBoolean) event("accept", v.acceptTag.toInt, v.instruction.toBigInt)
+        if(v.start.toBoolean) event("start", v.startTag.toInt, BigInt(v.startElement.toBoolean.toInt))
+        if(v.syncStart.toBoolean) event("sync_start")
+        if(v.syncDone.toBoolean) event("sync_done")
+        if(v.config.toBoolean) event("config")
+      }
+      onSimEnd { out.close() }
+    }
 
     val manager = IoDeviceManager()
 

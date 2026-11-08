@@ -98,7 +98,7 @@ object TestList {
     if (tests.exists(_._2.traceWave)) simConfig.withFstWave
     val withEvents = entries.exists(_.options.contains(LSU_EVENTS))
     val compiled = simConfig.compile {
-      val dut = TestBench.makeDut(param, 1)
+      val dut = TestBench.makeDut(param, 1, tests.exists(_._2.vectorPerfTrace))
       if (withEvents) LsuEventMonitor.publish(dut)
       dut
     }
