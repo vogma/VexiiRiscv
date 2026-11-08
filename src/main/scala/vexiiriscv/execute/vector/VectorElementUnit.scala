@@ -46,7 +46,7 @@ case class VectorElementCmd(p: VectorRegFileParam, xlen: Int) extends Bundle {
 // With ELEN 64 an active SEW-64 multiply takes three passes of the 33 x 33 multiplier, reading its element in each,
 // and the divider, iota counts, gather indices and permuted data are 64 bits wide.
 // vcpop and vfirst take one 64-bit mask word per cycle: read in t, mask in t+1, count and find in t+2.
-class VectorElementUnit(val p: VectorRegFileParam, val xlen: Int, val elen: Int = 32) extends Component {
+class VectorElementUnit(val p: VectorRegFileParam, val xlen: Int, val elen: Int = 32, val slides: Boolean = false) extends Component {
   require(p.dlen == 64 && p.readPorts >= 3)
   require(xlen == 32 || xlen == 64)
   require(elen == 32 || elen == 64)
@@ -341,7 +341,8 @@ class VectorElementUnit(val p: VectorRegFileParam, val xlen: Int, val elen: Int 
       U(1) -> rawIndex(15 downto 0).asUInt.resize(indexWidth), U(2) -> rawIndex(31 downto 0).asUInt.resize(indexWidth),
       default -> rawIndex.asUInt.resize(indexWidth)) else indexSew.mux(U(0) -> rawIndex(7 downto 0).asUInt.resize(xlen),
       U(1) -> rawIndex(15 downto 0).asUInt.resize(xlen), default -> rawIndex.asUInt.resize(xlen))
-    val offset = (vectorIndex ? selectedIndex | command.scalar.asUInt.resize(indexWidth)).resize(indexWidth + 1)
+    // With beat slides only vector-index gathers and compress remain here
+    val offset = (if (slides) selectedIndex.resize(indexWidth) else vectorIndex ? selectedIndex | command.scalar.asUInt.resize(indexWidth)).resize(indexWidth + 1)
     val source = UInt(indexWidth + 1 bits)
     val keep = Bool()
     val scalar = Bool()
@@ -349,10 +350,12 @@ class VectorElementUnit(val p: VectorRegFileParam, val xlen: Int, val elen: Int 
     keep := True
     scalar := False
     switch(command.op) {
-      spinal.core.is(VectorElementOp.SLIDEUP) { source := index1.resize(indexWidth + 1) - offset; keep := index1.resize(indexWidth + 1) >= offset }
-      spinal.core.is(VectorElementOp.SLIDEDOWN) { source := index1.resize(indexWidth + 1) + offset }
-      spinal.core.is(VectorElementOp.SLIDE1UP) { source := index1.resize(indexWidth + 1) - 1; scalar := index1 === 0 }
-      spinal.core.is(VectorElementOp.SLIDE1DOWN) { source := index1.resize(indexWidth + 1) + 1; scalar := index1.resize(offsetWidth) + 1 === command.vl }
+      if (!slides) {
+        spinal.core.is(VectorElementOp.SLIDEUP) { source := index1.resize(indexWidth + 1) - offset; keep := index1.resize(indexWidth + 1) >= offset }
+        spinal.core.is(VectorElementOp.SLIDEDOWN) { source := index1.resize(indexWidth + 1) + offset }
+        spinal.core.is(VectorElementOp.SLIDE1UP) { source := index1.resize(indexWidth + 1) - 1; scalar := index1 === 0 }
+        spinal.core.is(VectorElementOp.SLIDE1DOWN) { source := index1.resize(indexWidth + 1) + 1; scalar := index1.resize(offsetWidth) + 1 === command.vl }
+      }
       spinal.core.is(VectorElementOp.GATHER) { source := offset }
       spinal.core.is(VectorElementOp.GATHEREI16) { source := offset }
     }

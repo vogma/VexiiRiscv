@@ -69,10 +69,13 @@ object VectorShape {
   val REDUCE = 11
   val WREDUCE = 12
   val EXT8 = 13        // vs2 at SEW/8: step k reads byte k mod 8 of word k/8
+  // Permutes, with the beat slides option: step k writes word k from vs2 bytes at a constant distance, or from one element
+  val SLIDE = 14       // vslideup, vslidedown, vslide1up, vslide1down (norm:vslideup_op, norm:vslidedown_op)
+  val SPLAT = 15       // vrgather.vx/.vi: element idx of vs2 to every element (norm:vrgather-vx_vrgather-vi_op)
   def width = 4
 }
 
-case class VectorArithmeticCmd(p: VectorRegFileParam, xlen: Int) extends Bundle {
+case class VectorArithmeticCmd(p: VectorRegFileParam, xlen: Int, slides: Boolean = false) extends Bundle {
   val vd, vs1, vs2 = UInt(5 bits)
   val vl = UInt(log2Up(p.vlen) + 1 bits)
   val vstart = UInt(log2Up(p.vlen) bits)
@@ -85,6 +88,8 @@ case class VectorArithmeticCmd(p: VectorRegFileParam, xlen: Int) extends Bundle 
   val signed, saturate = Bool()
   val vxrm = Bits(2 bits)
   val nreg = UInt(4 bits) // WHOLE: 1, 2, 4 or 8 registers
+  val vlmax = slides generate UInt(log2Up(p.vlen) + 1 bits)
+  val slide = slides generate Bits(2 bits) // SLIDE: bit 0 down, bit 1 by one element with the scalar inserted
 }
 
 // Shape and op properties of a command, registered with it so the datapath does not decode them
@@ -131,12 +136,12 @@ object VectorArithmeticFlags {
 
 // One step per cycle: issue synchronous reads, compute in X1 and X2, then write the destination word with byte enables.
 // ELEN 64 adds 64-bit lanes (sew 3), one element per word.
-class VectorArithmetic(val p: VectorRegFileParam, val xlen: Int, val elen: Int = 32) extends Component {
+class VectorArithmetic(val p: VectorRegFileParam, val xlen: Int, val elen: Int = 32, val slides: Boolean = false) extends Component {
   require(p.dlen == 64 && p.readPorts >= 3)
   require(xlen == 32 || xlen == 64)
   require(elen == 32 || elen == 64)
   val io = new Bundle {
-    val cmd = slave(Flow(VectorArithmeticCmd(p, xlen)))
+    val cmd = slave(Flow(VectorArithmeticCmd(p, xlen, slides)))
     val reads = Vec.fill(3)(master(VrfReadPort(p)))
     val write = master(Flow(VrfWriteCmd(p)))
     val v0 = in Bits(p.vlen bits)
@@ -145,7 +150,7 @@ class VectorArithmetic(val p: VectorRegFileParam, val xlen: Int, val elen: Int =
     val result = out Bits(xlen bits)
   }
 
-  val command = Reg(VectorArithmeticCmd(p, xlen))
+  val command = Reg(VectorArithmeticCmd(p, xlen, slides))
   val flags = Reg(VectorArithmeticFlags())
   val scalarRead = flags.scalarRead
   val scalarWrite = flags.scalarWrite
@@ -269,6 +274,60 @@ class VectorArithmetic(val p: VectorRegFileParam, val xlen: Int, val elen: Int =
       when(folding) { fold := fold + 1 }
       when(last) { running := False }
     }
+  }
+
+  // SLIDE and SPLAT: step k reads the vs2 words holding source bytes 8k + D .. 8k + D + 7 on ports A and B, D the
+  // signed byte distance; SPLAT reads the word of element idx in every step. Source bytes outside VLMAX elements read zero.
+  val permute = slides generate new Area {
+    val w = log2Up(p.vlen) + 1
+    // The slide amount or index, clamped to VLMAX: any larger value acts like VLMAX (norm:vslidedown_op_src)
+    val amount = Reg(UInt(w bits))
+    val slide, splat, down, one = Reg(Bool()) init(False)
+    when(io.cmd.valid) {
+      val c = io.cmd.payload
+      val width = xlen max w
+      amount := (c.scalar.asUInt.resize(width) >= c.vlmax.resize(width)) ? c.vlmax | c.scalar.asUInt.resize(w)
+      slide := c.shape === VectorShape.SLIDE
+      splat := c.shape === VectorShape.SPLAT
+      down := c.slide(0)
+      one := c.slide(1)
+    }
+    val active = slide || splat
+    val groupBytes = (command.vlmax.resize(w + 3) << command.sew).resize(w + 3)
+    val distance = ((one ? U(1, w bits) | amount).resize(w + 3) << command.sew).resize(w + 3).asSInt.resize(w + 5)
+    val stepBytes = (step.resize(w + 3) << 3).resize(w + 4).asSInt.resize(w + 5)
+    val source = (splat ? S(0, w + 5 bits) | stepBytes) + ((down || splat) ? distance | -distance)
+    val wordA = source >> 3
+    val wordB = wordA + S(1, wordA.getWidth bits)
+    val rotate = source(2 downto 0).asUInt
+    def inGroup(byte: SInt): Bool = !byte.msb && byte.asUInt.resize(w + 5) < groupBytes.resize(w + 5)
+    val readA = inGroup((wordA << 3).resize(w + 5))
+    val readB = !splat && rotate =/= 0 && inGroup((wordB << 3).resize(w + 5))
+    val zeros, inserts = Bits(8 bits)
+    for (j <- 0 until 8) {
+      val element = (((step.resize(log2Up(p.vlen) + 3) << 3) + j) >> command.sew).resize(command.vl.getWidth)
+      zeros(j) := !inGroup(source + S(j, w + 5 bits))
+      // vslide1up writes the scalar to element 0, vslide1down to element vl - 1 (norm:vslide1down-vx_op)
+      inserts(j) := slide && one && (down ? (element + 1 === command.vl) | element === 0)
+      // vslideup leaves the elements below OFFSET undisturbed (norm:vslideup_op)
+      when(slide && !down && !one && element < amount) { issue.enables(j) := False }
+    }
+    when(active) {
+      io.reads(0).cmd.valid := issue.active && readA
+      io.reads(0).cmd.payload := word(command.vs2, wordA.asUInt.resize(step.getWidth))
+      io.reads(1).cmd.valid := issue.active && readB
+      io.reads(1).cmd.payload := word(command.vs2, wordB.asUInt.resize(step.getWidth))
+    }
+    // Reads stay inside the vs2 group
+    val groupWords = ((groupBytes + 7) >> 3).resize(p.addressWidth + 1)
+    for (port <- 0 to 1) assert(!(active && io.reads(port).cmd.valid &&
+      (io.reads(port).cmd.payload - word(command.vs2, U(0, 1 bits))).resize(p.addressWidth + 1) >= groupWords),
+      "vector permute read outside the vs2 group")
+    val x1Active = RegNext(issue.active && active) init(False)
+    val x1Splat = RegNext(splat)
+    val x1Rotate = RegNext(rotate)
+    val x1Zeros = RegNext(zeros)
+    val x1Inserts = RegNext(inserts)
   }
 
   // Adder, logic, overflow flags, min/max/merge select and extension on the read data
@@ -439,6 +498,17 @@ class VectorArithmetic(val p: VectorRegFileParam, val xlen: Int, val elen: Int =
       U(VectorAluOp.INDEX) -> ids,
       default -> sum
     )
+    // SLIDE and SPLAT: bytes rotate .. rotate + 7 of {B, A}, out-of-range bytes zero, then the scalar or the replicated element
+    val permuted = slides generate {
+      val rotated = ((io.reads(1).rsp ## io.reads(0).rsp) >> (permute.x1Rotate @@ U(0, 3 bits))).resize(64)
+      val clean = Bits(64 bits)
+      for (j <- 0 until 8) clean(j * 8, 8 bits) := permute.x1Inserts(j) ? scalarBeat(j * 8, 8 bits) |
+        (permute.x1Zeros(j) ? B(0, 8 bits) | rotated(j * 8, 8 bits))
+      val splatted = if (elen == 64) command.sew.mux(U(0) -> (clean(7 downto 0) #* 8), U(1) -> (clean(15 downto 0) #* 4),
+        U(2) -> (clean(31 downto 0) #* 2), default -> clean)
+        else command.sew.mux(U(0) -> (clean(7 downto 0) #* 8), U(1) -> (clean(15 downto 0) #* 4), default -> (clean(31 downto 0) #* 2))
+      permute.x1Splat ? splatted | clean
+    }
     // Mask prefix operations: one recurrence per mask word, counting only active source bits
     val scanFound = Reg(Bool())
     val scanEn = Bits(64 bits)
@@ -453,7 +523,10 @@ class VectorArithmetic(val p: VectorRegFileParam, val xlen: Int, val elen: Int =
     )
     val scanOutput = (!first && scanFound) ? B(0, 64 bits) | scanBits
     when(valid && maskScan) { scanFound := (!first && scanFound) || scanSource.orR }
-    val output = maskScan ? scanOutput | (whole ? a | ((ext2 || ext4 || ext8) ? extended | data))
+    val output = {
+      val base = maskScan ? scanOutput | (whole ? a | ((ext2 || ext4 || ext8) ? extended | data))
+      if (slides) permute.x1Active ? permuted | base else base
+    }
     when(valid && reduce) { partial := data }
     val negative = Bits(8 bits)
     for (j <- 0 until 8) negative(j) := a(j * 8 + 7)

@@ -72,7 +72,7 @@ case class VectorMemoryDescriptor(indexWidth : Int, split : Boolean = false, bea
  * it retires there and runs later. Every reader of its results waits until nothing is outstanding.
  */
 class VectorPlugin(val layer : LaneLayer, val dlen : Int = 64, var withMemory : Boolean = true, val elen : Int = 32,
-                   val queueDepth : Int = 0) extends FiberPlugin with InitService {
+                   val queueDepth : Int = 0, val beatSlides : Boolean = false) extends FiberPlugin with InitService {
   require(elen == 32 || elen == 64)
   require(queueDepth >= 0 && queueDepth <= 4)
   override def initHold(): Bool = regFile.vrf.io.initHold
@@ -135,7 +135,7 @@ class VectorPlugin(val layer : LaneLayer, val dlen : Int = 64, var withMemory : 
     for (key <- List(EMUL_VD, EMUL_VS1, EMUL_VS2)) elp.setDecodingDefault(key, U(VectorEmul.NONE, VectorEmul.width bits))
     for (key <- checks) elp.setDecodingDefault(key, False)
     ds.addMicroOpDecodingDefault(VECTOR, False)
-    if (elen == 64) elp.setDecodingDefault(UNSIGNED_IMMEDIATE, False)
+    if (elen == 64 || beatSlides) elp.setDecodingDefault(UNSIGNED_IMMEDIATE, False)
     val shiftNames = Set("vsll", "vsrl", "vsra", "vssrl", "vssra", "vnsrl", "vnsra", "vnclipu", "vnclip")
 
     val wb = ifp.access(1)
@@ -302,12 +302,16 @@ class VectorPlugin(val layer : LaneLayer, val dlen : Int = 64, var withMemory : 
       val compress = name == "vcompress"
       val vector = form == "vv"
       val disjoint = gather || compress || name == "vslideup" || name == "vslide1up"
-      add(Rvv.all(s"$name.$form"), ELEMENT -> True, ELEMENT_OP -> U(op, VectorElementOp.width bits),
+      // With beat slides, slides and scalar-index gathers run in the beat unit, immediates zero-extended
+      val beat = beatSlides && (name.startsWith("vslide") || name == "vrgather" && !vector)
+      val spec = add(Rvv.all(s"$name.$form"), ELEMENT -> Bool(!beat), ELEMENT_OP -> U(op, VectorElementOp.width bits),
         SCALAR_OPERAND -> Bool(!vector && !compress), IMMEDIATE -> Bool(form == "vi"),
         CHECK_VILL -> True, CHECK_VSTART -> True, EMUL_VD -> emul(VectorEmul.L), EMUL_VS2 -> emul(VectorEmul.L),
         EMUL_VS1 -> emul(if (name == "vrgatherei16") VectorEmul.INDEX16 else if (vector) VectorEmul.L else VectorEmul.NONE),
         MASK_NOT_V0 -> True, OVERLAP_VS2 -> overlap(if (disjoint) VectorOverlap.DISJOINT else VectorOverlap.ANY),
         OVERLAP_VS1 -> overlap(if (vector || compress) VectorOverlap.DISJOINT else VectorOverlap.ANY))
+      if (beat) spec.addDecoding(ARITH -> True, SHAPE -> shape(if (gather) VectorShape.SPLAT else VectorShape.SLIDE),
+        UNSIGNED_IMMEDIATE -> Bool(form == "vi"))
     }
     add(Rvv.all("vmv.x.s"), ARITH -> True, SHAPE -> shape(VectorShape.SCALAR_READ), CHECK_VILL -> True, CHECK_VSTART -> True)
     add(Rvv.all("vmv.s.x"), ARITH -> True, ALU_OP -> alu(VectorAluOp.MOVE),
@@ -333,8 +337,8 @@ class VectorPlugin(val layer : LaneLayer, val dlen : Int = 64, var withMemory : 
     val vlen = vcs.vlen
     val vlWidth = vcs.vlWidth
     val vrf = regFile.vrf
-    val arithmetic = new VectorArithmetic(vrf.p, XLEN, elen)
-    val element = new VectorElementUnit(vrf.p, XLEN, elen)
+    val arithmetic = new VectorArithmetic(vrf.p, XLEN, elen, beatSlides)
+    val element = new VectorElementUnit(vrf.p, XLEN, elen, beatSlides)
     vrf.io.write := arithmetic.io.write
     when(element.io.busy) { vrf.io.write := element.io.write }
     arithmetic.io.v0 := vrf.io.v0
@@ -557,14 +561,14 @@ class VectorPlugin(val layer : LaneLayer, val dlen : Int = 64, var withMemory : 
 
       val decoupled = queueDepth > 0
       val queue = decoupled generate new Area {
-        val q = new VectorQueue(vrf.p, XLEN, queueDepth)
+        val q = new VectorQueue(vrf.p, XLEN, queueDepth, beatSlides)
         val pp = host[PrivilegedPlugin]
         val forceSync = if (pp.p.withDebug) pp.logic.harts(0).debugMode || pp.logic.harts(0).debug.dcsr.step else False
         // Everything without a scalar result; in debug mode or while stepping, everything runs synchronously
         val queued = (ARITH && SHAPE =/= VectorShape.SCALAR_READ ||
           ELEMENT && ELEMENT_OP =/= VectorElementOp.CPOP && ELEMENT_OP =/= VectorElementOp.FIRST) && !forceSync
         val accept = fire && queued
-        val e0Arith = Flow(VectorArithmeticCmd(vrf.p, XLEN))
+        val e0Arith = Flow(VectorArithmeticCmd(vrf.p, XLEN, beatSlides))
         val e0Element = Flow(VectorElementCmd(vrf.p, XLEN))
         q.push.valid := accept
         q.push.element := ELEMENT
@@ -592,7 +596,7 @@ class VectorPlugin(val layer : LaneLayer, val dlen : Int = 64, var withMemory : 
         armCmd.sew := vtype.vsew.resized
         armCmd.shape := SHAPE
         armCmd.op := ALU_OP
-        armCmd.scalar := IMMEDIATE ? (if (elen == 64) UNSIGNED_IMMEDIATE ? Decode.UOP(Const.rs1Range).resize(XLEN) |
+        armCmd.scalar := IMMEDIATE ? (if (elen == 64 || beatSlides) UNSIGNED_IMMEDIATE ? Decode.UOP(Const.rs1Range).resize(XLEN) |
           Decode.UOP(Const.rs1Range).asSInt.resize(XLEN).asBits else Decode.UOP(Const.rs1Range).asSInt.resize(XLEN).asBits) | up(elp(IntRegFile, RS1))
         armCmd.scalarOperand := SCALAR_OPERAND
         armCmd.unmasked := vm
@@ -601,6 +605,11 @@ class VectorPlugin(val layer : LaneLayer, val dlen : Int = 64, var withMemory : 
         armCmd.saturate := SATURATE
         armCmd.vxrm := vcs.vxrm
         armCmd.nreg := Decode.UOP(17 downto 15).asUInt.resize(4) + 1
+        if (beatSlides) {
+          armCmd.vlmax := vlmaxOf(vtype.vsew, vtype.vlmul)
+          // funct6 bit 0 selects down; the OPMVX forms are vslide1up and vslide1down
+          armCmd.slide := (Decode.UOP(Const.funct3Range) === B"110") ## Decode.UOP(26)
+        }
         elemCmd.valid := sel && ELEMENT && !legality.illegal && !started
         elemCmd.vd := vd
         elemCmd.vs1 := vs1

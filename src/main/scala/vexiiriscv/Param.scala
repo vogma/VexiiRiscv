@@ -190,6 +190,7 @@ class ParamSimple() {
   var vectorDlen = 64
   var vectorBeatMemory = true
   var vectorQueue = 0
+  var vectorBeatSlides = false
   var narrowIoWindow = false
   val prefetcherRptParam = new PrefetcherRptParam()
 
@@ -620,6 +621,7 @@ class ParamSimple() {
     if (extension.withDiv) r += s"d${divRadix}${divImpl}${if(divArea)"Area" else ""}"
     if (extension.withZve32x) r += s"vd${vectorDlen}"
     if (extension.withZve32x && vectorQueue > 0) r += s"vq${vectorQueue}"
+    if (extension.withZve32x && vectorBeatSlides) r += "vbs"
     if (privParam.withImsic) r += s"if${privParam.imsicInterrupts}gf${privParam.guestExternalInterruptFiles}"
     if (privParam.withDebug) r += s"pdbg"
     if (privParam.withExternalInterrupt) r += "nei"
@@ -922,6 +924,8 @@ class ParamSimple() {
       .text("Queue vector arithmetic without a scalar result and let it finish after it retires; depth 1 unless --vector-queue.")
     opt[Int]("vector-queue").action { (v, c) => vectorQueue = v }
       .text("Set the vector arithmetic queue depth (1 to 4) and enable the queue; 0 (the default) keeps vector instructions synchronous.")
+    opt[Unit]("vector-beat-slides").action { (v, c) => vectorBeatSlides = true }
+      .text("Run vslide* and vrgather.vx/.vi in the beat unit, one destination word per cycle.")
     opt[Unit]("narrow-io-window").action { (v, c) => narrowIoWindow = true }
       .text("TestBench only: the IO window 0x10021000-0x10021FFF takes accesses of at most 4 bytes.")
     opt[Unit]("dual-issue").action { (v, c) =>
@@ -1436,7 +1440,8 @@ class ParamSimple() {
     // Vector
     if (extension.withZve32x) {
       plugins += new execute.vector.VectorCsrPlugin(vlen = vlen, withAccessHold = vectorQueue > 0)
-      plugins += new execute.vector.VectorPlugin(early0, dlen = vectorDlen, elen = if (extension.withZve64x) 64 else 32, queueDepth = vectorQueue)
+      plugins += new execute.vector.VectorPlugin(early0, dlen = vectorDlen, elen = if (extension.withZve64x) 64 else 32, queueDepth = vectorQueue,
+        beatSlides = vectorBeatSlides)
     }
 
     plugins += new WhiteboxerPlugin(
