@@ -136,9 +136,10 @@ object VectorArithmeticFlags {
 }
 
 // One step per cycle: issue synchronous reads, compute in X1 and X2, then write the destination word with byte enables.
-// ELEN 64 adds 64-bit lanes (sew 3), one element per word.
+// ELEN 64 adds 64-bit lanes (sew 3), one element per word. With overlap a command may start while the previous one's
+// steps are still in X1 and later; each stage then works from its own copy of the command.
 class VectorArithmetic(val p: VectorRegFileParam, val xlen: Int, val elen: Int = 32, val slides: Boolean = false,
-                        val beatCompress: Boolean = false) extends Component {
+                        val beatCompress: Boolean = false, val overlap: Boolean = false, val tagWidth: Int = 3) extends Component {
   require(p.dlen == 64 && p.readPorts >= 3)
   require(!beatCompress || slides)
   require(xlen == 32 || xlen == 64)
@@ -151,6 +152,9 @@ class VectorArithmetic(val p: VectorRegFileParam, val xlen: Int, val elen: Int =
     val busy, done = out Bool()
     val saturated = out Bool() // an active element saturated; holds from done until the next command
     val result = out Bits(xlen bits)
+    val ready = overlap generate (out Bool()) // a command may start this cycle
+    val tag = overlap generate (in UInt(tagWidth bits)) // taken with the command
+    val writeTag, doneTag = overlap generate (out UInt(tagWidth bits)) // the command of io.write and of io.done
   }
 
   val command = Reg(VectorArithmeticCmd(p, xlen, slides, beatCompress))
@@ -187,25 +191,27 @@ class VectorArithmetic(val p: VectorRegFileParam, val xlen: Int, val elen: Int =
   val result = Reg(Bits(xlen bits))
   io.result := result
   io.busy := busy
-  io.saturated := saturated
+  if (!overlap) io.saturated := saturated
+  // The command of a step one stage later
+  def stage[T <: Data](that: T): T = if (overlap) RegNext(that) else that
 
   def word(reg: UInt, index: UInt): UInt = ((reg.resize(p.addressWidth) << p.beatWidth) + index).resize(p.addressWidth)
   // Most significant byte of the lane holding byte j
-  def topOf(j: Int): UInt = if (elen == 64)
+  def topOf(j: Int, laneSew: UInt = laneSew): UInt = if (elen == 64)
     laneSew.mux(U(0) -> U(j, 3 bits), U(1) -> U(j | 1, 3 bits), U(2) -> U(j | 3, 3 bits), default -> U(7, 3 bits))
   else laneSew.mux(U(0) -> U(j, 3 bits), U(1) -> U(j | 1, 3 bits), default -> U(j | 3, 3 bits))
   // Byte j is the least significant byte of its lane
-  def boundary(j: Int): Bool = if (elen == 64) {
+  def boundary(j: Int, laneSew: UInt): Bool = if (elen == 64) {
     if (j == 0) True else if (j == 4) laneSew =/= 3 else if (j % 2 == 0) laneSew <= 1 else laneSew === 0
   } else if (j % 4 == 0) True else if (j % 2 == 0) laneSew =/= 2 else laneSew === 0
   // a + b per lane on one carry chain, with a guard bit below each byte: (1, 0) passes the carry of the byte
   // below, (c, c) starts a lane with carry-in c. Returns the sum and the carry out of each byte.
-  def laneAdd(a: Bits, b: Bits, carryIn: Bits): (Bits, Bits) = {
+  def laneAdd(a: Bits, b: Bits, carryIn: Bits, laneSew: UInt): (Bits, Bits) = {
     def spread(bytes: Bits, guards: Bits): UInt = Cat((0 until 8).map(j => bytes(j * 8, 8 bits) ## guards(j))).asUInt
     val guardA, guardB = Bits(8 bits)
     for (j <- 0 until 8) {
-      guardA(j) := !boundary(j) || carryIn(j)
-      guardB(j) := boundary(j) && carryIn(j)
+      guardA(j) := !boundary(j, laneSew) || carryIn(j)
+      guardB(j) := boundary(j, laneSew) && carryIn(j)
     }
     val total = spread(a, guardA).resize(73) + spread(b, guardB).resize(73)
     val sumOut = Bits(64 bits)
@@ -213,21 +219,26 @@ class VectorArithmetic(val p: VectorRegFileParam, val xlen: Int, val elen: Int =
     for (j <- 0 until 8) {
       sumOut(j * 8, 8 bits) := total(j * 9 + 1, 8 bits).asBits
       // A passing guard sums to the inverted carry, a starting one to the carry itself
-      carryOut(j) := (if (j == 7) total(72) else boundary(j + 1) === total((j + 1) * 9))
+      carryOut(j) := (if (j == 7) total(72) else boundary(j + 1, laneSew) === total((j + 1) * 9))
     }
     (sumOut, carryOut)
   }
 
-  when(io.cmd.valid) {
-    command := io.cmd.payload
-    flags := VectorArithmeticFlags(io.cmd.payload, elen)
-    running := True
-    busy := True
-    saturated := False
-    step := 0
-    folding := False
-    fold := 0
+  def startCommand(): Unit = {
+    when(io.cmd.valid) {
+      command := io.cmd.payload
+      flags := VectorArithmeticFlags(io.cmd.payload, elen)
+      running := True
+      if (!overlap) {
+        busy := True
+        saturated := False
+      }
+      step := 0
+      folding := False
+      fold := 0
+    }
   }
+  if (!overlap) startCommand()
 
   val issue = new Area {
     val enables, selects = Bits(8 bits) // selects: v0 bit of the element holding each byte
@@ -278,6 +289,10 @@ class VectorArithmetic(val p: VectorRegFileParam, val xlen: Int, val elen: Int =
       when(last) { running := False }
     }
   }
+
+  // A new command overrides the end of the previous one in issue
+  if (overlap) startCommand()
+  if (overlap) io.ready := !running || issue.last
 
   // SLIDE and SPLAT: step k reads the vs2 words holding source bytes 8k + D .. 8k + D + 7 on ports A and B, D the
   // signed byte distance; SPLAT reads the word of element idx in every step. Source bytes outside VLMAX elements read zero.
@@ -335,10 +350,17 @@ class VectorArithmetic(val p: VectorRegFileParam, val xlen: Int, val elen: Int =
 
   // Adder, logic, overflow flags, min/max/merge select and extension on the read data
   val x1 = new Area {
+    val command = stage(VectorArithmetic.this.command)
+    val flags = stage(VectorArithmetic.this.flags)
+    val (reduce, wreduce, wideVv, widening, narrow) = (flags.reduce, flags.wreduce, flags.wideVv, flags.widening, flags.narrow)
+    val (ext2, ext4, ext8, whole, maskScan) = (flags.ext2, flags.ext4, flags.ext8, flags.whole, flags.maskScan)
+    val (scalarRead, subtract, average, laneSew) = (flags.scalarRead, flags.subtract, flags.average, flags.laneSew)
+    val begin = overlap generate (RegNext(running && step === 0 && !folding) init(False))
     val valid = RegNext(issue.active) init(False)
     val last = RegNext(issue.last) init(False)
-    val address = RegNext(word(command.vd, maskDst ? issue.maskWord.resize(step.getWidth) |
-      (reduce ? U(0, step.getWidth bits) | issue.dstWord)))
+    // Registered from issue, with the issuing command
+    val address = RegNext(word(VectorArithmetic.this.command.vd, VectorArithmetic.this.maskDst ? issue.maskWord.resize(step.getWidth) |
+      (VectorArithmetic.this.reduce ? U(0, step.getWidth bits) | issue.dstWord)))
     val mask = RegNext(issue.enables)
     val selects = RegNext(issue.selects)
     val part = RegNext(step(log2Up(elen / 16) downto 0))
@@ -381,7 +403,7 @@ class VectorArithmetic(val p: VectorRegFileParam, val xlen: Int, val elen: Int =
     // INT_MIN for max (norm:vredsum_vredmaxu_vredmax_vredminu_vredmin_vredand_vredor_vredxor_op)
     val identity = Bits(64 bits)
     for (j <- 0 until 8) {
-      val top = topOf(j) === U(j, 3 bits)
+      val top = topOf(j, laneSew) === U(j, 3 bits)
       identity(j * 8, 8 bits) := command.op.mux(
         U(VectorAluOp.AND) -> B"xff",
         U(VectorAluOp.MIN) -> (command.signed ? (top ? B"x7f" | B"xff") | B"xff"),
@@ -411,7 +433,7 @@ class VectorArithmetic(val p: VectorRegFileParam, val xlen: Int, val elen: Int =
     // Carry-in, or borrow-in for subtraction, of each lane from v0 (norm:vadc_vsbc_op)
     val carryIn = Bits(8 bits)
     for (j <- 0 until 8) carryIn(j) := subtract ^ (command.maskData && selects(j))
-    val (sum, carries) = laneAdd(left, rhs, carryIn)
+    val (sum, carries) = laneAdd(left, rhs, carryIn, laneSew)
     // Per byte, meaningful at the most significant byte of each element: the result does not fit SEW bits
     val overflow = Bits(8 bits)
     // Unsigned or signed vs2 < vs1, meaningful at the most significant byte of each element
@@ -432,7 +454,7 @@ class VectorArithmetic(val p: VectorRegFileParam, val xlen: Int, val elen: Int =
     val amounts = average ? one | b
     val selected = Bits(64 bits)
     for (j <- 0 until 8) {
-      val takeA = flags.min === less(topOf(j))
+      val takeA = flags.min === less(topOf(j, laneSew))
       val takeB = flags.merge ? selects(j) | !takeA
       selected(j * 8, 8 bits) := takeB ? b(j * 8, 8 bits) | a(j * 8, 8 bits)
     }
@@ -553,6 +575,12 @@ class VectorArithmetic(val p: VectorRegFileParam, val xlen: Int, val elen: Int =
 
   // Shifts with rounding (norm:vssrl_vssra_op), saturation (norm:vsaddu_vsadd_vssubu_vssub_op_overflow_vxsat_op_vsaddsub), mask merging
   val x2 = new Area {
+    val command = stage(x1.command)
+    val flags = stage(x1.flags)
+    val (average, rounding, shift, laneSew, subtract) = (flags.average, flags.rounding, flags.shift, flags.laneSew, flags.subtract)
+    val (narrow, maskDst, maskMm, maskScan) = (flags.narrow, flags.maskDst, flags.maskMm, flags.maskScan)
+    val (scalarRead, reduce) = (flags.scalarRead, flags.reduce)
+    val begin = overlap generate (RegNext(x1.begin) init(False))
     val valid = RegNext(x1.valid) init(False)
     val last = RegNext(x1.last) init(False)
     val address = RegNext(x1.address)
@@ -576,7 +604,7 @@ class VectorArithmetic(val p: VectorRegFileParam, val xlen: Int, val elen: Int =
     def lane(i: Int, w: Int) = i - i % w
     // Averaging shifts in bit SEW of the exact result (norm:vaaddu_vaadd_vasubu_vasub_op)
     val fill = Bits(64 bits)
-    for (i <- 0 until 64) fill(i) := average ? upper(topOf(i / 8)) | command.signed && (if (elen == 64) laneSew.mux(
+    for (i <- 0 until 64) fill(i) := average ? upper(topOf(i / 8, laneSew)) | command.signed && (if (elen == 64) laneSew.mux(
       U(0) -> data(lane(i, 8) + 7), U(1) -> data(lane(i, 16) + 15), U(2) -> data(lane(i, 32) + 31), default -> data(63))
       else laneSew.mux(U(0) -> data(lane(i, 8) + 7), U(1) -> data(lane(i, 16) + 15), default -> data(lane(i, 32) + 31)))
     val stages = ArrayBuffer(data)
@@ -617,13 +645,13 @@ class VectorArithmetic(val p: VectorRegFileParam, val xlen: Int, val elen: Int =
     }
     val increment = rounding ? (if (elen == 64) laneSew.mux(U(0) -> increments(8), U(1) -> increments(16), U(2) -> increments(32),
       default -> increments(64)) else laneSew.mux(U(0) -> increments(8), U(1) -> increments(16), default -> increments(32))) | B(0, 8 bits)
-    val rounded = laneAdd(stages.last, B(0, 64 bits), increment)._1
+    val rounded = laneAdd(stages.last, B(0, 64 bits), increment, laneSew)._1
     val base = shift ? rounded | data
 
     val clipped = Bits(8 bits)
     val value = Bits(64 bits)
     for (j <- 0 until 8) {
-      val top = topOf(j)
+      val top = topOf(j, laneSew)
       val upper = top === U(j, 3 bits)
       val signedLimit = negative(top) ? (upper ? B"x80" | B"x00") | (upper ? B"x7f" | B"xff")
       clipped(j) := command.saturate && overflow(top)
@@ -652,7 +680,15 @@ class VectorArithmetic(val p: VectorRegFileParam, val xlen: Int, val elen: Int =
         command.sew.mux(U(0) -> clips8, U(1) -> clips16, default -> clips32))
     } else ((command.sew === 0) ? packed8 | packed16, (command.sew === 0) ? clips8 | clips16)
     // Only active elements set vxsat; their bytes are the enabled ones, in the written half for narrowing
-    when(valid && ((narrow ? (narrowClips ## narrowClips) | clipped) & mask).orR) { saturated := True }
+    def saturating = valid && ((narrow ? (narrowClips ## narrowClips) | clipped) & mask).orR
+    if (!overlap) when(saturating) { saturated := True }
+    // Per command: the saturation of its steps so far, and of the whole command at its last step
+    val sticky = overlap generate new Area {
+      val seen = RegInit(False)
+      val sofar = !begin && seen || saturating
+      seen := sofar
+      val total = RegNextWhen(sofar, last) init(False)
+    }
 
     // MASK_DST: the accumulator starts from the old word at a word's first step and takes active bits only
     val accumulator = Reg(Bits(64 bits))
@@ -754,12 +790,12 @@ class VectorArithmetic(val p: VectorRegFileParam, val xlen: Int, val elen: Int =
 
   val writeback = new Area {
     def packed[T <: Data](compressed: => T, other: T): T = if (beatCompress) pack.active ? compressed | other else other
-    val valid = RegNext(packed(pack.write, x2.valid && !scalarRead && x2.wordLast)) init(False)
+    val valid = RegNext(packed(pack.write, x2.valid && !x2.scalarRead && x2.wordLast)) init(False)
     val last = RegNext(packed(pack.last, x2.last)) init(False)
     val address = RegNext(packed(pack.writeAddress, x2.address))
     // Reductions write element 0 only; the rest of vd is tail (norm:vreduction_tail_policy)
-    val elementZero = Vec((0 until 8).map(j => (U(j, 3 bits) >> laneSew) === 0)).asBits
-    val mask = RegNext(packed(pack.writeMask, (maskDst || maskMm) ? B(0xff, 8 bits) | (reduce ? elementZero | x2.mask)))
+    val elementZero = Vec((0 until 8).map(j => (U(j, 3 bits) >> x2.laneSew) === 0)).asBits
+    val mask = RegNext(packed(pack.writeMask, (x2.maskDst || x2.maskMm) ? B(0xff, 8 bits) | (x2.reduce ? elementZero | x2.mask)))
     val data = RegNext(packed(pack.writeData, x2.output))
     io.write.valid := valid
     io.write.address := address
@@ -769,5 +805,22 @@ class VectorArithmetic(val p: VectorRegFileParam, val xlen: Int, val elen: Int =
 
   // The VRF holds every written word when done rises
   io.done := RegNext(writeback.last) init(False)
-  when(io.done) { busy := False }
+  if (!overlap) when(io.done) { busy := False }
+
+  // Commands in the unit, from their command to their done; tags and saturation travel with the steps
+  val lifecycle = overlap generate new Area {
+    val inUnit = Reg(UInt(3 bits)) init(0)
+    val inUnitNext = inUnit + U(io.cmd.valid).resized - U(io.done).resized
+    inUnit := inUnitNext
+    busy := inUnitNext =/= 0
+    val issueTag = RegNextWhen(io.tag, io.cmd.valid) init(0)
+    val x1Tag = RegNext(issueTag) init(0)
+    val x2Tag = RegNext(x1Tag) init(0)
+    val writeTag = RegNext(x2Tag) init(0)
+    io.writeTag := writeTag
+    io.doneTag := RegNextWhen(writeTag, writeback.last) init(0)
+    io.saturated := RegNextWhen(x2.sticky.total, writeback.last) init(False)
+    assert(!(inUnit === 0 && io.done), "vector beat unit done without a command")
+    assert(!(io.cmd.valid && !io.ready), "vector beat command while the unit is not ready")
+  }
 }

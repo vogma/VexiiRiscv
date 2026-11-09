@@ -73,6 +73,8 @@ class VexiiRiscvProbe(cpu : VexiiRiscv, kb : Option[konata.Backend], var withRvl
   var vectorDeferFault = ""
   // A vector arithmetic queue in the RTL: its accepted instructions report their effects by tag after the commit
   val vectorQueue = cpu.host.get[VectorPlugin].exists(_.queueDepth > 0)
+  // Unfenced vector uops may set VS Dirty while older uops are in flight: report it with the owning uop's commit
+  val vectorVsAtCommit = cpu.host.get[VectorPlugin].exists(_.noFence)
   def withVectorDeferral = vectorDeferReports >= 0 || vectorDeferEarly || vectorQueue
   def vectorIdle = vwb.forall(v => v.queueIdle == null || v.queueIdle.toBoolean)
   // Cycles in which each queue coverage event of the RTL was seen
@@ -271,11 +273,15 @@ class VexiiRiscvProbe(cpu : VexiiRiscv, kb : Option[konata.Backend], var withRvl
 
     val pendingTraps = mutable.Queue[(Boolean, Int, Int, Long, Long)]()
     var vs = 0 // mstatus.VS reset value
+    var vsDirtyPending = false // a uop that set VS Dirty has not retired yet
     var lastTrapInstruction = -1l
     var vectorRecord: VectorRecord = null
     val vectorStores = mutable.Map[Int, VectorAccess]()
     val liveVectorStoreIds = mutable.Set[Int]()
     lazy val vectorReports = new VectorTraceBuffer(hartId, () => backends.toVector, math.max(0, vectorDeferReports), 0x564543L + hartId, vectorDeferFault)
+
+    // The trace tag of each RTL queue tag, set when the RTL accepts the instruction
+    val vectorRtlTags = Array.fill(8)(-1)
 
     def vectorTag(uop: MicroOpCtx): Int = {
       if(uop.vectorTag == -1) uop.vectorTag = vectorReports.accept()
@@ -427,6 +433,7 @@ class VexiiRiscvProbe(cpu : VexiiRiscv, kb : Option[konata.Backend], var withRvl
 
     var vectorValid = false
     var vectorTag = -1
+    var vectorDirty = false
     var vectorVxsat = 0
     val vectorCsrWrites = ArrayBuffer[(Int, Long)]() // Implicit vl, vtype, vstart updates
     val vectorWrites = ArrayBuffer[(Int, Array[Byte], Array[Byte])]()
@@ -509,6 +516,7 @@ class VexiiRiscvProbe(cpu : VexiiRiscv, kb : Option[konata.Backend], var withRvl
       lsuAmo = false
       vectorValid = false
       vectorTag = -1
+      vectorDirty = false
       vectorVxsat = 0
       vectorCsrWrites.clear()
       vectorWrites.clear()
@@ -689,7 +697,9 @@ class VexiiRiscvProbe(cpu : VexiiRiscv, kb : Option[konata.Backend], var withRvl
         val hart = harts(0)
         val uop = hart.microOp(v.uopId.toInt)
         require(uop.vectorTag == -1, "vector instruction accepted twice")
-        require(hart.vectorTag(uop) == v.queueAcceptTag.toInt, "vector queue tag differs from the accept order")
+        val tag = hart.vectorTag(uop)
+        require((tag & 7) == v.queueAcceptTag.toInt, "vector queue tag differs from the accept order")
+        hart.vectorRtlTags(v.queueAcceptTag.toInt) = tag
       }
       if(vectorDeferEarly && vectorReportSignals.get.unitStart.toBoolean) {
         val hart = harts(0)
@@ -713,7 +723,7 @@ class VexiiRiscvProbe(cpu : VexiiRiscv, kb : Option[konata.Backend], var withRvl
           val hart = harts(0)
           val uop = hart.microOp(v.uopId.toInt)
           if(vectorQueue && v.queueRunning.toBoolean) {
-            hart.vectorReports.write(v.queueRunningTag.toInt, reg, mask, write._3)
+            hart.vectorReports.write(hart.vectorRtlTags(v.queueWriteTag.toInt), reg, mask, write._3)
           } else if(vectorDeferEarly && VectorTraceBuffer.queued(uop.instruction)) {
             hart.vectorReports.write(hart.vectorTag(uop), reg, mask, write._3)
           } else uop.vectorWrites += write
@@ -727,7 +737,7 @@ class VexiiRiscvProbe(cpu : VexiiRiscv, kb : Option[konata.Backend], var withRvl
         }
       }
       if(vectorQueue && v.queueComplete.toBoolean) {
-        harts(0).vectorReports.complete(v.queueRunningTag.toInt, (v.vxsat.toBoolean || v.vxsatSet.toBoolean).toInt)
+        harts(0).vectorReports.complete(harts(0).vectorRtlTags(v.queueRunningTag.toInt), (v.vxsat.toBoolean || v.vxsatSet.toBoolean).toInt)
       }
       if (v.fire.toBoolean) {
         val uop = harts(0).microOp(v.uopId.toInt)
@@ -749,12 +759,16 @@ class VexiiRiscvProbe(cpu : VexiiRiscv, kb : Option[konata.Backend], var withRvl
         val hart = harts(0)
         hart.openVector(hart.microOp(v.memoryUopId.toInt)).config = Some((v.configVl.toLong, v.configVtype.toLong))
       }
-      // VS only changes under the oldest instruction in flight, before its commit
+      // VS changes under the oldest instruction in flight, before its commit, except a Dirty set by an unfenced uop
       val hart = harts(0)
+      if (vectorVsAtCommit && v.vsDirtyUop.toBoolean && hart.vs != 3 && !hart.vsDirtyPending) {
+        hart.microOp(v.uopId.toInt).vectorDirty = true
+        hart.vsDirtyPending = true
+      }
       val vs = v.vs.toInt
       if (vs != hart.vs) {
         hart.vs = vs
-        backends.foreach(_.writeVs(hart.hartId, vs))
+        if (!(vs == 3 && hart.vsDirtyPending)) backends.foreach(_.writeVs(hart.hartId, vs))
       }
     }
 
@@ -917,9 +931,13 @@ class VexiiRiscvProbe(cpu : VexiiRiscv, kb : Option[konata.Backend], var withRvl
         if(withVectorDeferral && uop.didCommit) {
           val config = (uop.instruction & 0x707F) == 0x7057
           val vectorObserver = isVectorInstruction(uop.instruction) && !config && !deferred
-          if(vectorObserver || uop.csrValid && VectorTraceBuffer.csrObserver(uop.csrAddress, uop.csrWriteDone)) hart.vectorReports.drain()
+          if(vectorObserver || uop.csrValid && VectorTraceBuffer.csrObserver(uop.csrAddress, uop.csrWriteDone)) hart.vectorReports.drain(committedOnly = true)
         }
         for (io <- uop.ioAccesses) backends.foreach(_.ioAccess(hartId, io))
+        if (uop.vectorDirty) {
+          backends.foreach(_.writeVs(hartId, 3))
+          hart.vsDirtyPending = false
+        }
         if (uop.spawned) {
           val fetch = hart.fetch(uop.fetchId)
           val decode = hart.decode(uop.decodeId)

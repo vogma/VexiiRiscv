@@ -192,6 +192,9 @@ class ParamSimple() {
   var vectorQueue = 0
   var vectorBeatSlides = false
   var vectorBeatCompress = false
+  var vectorOverlap = false
+  var vectorNoFence = false
+  var vectorTrapE0 = false
   var narrowIoWindow = false
   val prefetcherRptParam = new PrefetcherRptParam()
 
@@ -624,6 +627,9 @@ class ParamSimple() {
     if (extension.withZve32x && vectorQueue > 0) r += s"vq${vectorQueue}"
     if (extension.withZve32x && vectorBeatSlides) r += "vbs"
     if (extension.withZve32x && vectorBeatCompress) r += "vbc"
+    if (extension.withZve32x && vectorOverlap) r += "vov"
+    if (extension.withZve32x && vectorNoFence) r += "vnf"
+    if (extension.withZve32x && vectorTrapE0) r += "vte0"
     if (privParam.withImsic) r += s"if${privParam.imsicInterrupts}gf${privParam.guestExternalInterruptFiles}"
     if (privParam.withDebug) r += s"pdbg"
     if (privParam.withExternalInterrupt) r += "nei"
@@ -930,6 +936,12 @@ class ParamSimple() {
       .text("Run vslide* and vrgather.vx/.vi in the beat unit, one destination word per cycle.")
     opt[Unit]("vector-beat-compress").action { (v, c) => vectorBeatCompress = true }
       .text("Run vcompress.vm in the beat unit, one source word per cycle; requires --vector-beat-slides.")
+    opt[Unit]("vector-overlap").action { (v, c) => vectorOverlap = true }
+      .text("Start an independent queued beat command once the previous one has issued its last step; requires the queue.")
+    opt[Unit]("vector-nofence").action { (v, c) => vectorNoFence = true }
+      .text("Dispatch queued vector arithmetic and vset* without waiting for older instructions; requires the queue.")
+    opt[Unit]("vector-trap-e0").action { (v, c) => vectorTrapE0 = true }
+      .text("Raise the vector illegal-instruction trap at E0 instead of E1 (longer freeze path, adjacent vector uops one cycle closer).")
     opt[Unit]("narrow-io-window").action { (v, c) => narrowIoWindow = true }
       .text("TestBench only: the IO window 0x10021000-0x10021FFF takes accesses of at most 4 bytes.")
     opt[Unit]("dual-issue").action { (v, c) =>
@@ -984,6 +996,7 @@ class ParamSimple() {
       assert(lsuL1Enable, "the vector unit needs the LSU L1 (--lsu-l1)")
       assert(!extension.withHypervisor, "the vector unit does not support the hypervisor extension")
       assert(vectorQueue >= 0 && vectorQueue <= 4, s"the vector queue depth must be 0 to 4, got $vectorQueue")
+      assert(!(vectorOverlap || vectorNoFence) || vectorQueue > 0, "--vector-overlap and --vector-nofence need the vector queue")
     } else {
       assert(zvlActive.isEmpty, "zvl*b needs a vector extension")
     }
@@ -1445,7 +1458,7 @@ class ParamSimple() {
     if (extension.withZve32x) {
       plugins += new execute.vector.VectorCsrPlugin(vlen = vlen, withAccessHold = vectorQueue > 0)
       plugins += new execute.vector.VectorPlugin(early0, dlen = vectorDlen, elen = if (extension.withZve64x) 64 else 32, queueDepth = vectorQueue,
-        beatSlides = vectorBeatSlides, beatCompress = vectorBeatCompress)
+        beatSlides = vectorBeatSlides, beatCompress = vectorBeatCompress, overlapIssue = vectorOverlap, noFence = vectorNoFence, trapAtE0 = vectorTrapE0)
     }
 
     plugins += new WhiteboxerPlugin(

@@ -5,7 +5,10 @@ import rvls.spinal.TraceBackend
 import scala.collection.mutable
 import scala.util.Random
 
-/** Keeps tagged effects behind their owning commit and reports completions in order. */
+/**
+ * Keeps tagged effects behind their owning commit and reports completions in order. Tags count modulo 16, twice the
+ * RTL's tag space; once 8 are pending, committed and completed heads are reported early so that tags stay unique.
+ */
 class VectorTraceBuffer(hartId: Int, backends: () => Seq[TraceBackend], maxDelay: Int, seed: Long, fault: String = "") {
   require(maxDelay >= 0 && maxDelay < Int.MaxValue)
   require(VectorTraceBuffer.faults.contains(fault))
@@ -26,10 +29,10 @@ class VectorTraceBuffer(hartId: Int, backends: () => Seq[TraceBackend], maxDelay
   def nonEmpty: Boolean = pending.nonEmpty
 
   def accept(): Int = {
-    if(pending.size == 5) emitHead()
+    while(pending.size >= VectorTraceBuffer.emitAt && headReady) emitHead()
     val tag = nextTag
-    require(!pending.contains(tag), s"vector trace tag $tag reused while live")
-    nextTag = (tag + 1) & 7
+    require(pending.size < VectorTraceBuffer.tags && !pending.contains(tag), s"vector trace tag $tag reused while live")
+    nextTag = (tag + 1) % VectorTraceBuffer.tags
     if(nextTag == 0) wraps += 1
     pending(tag) = new Entry(tag)
     accepted += 1
@@ -79,7 +82,7 @@ class VectorTraceBuffer(hartId: Int, backends: () => Seq[TraceBackend], maxDelay
     val corruptWrite = !faultUsed && entry.writes.nonEmpty && (fault == "missing" || fault == "wrong-tag")
     if(corruptWrite) faultUsed = true
     if(!corruptWrite || fault != "missing") for((reg, mask, data) <- entry.writes) {
-      val reportedTag = if(corruptWrite) tag ^ 4 else tag
+      val reportedTag = if(corruptWrite) tag ^ 8 else tag
       backends().foreach(_.writeVrfDeferred(hartId, reportedTag, reg, mask.clone(), data.clone()))
     }
     backends().foreach(_.completeVector(hartId, tag, entry.saturation.get))
@@ -91,23 +94,28 @@ class VectorTraceBuffer(hartId: Int, backends: () => Seq[TraceBackend], maxDelay
     completed += 1
   }
 
+  private def headReady: Boolean = pending.headOption.exists { case (_, e) => e.committed && e.saturation.nonEmpty }
+
   def tick(cycle: Long): Unit = {
-    while(pending.headOption.exists { case (_, e) => e.committed && e.saturation.nonEmpty && e.due <= cycle }) emitHead()
+    while(headReady && pending.head._2.due <= cycle) emitHead()
   }
 
-  def drain(): Unit = {
+  // committedOnly leaves the accepted but uncommitted entries, which are younger than the retiring observer
+  def drain(committedOnly: Boolean = false): Unit = {
     if(fault == "late" && !faultUsed && pending.nonEmpty) {
       require(pending.head._2.committed && pending.head._2.saturation.nonEmpty)
       faultUsed = true
       pending.remove(pending.head._1) // Leave the checker tag live across the next observer.
     }
-    while(pending.nonEmpty) emitHead()
+    while(pending.nonEmpty && (!committedOnly || pending.head._2.committed)) emitHead()
   }
 
   def stats: String = s"accepted=$accepted completed=$completed maxLive=$maxLive earlyWrites=$writesBeforeCommit earlyCompletions=$completionsBeforeCommit wraps=$wraps"
 }
 
 object VectorTraceBuffer {
+  val tags = 16
+  val emitAt = 8
   val faults = Set("", "missing", "duplicate", "wrong-tag", "late", "before-defer")
   // The three integer scalar-result encodings in Rvv.scala are synchronous observers.
   def queued(instruction: Long): Boolean = {

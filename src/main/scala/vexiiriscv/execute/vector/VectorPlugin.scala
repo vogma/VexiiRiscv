@@ -70,13 +70,18 @@ case class VectorMemoryDescriptor(indexWidth : Int, split : Boolean = false, bea
  * with a 32-bit LSU each 8-byte element then takes two micro-ops, low word first.
  * queueDepth > 0 instead accepts arithmetic without a scalar result into a queue of that depth when it leaves E0;
  * it retires there and runs later. Every reader of its results waits until nothing is outstanding.
+ * overlapIssue starts a queued beat command behind running ones when it reads no register they still write;
+ * noFence dispatches queued uops and vset* without waiting for older instructions to leave the pipeline.
+ * trapAtE0 raises the illegal-instruction trap at E0, so a younger vector uop may follow one stage behind.
  */
 class VectorPlugin(val layer : LaneLayer, val dlen : Int = 64, var withMemory : Boolean = true, val elen : Int = 32,
-                   val queueDepth : Int = 0, val beatSlides : Boolean = false, val beatCompress : Boolean = false)
+                   val queueDepth : Int = 0, val beatSlides : Boolean = false, val beatCompress : Boolean = false,
+                   val overlapIssue : Boolean = false, val noFence : Boolean = false, val trapAtE0 : Boolean = false)
   extends FiberPlugin with InitService {
   require(elen == 32 || elen == 64)
   require(!beatCompress || beatSlides, "beat compress requires beat slides")
   require(queueDepth >= 0 && queueDepth <= 4)
+  require(!(overlapIssue || noFence) || queueDepth > 0, "overlapIssue and noFence need the queue")
   override def initHold(): Bool = regFile.vrf.io.initHold
 
   // Initialization must be available before the trap controller finishes building.
@@ -143,13 +148,17 @@ class VectorPlugin(val layer : LaneLayer, val dlen : Int = 64, var withMemory : 
     val shiftNames = Set("vsll", "vsrl", "vsra", "vssrl", "vssra", "vnsrl", "vnsra", "vnclipu", "vnclip")
 
     val wb = ifp.access(1)
+    val trapStage = if (trapAtE0) 0 else 1
+    // Uops that may have a scalar result or run synchronously wait for older instructions; with noFence the others
+    // (queued arithmetic and vset*) dispatch once no older uop can flush them
+    val synchronous = Set[MicroOp](Rvv.all("vmv.x.s"), Rvv.all("vcpop.m"), Rvv.all("vfirst.m"))
     def add(op : MicroOp, decodings : (Payload[_ <: BaseType], Any)*) : UopLayerSpec = {
       val spec = layer.add(op)
       spec.addDecoding(SEL -> True)
       spec.addDecoding(decodings)
       ds.addMicroOpDecoding(op, VECTOR, True)
-      dp.fenceOlder(op)
-      spec.mayFlushUpTo(1)
+      if (!noFence || synchronous(op)) dp.fenceOlder(op)
+      spec.mayFlushUpTo(trapStage)
       spec.dontFlushFrom(0)
       op.resources.foreach {
         case RfResource(IntRegFile, rs : RfRead) => spec.addRsSpec(rs, 0)
@@ -335,8 +344,8 @@ class VectorPlugin(val layer : LaneLayer, val dlen : Int = 64, var withMemory : 
 
     ds.addIllegalCheck(ctrl => ctrl(VECTOR) && !vcs.vectorEnable)
 
-    // The illegal-instruction trap is raised one stage after the checks, from a register
-    val age = elp.getExecuteAge(1)
+    // The illegal-instruction trap is raised one stage after the checks, from a register, unless trapAtE0
+    val age = elp.getExecuteAge(trapStage)
     val flushPort = sp.newFlushPort(age, laneAgeWidth = Execute.LANE_AGE_WIDTH, withUopId = true)
     val trapPort = ts.newTrap(age, Execute.LANE_AGE_WIDTH)
     ioRetainer.release()
@@ -344,7 +353,7 @@ class VectorPlugin(val layer : LaneLayer, val dlen : Int = 64, var withMemory : 
     val vlen = vcs.vlen
     val vlWidth = vcs.vlWidth
     val vrf = regFile.vrf
-    val arithmetic = new VectorArithmetic(vrf.p, XLEN, elen, beatSlides, beatCompress)
+    val arithmetic = new VectorArithmetic(vrf.p, XLEN, elen, beatSlides, beatCompress, overlapIssue)
     val element = new VectorElementUnit(vrf.p, XLEN, elen, beatSlides, beatCompress)
     vrf.io.write := arithmetic.io.write
     when(element.io.busy) { vrf.io.write := element.io.write }
@@ -568,7 +577,7 @@ class VectorPlugin(val layer : LaneLayer, val dlen : Int = 64, var withMemory : 
 
       val decoupled = queueDepth > 0
       val queue = decoupled generate new Area {
-        val q = new VectorQueue(vrf.p, XLEN, queueDepth, beatSlides, beatCompress)
+        val q = new VectorQueue(vrf.p, XLEN, queueDepth, beatSlides, beatCompress, overlapIssue)
         val pp = host[PrivilegedPlugin]
         val forceSync = if (pp.p.withDebug) pp.logic.harts(0).debugMode || pp.logic.harts(0).debug.dcsr.step else False
         // Everything without a scalar result; in debug mode or while stepping, everything runs synchronously
@@ -582,6 +591,23 @@ class VectorPlugin(val layer : LaneLayer, val dlen : Int = 64, var withMemory : 
         q.push.arith := e0Arith.payload
         q.push.elem := e0Element.payload
         q.done := arithmetic.io.done || element.io.done
+        if (overlapIssue) {
+          // Whole registers read and written, from the shape and the operand groups of the legality checks
+          def regs(reg : UInt, log2 : SInt) : Bits = ((((U(1, 9 bits) << groupSize(log2)) - 1).resize(32)) << reg).resize(32).asBits
+          val l = legality
+          val op = ALU_OP
+          val scanOp = op === VectorAluOp.MSBF || op === VectorAluOp.MSIF || op === VectorAluOp.MSOF
+          val readsVs2 = SHAPE === VectorShape.SCALAR_READ || SHAPE =/= VectorShape.SCALAR_WRITE && op =/= VectorAluOp.MOVE && op =/= VectorAluOp.INDEX
+          val noVs1 = List(VectorShape.SCALAR_READ, VectorShape.EXT2, VectorShape.EXT4, VectorShape.EXT8, VectorShape.WHOLE).map(SHAPE === _).orR
+          val readsVs1 = !SCALAR_OPERAND && !noVs1 && op =/= VectorAluOp.INDEX && !scanOp
+          val readsVd = SHAPE === VectorShape.MASK_DST || SHAPE === VectorShape.MASK_MM
+          val readsV0 = !vm || MASK_DATA
+          q.push.reads := (readsVs2 ? regs(vs2, l.vs2Log2) | B(0, 32 bits)) | (readsVs1 ? regs(vs1, l.vs1Log2) | B(0, 32 bits)) |
+            (readsVd ? regs(vd, S(0, 4 bits)) | B(0, 32 bits)) | (readsV0 ? B(1, 32 bits) | B(0, 32 bits))
+          q.push.writes := regs(vd, l.vdLog2)
+          q.beatReady := arithmetic.io.ready
+          arithmetic.io.tag := q.head.tag
+        }
         // A unit takes the queue head on a pop, or a synchronizing command from E0 once nothing is outstanding
         val syncGo = q.idle && !queued
         arithmetic.io.cmd.valid := q.pop && !q.head.element || e0Arith.valid && syncGo
@@ -637,7 +663,8 @@ class VectorPlugin(val layer : LaneLayer, val dlen : Int = 64, var withMemory : 
         // An illegal uop is held for one cycle before it leaves for its trap, which keeps the checks out of the freeze
         val illegalHeld = RegInit(False)
         // A queued uop waits only for room in the queue; the others until their unit is done
-        def hold = if (decoupled) sel && unit && (queue.queued ? queue.q.full | !illegalHeld && !completed) else sel && unit && !illegalHeld && !completed
+        def hold = if (trapAtE0) sel && unit && !legality.illegal && (if (decoupled) queue.queued ? queue.q.full | !completed else !completed)
+          else if (decoupled) sel && unit && (queue.queued ? queue.q.full | !illegalHeld && !completed) else sel && unit && !illegalHeld && !completed
         elp.freezeWhen(hold)
         when(sel && legality.illegal) { illegalHeld := True }
         when(isReady) { illegalHeld := False }
@@ -667,7 +694,9 @@ class VectorPlugin(val layer : LaneLayer, val dlen : Int = 64, var withMemory : 
     val e1 = new layer.Execute(1) {
       wb.valid := SEL && !MEM
       wb.payload := RESULT
+    }
 
+    val illegalTrap = new layer.Execute(trapStage) {
       val trap = isValid && SEL && e0.ILLEGAL
       flushPort.valid := trap
       flushPort.hartId := Global.HART_ID
@@ -684,6 +713,9 @@ class VectorPlugin(val layer : LaneLayer, val dlen : Int = 64, var withMemory : 
       trapPort.laneAge := Execute.LANE_AGE
       trapPort.hartId := Global.HART_ID
     }
+
+
+    if (!trapAtE0) illegalTrap.trap.setCompositeName(e1, "trap")
 
     // One LSU micro-op per field of each active element; the descriptor travels with it from the dispatch insert node.
     val memory = withMemory generate new Area {
@@ -952,7 +984,12 @@ class VectorPlugin(val layer : LaneLayer, val dlen : Int = 64, var withMemory : 
       assert(!(applies.map(fsm.isActive(_)).orR && !q.idle), "trap, debug entry or xRET applied while vector instructions are outstanding")
       assert(!(e0.queue.accept && e0.isCancel), "vector instruction accepted while cancelled")
       val unitStart = arithmetic.io.cmd.valid || element.io.cmd.valid
-      assert(!(unitStart && (q.running || arithmetic.io.busy || element.io.busy)), "vector unit started while another instruction runs")
+      val behind = if (overlapIssue) arithmetic.io.cmd.valid && q.pop && q.serial.behind else False
+      assert(!(unitStart && !behind && (q.running || arithmetic.io.busy || element.io.busy)), "vector unit started while another instruction runs")
+      if (overlapIssue) {
+        assert(!(element.io.cmd.valid && arithmetic.io.busy), "vector element unit started while beat commands run")
+        assert(!(arithmetic.io.done && q.running && arithmetic.io.doneTag =/= q.runningTag), "vector beat command completed out of order")
+      }
       assert(!(q.done && !q.running && !(e0.sequencer.started && !e0.sequencer.completed)), "vector unit done without a running instruction")
       if (withMemory) assert(!(memory.seq.fire && !q.idle), "vector memory micro-op issued while arithmetic is outstanding")
       val xret = !trap.pending.state.exception && trap.pending.state.code === TrapReason.PRIV_RET
@@ -1050,6 +1087,8 @@ class VectorPlugin(val layer : LaneLayer, val dlen : Int = 64, var withMemory : 
       val vrfWriteMask = CombInit(vrf.io.writeEvent.mask).simPublic()
 
       val vs = CombInit(vcs.vs).simPublic()
+      // The E0 uop that sets VS Dirty and always commits afterwards (memory uops may trap instead)
+      val vsDirtyUop = noFence generate CombInit(e0.sel && !e0.legality.illegal && !e0(MEM)).simPublic()
       val vstart = CombInit(vcs.vstart).simPublic()
       val vxrm = CombInit(vcs.vxrm).simPublic()
       val vxsat = CombInit(vcs.vxsat).simPublic()
@@ -1059,6 +1098,9 @@ class VectorPlugin(val layer : LaneLayer, val dlen : Int = 64, var withMemory : 
       val queueAcceptTag = e0.decoupled generate CombInit(e0.queue.q.nextTag).simPublic()
       val queueRunning = e0.decoupled generate CombInit(e0.queue.q.running).simPublic()
       val queueRunningTag = e0.decoupled generate CombInit(e0.queue.q.runningTag).simPublic()
+      // The instruction whose result vrfWrite carries; with overlap a younger beat command may write before the oldest completes
+      val queueWriteTag = e0.decoupled generate CombInit(if (overlapIssue) (arithmetic.io.write.valid ? arithmetic.io.writeTag | e0.queue.q.runningTag)
+        else e0.queue.q.runningTag).simPublic()
       val queueComplete = e0.decoupled generate CombInit(e0.queue.q.complete).simPublic()
       val queueIdle = e0.decoupled generate CombInit(e0.queue.q.idle).simPublic()
       val queueEvents = e0.decoupled generate CombInit(queueChecks.events).simPublic()
