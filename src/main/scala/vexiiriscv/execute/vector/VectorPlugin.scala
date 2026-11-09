@@ -50,15 +50,15 @@ object VectorRange {
   def width = 3
 }
 
-case class VectorMemoryDescriptor(indexWidth : Int, split : Boolean = false, beat : Boolean = false) extends Bundle {
+case class VectorMemoryDescriptor(indexWidth : Int, split : Boolean = false, beat : Boolean = false, wordBytes : Int = 8) extends Bundle {
   val index = UInt(indexWidth bits)
   val field = UInt(3 bits)
   val last, access = Bool()
   val half = split generate Bool() // upper word of an 8-byte element
   val beats = beat generate new Bundle {
     val enable = Bool() // a chunk of whole elements in one VRF word and one aligned LSU word
-    val mask = Bits(8 bits) // the chunk's active bytes in the VRF word
-    val rotate = UInt(3 bits) // VRF byte (q + rotate) mod 8 goes to memory lane q
+    val mask = Bits(wordBytes bits) // the chunk's active bytes in the VRF word
+    val rotate = UInt(log2Up(wordBytes) bits) // VRF byte (q + rotate) mod wordBytes goes to memory lane q
   }
 }
 
@@ -421,7 +421,7 @@ class VectorPlugin(val layer : LaneLayer, val dlen : Int = 64, var withMemory : 
       ((vreg.resize(vrf.p.addressWidth) << vrf.p.beatWidth) + (offset >> log2Up(vrf.p.beatBytes)).resized).resize(vrf.p.addressWidth)
     val split = withMemory && lsu.vectorSplit
     val beats = withMemory && lsu.vectorBeat
-    val DESCRIPTOR = Payload(VectorMemoryDescriptor(vcs.vstartWidth, split, beats))
+    val DESCRIPTOR = Payload(VectorMemoryDescriptor(vcs.vstartWidth, split, beats, dlen / 8))
     val lsuBytes = LSLEN.get / 8
     // Unit-stride forms without segments; whole-register and mask transfers count their nf as registers
     def unitStride(uop : Bits) : Bool = uop(27 downto 26) === 0 && (whole(uop) || maskMemory(uop) ||
@@ -721,7 +721,7 @@ class VectorPlugin(val layer : LaneLayer, val dlen : Int = 64, var withMemory : 
     val memory = withMemory generate new Area {
       val port = lsuPort
       val seq = dp.logic.sequencer.port
-      val walker = new VectorElementWalker(vlen, split, beats)
+      val walker = new VectorElementWalker(vlen, split, beats, dlen / 8)
       val resume = RegInit(False) // an element retries after REDO or a TLB refill
       val resumeField = Reg(UInt(3 bits)) init(0) // the field it retries from
       // Fault-only-first: the trap controller may turn the exception of an element past 0 into a trim,
@@ -786,18 +786,20 @@ class VectorPlugin(val layer : LaneLayer, val dlen : Int = 64, var withMemory : 
         when(candidate && !ready) { seq.ready := !seq.first }
 
         val chunk = RegInit(False)
-        val wordMask = Reg(UInt(3 bits)) init(0)
-        val table = Reg(Vec.fill(8)(UInt(2 bits)))
+        val wordBytes = dlen / 8
+        val posWidth = log2Up(wordBytes)
+        val wordMask = Reg(UInt(posWidth bits)) init(0)
+        val table = Reg(Vec.fill(wordBytes)(UInt(2 bits)))
         val offset = strideRead.data(log2Up(lsuBytes) - 1 downto 0).asUInt
         val aligned = (offset & ((U(1, 3 bits) << size) - 1).resized) === 0
         when(walker.io.start) { chunk := False }
         when(sampled) {
           chunk := candidate && aligned
-          wordMask := U(7, 3 bits) >> size
+          wordMask := U(wordBytes - 1, posWidth bits) >> size
           // Chunk number of each element position: the LSU-word boundaries after the word's first element
-          for (pos <- 0 until 8) {
-            val k = U(pos, 3 bits) & (U(7, 3 bits) >> size)
-            val ends = (1 until 8).map(m => U(m, 3 bits) <= k && (offset + (U(m, 5 bits) << size)).resize(log2Up(lsuBytes)) === 0)
+          for (pos <- 0 until wordBytes) {
+            val k = U(pos, posWidth bits) & (U(wordBytes - 1, posWidth bits) >> size)
+            val ends = (1 until wordBytes).map(m => U(m, posWidth bits) <= k && (offset + (U(m, 5 bits) << size)).resize(log2Up(lsuBytes)) === 0)
             table(pos) := CountOne(ends).resize(2)
           }
         }
@@ -806,7 +808,7 @@ class VectorPlugin(val layer : LaneLayer, val dlen : Int = 64, var withMemory : 
         walker.io.table := table
       }
 
-      val descriptor = VectorMemoryDescriptor(vcs.vstartWidth, split, beats)
+      val descriptor = VectorMemoryDescriptor(vcs.vstartWidth, split, beats, dlen / 8)
       if (split) descriptor.half := walker.io.half
       descriptor.index := walker.io.index
       descriptor.field := walker.io.field
@@ -819,11 +821,11 @@ class VectorPlugin(val layer : LaneLayer, val dlen : Int = 64, var withMemory : 
         descriptor.beats.enable := beat.chunk
         descriptor.beats.mask := size.mux(
           0 -> active,
-          1 -> Cat((0 until 8).map(p => active(p >> 1))),
-          default -> Cat((0 until 8).map(p => active(p >> 2))))
-        val p0 = (walker.io.index << size).resize(3)
+          1 -> Cat((0 until dlen / 8).map(p => active(p >> 1))),
+          default -> Cat((0 until dlen / 8).map(p => active(p >> 2))))
+        val p0 = (walker.io.index << size).resize(log2Up(dlen / 8))
         val q0 = (stride(log2Up(lsuBytes) - 1 downto 0).asUInt + p0).resize(log2Up(lsuBytes))
-        descriptor.beats.rotate := p0 - q0.resize(3)
+        descriptor.beats.rotate := p0 - q0.resize(log2Up(dlen / 8))
       }
       elp.ctrl(0).up(DESCRIPTOR) := descriptor
 
@@ -900,15 +902,18 @@ class VectorPlugin(val layer : LaneLayer, val dlen : Int = 64, var withMemory : 
         write.valid := rsp.valid && rsp.access && rsp.load && !rsp.trap.valid
         write.address := wordOf(fieldReg(Decode.UOP, d.field), offset)
         write.data := size.mux(
-          U(0) -> (rsp.data(7 downto 0) #* 8),
-          U(1) -> (rsp.data(15 downto 0) #* 4),
-          default -> (rsp.data(31 downto 0) #* 2)
+          U(0) -> (rsp.data(7 downto 0) #* (dlen / 8)),
+          U(1) -> (rsp.data(15 downto 0) #* (dlen / 16)),
+          default -> (rsp.data(31 downto 0) #* (dlen / 32))
         )
         val bytes = size.mux(U(0) -> B"0001", U(1) -> B"0011", default -> B"1111")
         write.mask := (bytes.resize(vrf.p.beatBytes) << offset.resize(log2Up(vrf.p.beatBytes))).resize(vrf.p.beatBytes)
-        if (elen == 64) when(size === 3) { write.mask := B(0xff, vrf.p.beatBytes bits) }
         // 8-byte elements: one LSU word, or with a 32-bit LSU the held low word and the upper half's word
-        if (elen == 64 && !split) when(size === 3) { write.data := rsp.data(63 downto 0) }
+        if (elen == 64) when(size === 3) {
+          write.mask := (if (dlen == 64) B(0xff, vrf.p.beatBytes bits)
+            else (B(0xff, 8 bits).resize(vrf.p.beatBytes) << offset.resize(log2Up(vrf.p.beatBytes))).resize(vrf.p.beatBytes))
+        }
+        if (elen == 64 && !split) when(size === 3) { write.data := (if (dlen == 64) rsp.data(63 downto 0) else rsp.data(63 downto 0) #* (dlen / 64)) }
         val low = split generate Reg(Bits(32 bits))
         if (split) {
           when(rsp.valid && rsp.load && !d.half) { low := rsp.data(31 downto 0) }
@@ -920,7 +925,7 @@ class VectorPlugin(val layer : LaneLayer, val dlen : Int = 64, var withMemory : 
 
         // A beat writes the chunk's bytes, rotated from the aligned memory word (doubled when narrower than a VRF word)
         if (beats) when(d.beats.enable) {
-          val doubled = if (lsuBytes == 8) rsp.raw else rsp.raw ## rsp.raw
+          val doubled = (dlen / LSLEN.get) match { case 1 => rsp.raw; case 2 => rsp.raw ## rsp.raw; case n => rsp.raw #* n }
           write.data := doubled.rotateLeft(d.beats.rotate << 3)
           write.mask := d.beats.mask
         }

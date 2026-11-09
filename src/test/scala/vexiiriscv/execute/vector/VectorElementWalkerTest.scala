@@ -86,10 +86,10 @@ class VectorElementWalkerTest extends AnyFunSuite {
   }
 
   // Chunks: the expected (first element, active positions) list comes from a direct model of the chunk rule, a chunk
-  // being the active elements of [i, b) with b the next VRF-word (8 bytes) or LSU-word (lsuBytes) boundary after i.
-  def runChunks(vlen: Int, lsuBytes: Int): Unit = {
-    SimConfig.compile(new VectorElementWalker(vlen, chunks = true)).doSim { dut =>
-      val random = new Random(91 + vlen + lsuBytes)
+  // being the active elements of [i, b) with b the next VRF-word (wordBytes) or LSU-word (lsuBytes) boundary after i.
+  def runChunks(vlen: Int, lsuBytes: Int, wordBytes: Int = 8): Unit = {
+    SimConfig.compile(new VectorElementWalker(vlen, chunks = true, wordBytes = wordBytes)).doSim { dut =>
+      val random = new Random(91 + vlen + lsuBytes + wordBytes - 8)
       dut.clockDomain.forkStimulus(10)
       dut.io.start #= false
       dut.io.advance #= false
@@ -98,9 +98,10 @@ class VectorElementWalkerTest extends AnyFunSuite {
       dut.io.startField #= 0
       dut.clockDomain.waitSampling()
       var cases, uops = 0
+      val chunkCounts = scala.collection.mutable.Set[Int]() // chunks per VRF word seen
       for (iteration <- 0 until 3000) {
         val w = random.nextInt(log2Up(lsuBytes))
-        val epw = 8 >> w
+        val epw = wordBytes >> w
         val o = random.nextInt(lsuBytes >> w) << w
         val vl = if (iteration % 4 == 0) Seq(0, 1, vlen - 1, vlen)(random.nextInt(4)) else random.nextInt(vlen + 1)
         val vstart = if (iteration % 3 == 0) 0 else random.nextInt(vlen)
@@ -121,7 +122,8 @@ class VectorElementWalkerTest extends AnyFunSuite {
           expected += ((i, chunk.map(j => 1 << (j % epw)).sum))
           rest = rest.drop(chunk.size)
         }
-        for (pos <- 0 until 8) dut.io.table(pos) #= (1 to (pos % epw)).count(m => (o + (m << w)) % lsuBytes == 0)
+        for (pos <- 0 until wordBytes) dut.io.table(pos) #= (1 to (pos % epw)).count(m => (o + (m << w)) % lsuBytes == 0)
+        chunkCounts += 1 + (1 until epw).count(m => (o + (m << w)) % lsuBytes == 0)
         dut.io.wordMask #= epw - 1
         dut.io.evl #= vl
         dut.io.vstart #= vstart
@@ -150,7 +152,9 @@ class VectorElementWalkerTest extends AnyFunSuite {
         cases += 1
         uops += expected.size
       }
-      println(s"VLEN=$vlen LSU bytes=$lsuBytes chunk cases=$cases micro-ops=$uops")
+      // A full word spans wordBytes / lsuBytes LSU words when aligned, one more otherwise (16-byte words: 2 and 3)
+      assert(chunkCounts == Set(wordBytes / lsuBytes, wordBytes / lsuBytes + 1), s"chunks per word $chunkCounts")
+      println(s"VLEN=$vlen word bytes=$wordBytes LSU bytes=$lsuBytes chunk cases=$cases micro-ops=$uops chunks per word $chunkCounts")
     }
   }
 
@@ -159,6 +163,8 @@ class VectorElementWalkerTest extends AnyFunSuite {
   test("chunk walker VLEN 128, 4-byte LSU") { runChunks(128, 4) }
   test("chunk walker VLEN 256, 8-byte LSU") { runChunks(256, 8) }
   test("chunk walker VLEN 256, 4-byte LSU") { runChunks(256, 4) }
+  test("chunk walker VLEN 128, 16-byte words, 8-byte LSU") { runChunks(128, 8, 16) }
+  test("chunk walker VLEN 256, 16-byte words, 8-byte LSU") { runChunks(256, 8, 16) }
   test("element walker VLEN 256") { run(256) }
   test("element walker with split wide elements VLEN 128") { run(128, split = true) }
   test("element walker with split wide elements VLEN 256") { run(256, split = true) }

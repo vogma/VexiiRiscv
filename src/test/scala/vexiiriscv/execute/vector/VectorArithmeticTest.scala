@@ -15,7 +15,7 @@ class VectorArithmeticHarness(p: VectorRegFileParam, xlen: Int, elen: Int = 32, 
     val debug = in Bool()
     val access = slave(Flow(VrfWriteCmd(p)))
     val readAddress = in UInt(p.addressWidth bits)
-    val readData = out Bits(64 bits)
+    val readData = out Bits(p.dlen bits)
     val initHold, done, busy, saturated = out Bool()
     val result = out Bits(xlen bits)
     val write = master(Flow(VrfWriteCmd(p)))
@@ -119,15 +119,17 @@ class VectorArithmeticTest extends AnyFunSuite {
       case 1 => VectorShape.EXT2; case 2 => VectorShape.EXT4; case 3 => VectorShape.EXT8; case _ => VectorShape.SINGLE
     }
 
-  def run(vlen: Int, xlen: Int, elen: Int = 32): Unit = {
-    val p = VectorRegFileParam(vlen = vlen)
+  def run(vlen: Int, xlen: Int, elen: Int = 32, dlen: Int = 64): Unit = {
+    val p = VectorRegFileParam(vlen = vlen, dlen = dlen)
+    val wb = dlen / 8
+    val full = (1 << wb) - 1
     val maxSew = log2Up(elen / 8)
     SimConfig.compile(new VectorArithmeticHarness(p, xlen, elen)).doSim { dut =>
-      val random = new Random(901 + xlen + vlen + (if (elen == 64) 64 else 0))
+      val random = new Random(901 + xlen + vlen + (if (elen == 64) 64 else 0) + dlen - 64)
       val bytes = Array.fill(32, vlen / 8)(random.nextInt(256))
       val xmask = (BigInt(1) << xlen) - 1
       def word(reg: Int, offset: Int): BigInt =
-        (0 until 8).map(b => BigInt(bytes(reg)(offset + b)) << (b * 8)).reduce(_ | _)
+        (0 until wb).map(b => BigInt(bytes(reg)(offset + b)) << (b * 8)).reduce(_ | _)
       def tick(): Unit = {
         dut.clockDomain.risingEdge(); sleep(5)
         dut.clockDomain.fallingEdge(); sleep(5)
@@ -152,8 +154,8 @@ class VectorArithmeticTest extends AnyFunSuite {
       for (a <- 0 until p.wordCount) {
         dut.io.access.valid #= true
         dut.io.access.address #= a
-        dut.io.access.mask #= 255
-        dut.io.access.data #= word(a / p.beatsPerReg, (a % p.beatsPerReg) * 8)
+        dut.io.access.mask #= full
+        dut.io.access.data #= word(a / p.beatsPerReg, (a % p.beatsPerReg) * wb)
         tick()
       }
       dut.io.access.valid #= false
@@ -167,6 +169,17 @@ class VectorArithmeticTest extends AnyFunSuite {
       val increments = scala.collection.mutable.Map[(String, Int, Int), Int]().withDefaultValue(0)
       // Operations run with 64-bit destination or adder lanes
       val lanes64 = scala.collection.mutable.Set[String]()
+      def load(): Unit = {
+        dut.io.debug #= true
+        for (a <- 0 until p.wordCount) {
+          dut.io.access.valid #= true
+          dut.io.access.address #= a
+          dut.io.access.mask #= full
+          dut.io.access.data #= word(a / p.beatsPerReg, (a % p.beatsPerReg) * wb)
+          tick()
+        }
+        dut.io.access.valid #= false
+      }
       def execute(name: String, sew: Int, lmul: Int, vl: Int, start: Int, masked0: Boolean,
                   scalarOperand0: Boolean, shape0: Int = VectorShape.SINGLE, vxrm0: Int = -1): Unit = {
         val (_, op, saturate) = ops.find(_._1 == name).get
@@ -288,9 +301,9 @@ class VectorArithmeticTest extends AnyFunSuite {
           // Every byte of NREG registers, whatever vl, vstart, SEW and v0 (norm:vmv-nr-r_op)
           if (vs2 == vd) outcomes((name, "same")) += 1
           for (k <- 0 until nreg * p.beatsPerReg) {
-            val (r, o) = (k / p.beatsPerReg, k % p.beatsPerReg * 8)
-            for (b <- 0 until 8) bytes(vd + r)(o + b) = bytes(vs2 + r)(o + b)
-            expected += ((vd * p.beatsPerReg + k, word(vd + r, o), 255))
+            val (r, o) = (k / p.beatsPerReg, k % p.beatsPerReg * wb)
+            for (b <- 0 until wb) bytes(vd + r)(o + b) = bytes(vs2 + r)(o + b)
+            expected += ((vd * p.beatsPerReg + k, word(vd + r, o), full))
             expectedReads += k
           }
         } else if (maskDst || maskMm) {
@@ -330,10 +343,10 @@ class VectorArithmeticTest extends AnyFunSuite {
             val byte = bytes(vd)(i / 8)
             bytes(vd)(i / 8) = if (bit) byte | (1 << (i % 8)) else byte & ~(1 << (i % 8))
           }
-          if (vl > 0) for (w <- 0 to (vl - 1) / 64) {
-            expected += ((vd * p.beatsPerReg + w, word(vd, w * 8), 255))
+          if (vl > 0) for (w <- 0 to (vl - 1) / dlen) {
+            expected += ((vd * p.beatsPerReg + w, word(vd, w * wb), full))
           }
-          val steps = if (vl == 0) 0 else if (maskMm) (vl - 1) / 64 + 1 else (vl - 1) * size / 8 + 1
+          val steps = if (vl == 0) 0 else if (maskMm) (vl - 1) / dlen + 1 else (vl - 1) * size / wb + 1
           expectedReads ++= 0 until steps
         } else if (reduction) {
           // vs1[0] combined with the active elements of vs2, written to element 0 of vd only if vl > 0
@@ -359,7 +372,7 @@ class VectorArithmeticTest extends AnyFunSuite {
             if (masked && (0 until vl).forall(i => !maskBit(i))) outcomes((name, "inactive")) += 1
             for (b <- 0 until dsize) bytes(vd)(b) = ((acc >> (8 * b)) & 255).toInt
             expected += ((vd * p.beatsPerReg, acc, (1 << dsize) - 1))
-            expectedReads ++= (0 to (vl - 1) * dsize / 8).map(k => if (wide) k / 2 else k)
+            expectedReads ++= (0 to (vl - 1) * dsize / wb).map(k => if (wide) k / 2 else k)
           }
         } else if (wk != 0) {
           // Each active element reads its sources and writes its destination bytes, in element order
@@ -383,15 +396,15 @@ class VectorArithmeticTest extends AnyFunSuite {
             updates += i -> (value & ((BigInt(1) << (8 * dsize)) - 1))
           }
           // One write per step: a destination word, or for narrowing one half of it
-          val perStep = updates.groupBy(u => u._1 * (if (wk == 3) 2 * size else dsize) / 8).toSeq.sortBy(_._1)
+          val perStep = updates.groupBy(u => u._1 * (if (wk == 3) 2 * size else dsize) / wb).toSeq.sortBy(_._1)
           for ((k, entries) <- perStep) {
             var byteMask = 0
             var data = BigInt(0)
             for ((i, value) <- entries; b <- 0 until dsize) {
               val byte = i * dsize + b
               val valueByte = ((value >> (8 * b)) & 255).toInt
-              byteMask |= 1 << (byte % 8)
-              data |= BigInt(valueByte) << (8 * (byte % 8))
+              byteMask |= 1 << (byte % wb)
+              data |= BigInt(valueByte) << (8 * (byte % wb))
               bytes(vd + byte / (vlen / 8))(byte % (vlen / 8)) = valueByte
             }
             expected += ((vd * p.beatsPerReg + (if (wk == 3) k / 2 else k), data, byteMask))
@@ -445,14 +458,14 @@ class VectorArithmeticTest extends AnyFunSuite {
             expectedSaturation |= saturated
             updates += i -> (value & mask)
           }
-          val perBeat = updates.groupBy(_._1 * size / 8).toSeq.sortBy(_._1)
+          val perBeat = updates.groupBy(_._1 * size / wb).toSeq.sortBy(_._1)
           for ((beat, entries) <- perBeat) {
             val address = vd * p.beatsPerReg + beat
             var byteMask = 0
             var data = BigInt(0)
             for ((i, value) <- entries; b <- 0 until size) {
               val byte = i * size + b
-              val pos = byte % 8
+              val pos = byte % wb
               val valueByte = ((value >> (8 * b)) & 255).toInt
               byteMask |= 1 << pos
               data |= BigInt(valueByte) << (8 * pos)
@@ -490,7 +503,7 @@ class VectorArithmeticTest extends AnyFunSuite {
             val base = if (readVs2) vs2 else vs1
             val beat = dut.io.readAddresses(port).toInt - base * p.beatsPerReg
             // Port C reads the old mask word: every step of MASK_MM, the first step of each word of MASK_DST
-            val wordStep = beat * (8 >> sew) % 64 == 0
+            val wordStep = beat * (wb >> sew) % dlen == 0
             val readVd = maskMm || maskDst && wordStep
             val expectedValid = (if (readVs2) 1 else 0) | (if (readVs1) 2 else 0) | (if (readVd) 4 else 0)
             assert(rv == expectedValid, s"read ports case $cases")
@@ -498,7 +511,7 @@ class VectorArithmeticTest extends AnyFunSuite {
             readCycles += cycles
             if (readVs2 && readVs1) assert(dut.io.readAddresses(1).toInt == vs1 * p.beatsPerReg +
               (if (reduction) 0 else if (wk >= 2) beat / 2 else beat))
-            val vdWord = if (maskDst) beat * (8 >> sew) / 64 else beat
+            val vdWord = if (maskDst) beat * (wb >> sew) / dlen else beat
             if (readVd) assert(dut.io.readAddresses(2).toInt == vd * p.beatsPerReg + vdWord, s"old mask word case $cases")
           }
           if (dut.io.write.valid.toBoolean) {
@@ -506,7 +519,7 @@ class VectorArithmeticTest extends AnyFunSuite {
             val (address, data, byteMask) = expected(writeIndex)
             assert(dut.io.write.address.toInt == address, s"address case $cases")
             assert(dut.io.write.mask.toInt == byteMask, s"byte enables case $cases")
-            val bitMask = (0 until 8).filter(b => (byteMask & (1 << b)) != 0).map(b => BigInt(255) << (8 * b)).reduce(_ | _)
+            val bitMask = (0 until wb).filter(b => (byteMask & (1 << b)) != 0).map(b => BigInt(255) << (8 * b)).reduce(_ | _)
             assert((dut.io.write.data.toBigInt & bitMask) == data, s"data case $cases $name sew $sew lmul $lmul vd $vd vs2 $vs2")
             if ((!masked || whole) && !maskDst && writeCycles.nonEmpty) assert(cycles == writeCycles.last + 1, "active beats must stream every cycle")
             writeCycles += cycles
@@ -518,9 +531,9 @@ class VectorArithmeticTest extends AnyFunSuite {
         assert(writeIndex == expected.size)
         // Each write lands three cycles after its reads; done follows the last write
         // MASK_DST writes a mask word after the last step that produces its bits
-        val writingSteps = actualReads.indices.filter(k => !maskDst || k == actualReads.size - 1 || (k + 1) * (8 >> sew) % 64 == 0)
-        // A reduction writes after its last step and one fold per halving of the 64-bit accumulator down to one lane
-        val folds = 3 - sew - (if (name.startsWith("vwred")) 1 else 0)
+        val writingSteps = actualReads.indices.filter(k => !maskDst || k == actualReads.size - 1 || (k + 1) * (wb >> sew) % dlen == 0)
+        // A reduction writes after its last step and one fold per halving of the DLEN-bit accumulator down to one lane
+        val folds = log2Up(wb) - sew - (if (name.startsWith("vwred")) 1 else 0)
         if (!scalarRead && readCycles.nonEmpty)
           assert(writeCycles.toSeq == (if (reduction) Seq(readCycles.last + folds + 3) else writingSteps.map(readCycles(_) + 3)),
             s"write latency case $cases")
@@ -535,7 +548,7 @@ class VectorArithmeticTest extends AnyFunSuite {
         dut.io.debug #= true
         for (a <- 0 until p.wordCount) {
           dut.io.readAddress #= a; tick()
-          assert(dut.io.readData.toBigInt == word(a / p.beatsPerReg, (a % p.beatsPerReg) * 8), s"readback case $cases word $a")
+          assert(dut.io.readData.toBigInt == word(a / p.beatsPerReg, (a % p.beatsPerReg) * wb), s"readback case $cases word $a")
         }
         cases += 1
       }
@@ -562,21 +575,25 @@ class VectorArithmeticTest extends AnyFunSuite {
           val v = limit(random.nextInt(limit.size))
           for (b <- 0 until size) bytes(reg)(e * size + b) = ((v >> (8 * b)) & 255).toInt
         }
-        dut.io.debug #= true
-        for (a <- 0 until p.wordCount) {
-          dut.io.access.valid #= true
-          dut.io.access.address #= a
-          dut.io.access.mask #= 255
-          dut.io.access.data #= word(a / p.beatsPerReg, (a % p.beatsPerReg) * 8)
-          tick()
-        }
-        dut.io.access.valid #= false
+        load()
         // INT_MAX - INT_MIN is odd, so rnu rounds it up past INT_MAX
         execute(name, sew, random.nextInt(2), vlen / (8 << sew), 0, random.nextBoolean(), random.nextInt(4) == 0 && !extremes,
           vxrm0 = if (extremes) 0 else -1)
       }
       for (sew <- 0 to maxSew; vl <- Seq(0, 1, 3); read <- Seq(false, true))
         execute("vmv", sew, 3, vl, 0, false, true, if (read) VectorShape.SCALAR_READ else VectorShape.SCALAR_WRITE)
+      // All-ones data: a carry, shift or fold leaking across any byte or 64-bit lane boundary changes the result
+      for (r <- 0 until 32; b <- 0 until vlen / 8) bytes(r)(b) = 255
+      load()
+      for (sew <- 0 to maxSew; name <- Seq("vadd", "vsll", "vsra", "vmadc", "vmseq", "vredsum", "vwredsumu", "vnsrl", "vsext2")
+           if sew >= extLog2(name) && sizeOk(name, sew, 0, elen))
+        execute(name, sew, 0, vlen / (8 << sew), 0, false, false)
+      // One set bit at the edges of bytes and of 64- and 128-bit mask words, in v0 and every source
+      for (bit <- Seq(7, 8, 15, 16, 63, 64, 127, 128, 255) if bit < vlen) {
+        for (r <- 0 until 32; b <- 0 until vlen / 8) bytes(r)(b) = if (b == bit / 8) 1 << (bit % 8) else 0
+        load()
+        for (name <- Seq("vadd", "vmseq", "vmsne", "vmand", "vmor", "vmxnor")) execute(name, 0, 3, vlen, 0, true, false)
+      }
       for ((name, _, saturate) <- ops if saturate; outcome <- Seq(false, true))
         assert(saturations((name, outcome)) > 0, s"$name never had saturated = $outcome")
       for (name <- compares ++ carries; outcome <- Seq("true", "false") ++ (if (compares.contains(name)) Seq("equal") else Nil))
@@ -590,7 +607,7 @@ class VectorArithmeticTest extends AnyFunSuite {
         assert(outcomes((name, "overlap")) > 0, s"$name never overlapped vd")
       for (name <- reductions) assert(outcomes((name, "inactive")) > 0, s"$name never had only inactive elements")
       if (elen == 64) assert(lanes64 == ops.map(_._1).toSet, s"never with 64-bit lanes: ${ops.map(_._1).toSet -- lanes64}")
-      println(s"VectorArithmetic VLEN=$vlen XLEN=$xlen ELEN=$elen: $cases cases, $writes writes, saturation outcomes " +
+      println(s"VectorArithmetic VLEN=$vlen DLEN=$dlen XLEN=$xlen ELEN=$elen: $cases cases, $writes writes, saturation outcomes " +
         saturations.toSeq.sorted.map { case ((n, o), c) => s"$n/$o=$c" }.mkString(" ") +
         s", $sourceInVd extensions with vs2 in the highest part of vd, mask outcomes " +
         outcomes.toSeq.sorted.map { case ((n, o), c) => s"$n/$o=$c" }.mkString(" ") + ", rounding increments " +
@@ -602,4 +619,6 @@ class VectorArithmeticTest extends AnyFunSuite {
   test("larger vector register addressing") { run(256, 64) }
   test("SEW 64 with sign-extended scalars on RV32") { run(128, 32, 64) }
   test("SEW 64 and larger vector registers on RV64") { run(256, 64, 64) }
+  test("128-bit words on RV64") { run(128, 64, 64, 128) }
+  test("128-bit words and larger vector registers on RV64") { run(256, 64, 64, 128) }
 }

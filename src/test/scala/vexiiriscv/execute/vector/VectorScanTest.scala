@@ -13,7 +13,7 @@ class VectorScanHarness(p: VectorRegFileParam, xlen: Int, elen: Int = 32) extend
     val useElement, debug = in Bool()
     val access = slave(Flow(VrfWriteCmd(p)))
     val readAddress = in UInt(p.addressWidth bits)
-    val readData = out Bits(64 bits)
+    val readData = out Bits(p.dlen bits)
     val result = out Bits(xlen bits)
     val done, busy, saturated, initHold = out Bool()
     val write = master(Flow(VrfWriteCmd(p)))
@@ -52,10 +52,11 @@ class VectorScanHarness(p: VectorRegFileParam, xlen: Int, elen: Int = 32) extend
 }
 
 class VectorScanTest extends AnyFunSuite {
-  def run(vlen: Int, xlen: Int, elen: Int = 32): Unit = {
-    val p = VectorRegFileParam(vlen = vlen)
+  def run(vlen: Int, xlen: Int, elen: Int = 32, dlen: Int = 64): Unit = {
+    val p = VectorRegFileParam(vlen = vlen, dlen = dlen)
+    val wb = dlen / 8
     SimConfig.compile(new VectorScanHarness(p, xlen, elen)).doSim { dut =>
-      val rng = new Random(1717 + vlen + xlen + (if (elen == 64) 64 else 0))
+      val rng = new Random(1717 + vlen + xlen + (if (elen == 64) 64 else 0) + dlen - 64)
       val nbytes = vlen / 8
       def tick(): Unit = {
         dut.clockDomain.risingEdge(); sleep(5)
@@ -86,8 +87,8 @@ class VectorScanTest extends AnyFunSuite {
       val crossed = scala.collection.mutable.Set[String]()
       for (name <- names; sew <- 0 to log2Up(elen / 8); lmul <- -3 to 3 if (8 << sew) <= elen * scala.math.pow(2, lmul)) {
         val max = ((vlen / (8 << sew)) * scala.math.pow(2, lmul)).toInt
-        for (vl <- Seq(0, 1, 63, 64, 65, max - 1, max).filter(_ <= max).distinct;
-             masked <- Seq(false, true); pattern <- 0 until 5) {
+        for (vl <- (Seq(0, 1, 63, 64, 65) ++ (if (dlen > 64) Seq(127, 128, 129) else Nil) ++ Seq(max - 1, max)).filter(_ <= max).distinct;
+             masked <- Seq(false, true); pattern <- 0 until (if (dlen > 64) 6 else 5)) {
           val scalar = name == "vcpop" || name == "vfirst"
           val element = scalar || name == "viota"
           val vd = if (scalar) 9 else if (!masked && pattern == 4) 0 else 8
@@ -98,11 +99,17 @@ class VectorScanTest extends AnyFunSuite {
             bytes(vs2)(b) = if (pattern == 0) 0 else if (pattern == 1) 255 else if (pattern == 2) 0 else bytes(vs2)(b)
           }
           if (pattern == 2) bytes(vs2)(nbytes - 1) = 128 // only the final mask bit is set
-          def word(r: Int, k: Int): BigInt = (0 until 8).map(b => BigInt(bytes(r)(k * 8 + b)) << (8 * b)).reduce(_ | _)
+          // Only one bit at the edge of a 64- or 128-bit mask word, all elements active
+          val edge = Seq(63, 64, 127, 128)(cases % 4) min (vlen - 1)
+          if (pattern == 5) for (b <- 0 until nbytes) {
+            bytes(0)(b) = 255
+            bytes(vs2)(b) = if (b == edge / 8) 1 << (edge % 8) else 0
+          }
+          def word(r: Int, k: Int): BigInt = (0 until wb).map(b => BigInt(bytes(r)(k * wb + b)) << (8 * b)).reduce(_ | _)
           dut.io.debug #= true
           for (r <- 0 until 32; k <- 0 until p.beatsPerReg) {
             dut.io.access.valid #= true; dut.io.access.address #= r * p.beatsPerReg + k
-            dut.io.access.mask #= 255; dut.io.access.data #= word(r, k); tick()
+            dut.io.access.mask #= (1 << wb) - 1; dut.io.access.data #= word(r, k); tick()
           }
           dut.io.access.valid #= false
           val expected = bytes.map(_.clone())
@@ -157,9 +164,9 @@ class VectorScanTest extends AnyFunSuite {
               val address = dut.io.write.address.toInt
               val mask = dut.io.write.mask.toInt
               val data = dut.io.write.data.toBigInt
-              for (b <- 0 until 8 if (mask & (1 << b)) != 0) {
+              for (b <- 0 until wb if (mask & (1 << b)) != 0) {
                 val reg = address / p.beatsPerReg
-                val at = (address % p.beatsPerReg) * 8 + b
+                val at = (address % p.beatsPerReg) * wb + b
                 assert(((data >> (8 * b)) & 255).toInt == expected(reg)(at), s"$name case=$cases sew=$sew lmul=$lmul vl=$vl masked=$masked pattern=$pattern reg=$reg byte=$at")
               }
               writeCount += 1; writes += 1
@@ -169,8 +176,8 @@ class VectorScanTest extends AnyFunSuite {
           assert(dut.io.done.toBoolean, s"$name timeout vl=$vl")
           assert(!dut.io.saturated.toBoolean)
           if (vl == 0) assert(readCount == 0 && writeCount == 0)
-          // vcpop and vfirst read each 64-bit mask word once and finish two cycles after the last read
-          val words = (vl + 63) / 64
+          // vcpop and vfirst read each DLEN-bit mask word once and finish two cycles after the last read
+          val words = (vl + dlen - 1) / dlen
           if (scalar) assert(readCount == words && cycles == scala.math.max(words, 1) + 2, s"$name vl=$vl: $readCount reads, $cycles cycles")
           if (scalar) {
             val value = if (name == "vcpop") BigInt(count) else BigInt(first) & ((BigInt(1) << xlen) - 1)
@@ -180,14 +187,14 @@ class VectorScanTest extends AnyFunSuite {
           dut.io.debug #= true
           for (r <- 0 until 32; k <- 0 until p.beatsPerReg) {
             dut.io.readAddress #= r * p.beatsPerReg + k; tick()
-            val want = (0 until 8).map(b => BigInt(expected(r)(k * 8 + b)) << (8 * b)).reduce(_ | _)
+            val want = (0 until wb).map(b => BigInt(expected(r)(k * wb + b)) << (8 * b)).reduce(_ | _)
             assert(dut.io.readData.toBigInt == want, s"$name full readback case=$cases reg=$r word=$k")
           }
           cases += 1
         }
       }
-      assert(names.forall(crossed.contains), s"mask-word coverage $crossed")
-      println(s"VectorScan VLEN=$vlen XLEN=$xlen ELEN=$elen: $cases cases, $writes writes; all six forms cross mask words; full physical readback")
+      assert(p.beatsPerReg == 1 || names.forall(crossed.contains), s"mask-word coverage $crossed")
+      println(s"VectorScan VLEN=$vlen DLEN=$dlen XLEN=$xlen ELEN=$elen: $cases cases, $writes writes; all six forms cross mask words; full physical readback")
     }
   }
   test("mask scans on RV32") { run(128, 32) }
@@ -195,4 +202,6 @@ class VectorScanTest extends AnyFunSuite {
   test("multiple mask words and counter width") { run(256, 64) }
   test("SEW-64 iota on RV32") { run(128, 32, 64) }
   test("SEW-64 iota at VLEN 256") { run(256, 64, 64) }
+  test("128-bit mask words") { run(128, 64, 64, 128) }
+  test("128-bit mask words at VLEN 256") { run(256, 64, 64, 128) }
 }

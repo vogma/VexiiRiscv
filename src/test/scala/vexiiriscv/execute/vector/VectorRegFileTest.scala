@@ -209,4 +209,7 @@ class VectorRegFileTest extends AnyFunSuite {
   test("VLEN=128 DLEN=128 3R1W") {
     run(VectorRegFileParam(vlen = 128, dlen = 128, readPorts = 3), cycles = 5000, seed = 4)
   }
+  test("VLEN=256 DLEN=128 3R1W") {
+    run(VectorRegFileParam(vlen = 256, dlen = 128, readPorts = 3), cycles = 5000, seed = 5)
+  }
 }

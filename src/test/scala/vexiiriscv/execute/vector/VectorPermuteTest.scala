@@ -9,10 +9,11 @@ class VectorPermuteTest extends AnyFunSuite {
   import VectorElementOp._
   val ops = Seq(SLIDEUP, SLIDEDOWN, SLIDE1UP, SLIDE1DOWN, GATHER, GATHEREI16, COMPRESS)
 
-  def run(vlen: Int, xlen: Int, elen: Int = 32): Unit = {
-    val p = VectorRegFileParam(vlen = vlen)
+  def run(vlen: Int, xlen: Int, elen: Int = 32, dlen: Int = 64): Unit = {
+    val p = VectorRegFileParam(vlen = vlen, dlen = dlen)
+    val wb = dlen / 8
     SimConfig.compile(new VectorElementHarness(p, xlen, elen)).doSim { dut =>
-      val rng = new Random(1818 + vlen + xlen + (if (elen == 64) 64 else 0))
+      val rng = new Random(1818 + vlen + xlen + (if (elen == 64) 64 else 0) + dlen - 64)
       val nbytes = vlen / 8
       def tick(): Unit = {
         dut.clockDomain.risingEdge(); sleep(5)
@@ -41,7 +42,7 @@ class VectorPermuteTest extends AnyFunSuite {
         val size = 1 << sew
         val max = (vlen / (8 << sew) * scala.math.pow(2, lmul)).toInt
         val vls = Seq(0, 1, 2, max / 2, max - 1, max).distinct.filter(_ <= max)
-        for (vl <- vls; masked <- Seq(false, true) if op != COMPRESS || !masked; pattern <- 0 until 5) {
+        for (vl <- vls; masked <- Seq(false, true) if op != COMPRESS || !masked; pattern <- 0 until (if (dlen > 64) 6 else 5)) {
           val vector = op == GATHEREI16 || (op == GATHER && pattern % 2 == 0)
           val overlap = (op == SLIDEDOWN || op == SLIDE1DOWN) && pattern % 2 == 0
           val vd = if (!masked && pattern == 4 && !overlap) 0 else 8
@@ -70,6 +71,9 @@ class VectorPermuteTest extends AnyFunSuite {
             bytes(0)(b) = if (pattern == 0) 0 else if (pattern == 1) 255 else bytes(0)(b)
             if (op == COMPRESS) bytes(vs1)(b) = if (pattern == 0) 0 else if (pattern == 1) 255 else bytes(vs1)(b)
           }
+          // Compress selects only the element at the edge of a 64- or 128-bit mask word
+          val edge = Seq(63, 64, 127, 128)(cases % 4) min (vlen - 1)
+          if (op == COMPRESS && pattern == 5) for (b <- 0 until nbytes) bytes(vs1)(b) = if (b == edge / 8) 1 << (edge % 8) else 0
           val indexBytes = if (op == GATHEREI16) 2 else size
           // A 64-bit index above 2^32 is out of range, also on RV32 (norm:vrgather_vrgatherei16_id_ge_vlmax)
           if (vector) for (i <- 0 until max) {
@@ -102,8 +106,8 @@ class VectorPermuteTest extends AnyFunSuite {
           dut.io.debug #= true
           for (r <- 0 until 32; k <- 0 until p.beatsPerReg) {
             dut.io.access.valid #= true; dut.io.access.address #= r * p.beatsPerReg + k
-            dut.io.access.mask #= 255
-            dut.io.access.data #= (0 until 8).map(b => BigInt(bytes(r)(k * 8 + b)) << (8 * b)).reduce(_ | _)
+            dut.io.access.mask #= (1 << wb) - 1
+            dut.io.access.data #= (0 until wb).map(b => BigInt(bytes(r)(k * wb + b)) << (8 * b)).reduce(_ | _)
             tick()
           }
           dut.io.access.valid #= false; dut.io.debug #= false
@@ -121,11 +125,11 @@ class VectorPermuteTest extends AnyFunSuite {
               assert(vector || op == COMPRESS)
               val a = dut.io.readAddresses(0).toInt
               val span = if (op == COMPRESS) nbytes else max * indexBytes
-              assert(a >= vs1 * p.beatsPerReg && a < vs1 * p.beatsPerReg + (span + 7) / 8)
+              assert(a >= vs1 * p.beatsPerReg && a < vs1 * p.beatsPerReg + (span + wb - 1) / wb)
             }
             if ((reads & 2) != 0) {
               val a = dut.io.readAddresses(1).toInt
-              assert(a >= vs2 * p.beatsPerReg && a < vs2 * p.beatsPerReg + (max * size + 7) / 8)
+              assert(a >= vs2 * p.beatsPerReg && a < vs2 * p.beatsPerReg + (max * size + wb - 1) / wb)
               if (a >= (vs2 + 1) * p.beatsPerReg) crossings += op
             }
             if (vl == 0) assert(reads == 0)
@@ -134,8 +138,8 @@ class VectorPermuteTest extends AnyFunSuite {
               val mask = dut.io.write.mask.toInt
               val data = dut.io.write.data.toBigInt
               assert(Integer.bitCount(mask) == size)
-              for (b <- 0 until 8 if (mask & (1 << b)) != 0) {
-                val r = a / p.beatsPerReg; val at = (a % p.beatsPerReg) * 8 + b
+              for (b <- 0 until wb if (mask & (1 << b)) != 0) {
+                val r = a / p.beatsPerReg; val at = (a % p.beatsPerReg) * wb + b
                 assert(((data >> (8 * b)) & 255).toInt == expected(r)(at),
                   s"op=$op sew=$sew lmul=$lmul vl=$vl pattern=$pattern masked=$masked reg=$r byte=$at")
               }
@@ -150,14 +154,14 @@ class VectorPermuteTest extends AnyFunSuite {
           dut.io.debug #= true
           for (r <- 0 until 32; k <- 0 until p.beatsPerReg) {
             dut.io.readAddress #= r * p.beatsPerReg + k; tick()
-            val want = (0 until 8).map(b => BigInt(expected(r)(k * 8 + b)) << (8 * b)).reduce(_ | _)
+            val want = (0 until wb).map(b => BigInt(expected(r)(k * wb + b)) << (8 * b)).reduce(_ | _)
             assert(dut.io.readData.toBigInt == want, s"op=$op full readback case=$cases reg=$r word=$k")
           }
           cases += 1
         }
       }
       assert(ops.forall(crossings.contains), s"group-crossing coverage $crossings")
-      println(s"VectorPermute VLEN=$vlen XLEN=$xlen ELEN=$elen: $cases cases, $writes writes; full physical readback")
+      println(s"VectorPermute VLEN=$vlen DLEN=$dlen XLEN=$xlen ELEN=$elen: $cases cases, $writes writes; full physical readback")
     }
   }
   test("permutations on RV32") { run(128, 32) }
@@ -166,4 +170,6 @@ class VectorPermuteTest extends AnyFunSuite {
   test("SEW-64 permutations on RV32") { run(128, 32, 64) }
   test("SEW-64 permutations on RV64") { run(128, 64, 64) }
   test("SEW-64 permutations at VLEN 256") { run(256, 64, 64) }
+  test("128-bit words") { run(128, 64, 64, 128) }
+  test("128-bit words at VLEN 256") { run(256, 64, 64, 128) }
 }

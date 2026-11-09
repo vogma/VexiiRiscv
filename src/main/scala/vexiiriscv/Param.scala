@@ -992,7 +992,9 @@ class ParamSimple() {
     if(extension.withZve32x) {
       assert(isPow2(vlen) && vlen >= 128, s"VLEN must be a power of two >= 128, got $vlen")
       assert(zvlActive.max == vlen, s"zvl${zvlActive.max}b in the ISA disagrees with VLEN = $vlen")
-      assert(vectorDlen == 64, s"only DLEN = 64 is supported, got $vectorDlen")
+      assert(vectorDlen == 64 || vectorDlen == 128, s"DLEN must be 64 or 128, got $vectorDlen")
+      assert(vectorDlen <= vlen, s"DLEN = $vectorDlen exceeds VLEN = $vlen")
+      assert(vectorDlen == 64 || xlen == 64, "DLEN = 128 needs RV64")
       assert(lsuL1Enable, "the vector unit needs the LSU L1 (--lsu-l1)")
       assert(!extension.withHypervisor, "the vector unit does not support the hypervisor extension")
       assert(vectorQueue >= 0 && vectorQueue <= 4, s"the vector queue depth must be 0 to 4, got $vectorQueue")

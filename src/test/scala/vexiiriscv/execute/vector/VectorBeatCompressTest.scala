@@ -10,15 +10,16 @@ import scala.util.Random
 // Beat-unit vcompress.vm against an element model (norm:vcompress_op): selected vs2 elements packed into vd from
 // element 0, the rest of vd undisturbed
 class VectorBeatCompressTest extends AnyFunSuite {
-  def run(vlen: Int, xlen: Int, elen: Int): Unit = {
-    val p = VectorRegFileParam(vlen = vlen)
+  def run(vlen: Int, xlen: Int, elen: Int, dlen: Int = 64): Unit = {
+    val p = VectorRegFileParam(vlen = vlen, dlen = dlen)
+    val wb = dlen / 8
     val maxSew = log2Up(elen / 8)
     SimConfig.compile(new VectorArithmeticHarness(p, xlen, elen, slides = true, beatCompress = true)).doSim { dut =>
-      val random = new Random(53 + xlen + vlen + elen)
+      val random = new Random(53 + xlen + vlen + elen + dlen - 64)
       val regBytes = vlen / 8
       val bytes = Array.fill(32, regBytes)(random.nextInt(256))
       def word(reg: Int, offset: Int): BigInt =
-        (0 until 8).map(b => BigInt(bytes(reg)(offset + b)) << (b * 8)).reduce(_ | _)
+        (0 until wb).map(b => BigInt(bytes(reg)(offset + b)) << (b * 8)).reduce(_ | _)
       def tick(): Unit = {
         dut.clockDomain.risingEdge(); sleep(5)
         dut.clockDomain.fallingEdge(); sleep(5)
@@ -26,8 +27,8 @@ class VectorBeatCompressTest extends AnyFunSuite {
       def store(a: Int): Unit = {
         dut.io.access.valid #= true
         dut.io.access.address #= a
-        dut.io.access.mask #= 255
-        dut.io.access.data #= word(a / p.beatsPerReg, (a % p.beatsPerReg) * 8)
+        dut.io.access.mask #= (1 << wb) - 1
+        dut.io.access.data #= word(a / p.beatsPerReg, (a % p.beatsPerReg) * wb)
         tick()
         dut.io.access.valid #= false
       }
@@ -58,7 +59,7 @@ class VectorBeatCompressTest extends AnyFunSuite {
       val latencies = mutable.Map[Boolean, mutable.Set[Int]]()
       def execute(sew: Int, lmul: Int, vl: Int, density: Double, nested: Boolean, chosen: Option[Int => Boolean] = None): Unit = {
         val size = 1 << sew
-        val perWord = 8 / size
+        val perWord = wb / size
         val group = 1 << (lmul max 0)
         val vlmax = (vlen / (8 * size) * math.pow(2, lmul)).toInt
         def pick(): Int = random.nextInt(32 / group) * group
@@ -89,17 +90,17 @@ class VectorBeatCompressTest extends AnyFunSuite {
           if (vl > 0) pairs += ((sew, fill, n))
           if (k == steps - 1) {
             val t = fill + n * size
-            extra = t > 8
-            seen(s"e${8 * size} last ${if (t == 0) "none" else if (t < 8) "merged" else if (t == 8) "exact" else "extra flush"}") += 1
+            extra = t > wb
+            seen(s"e${8 * size} last ${if (t == 0) "none" else if (t < wb) "merged" else if (t == wb) "exact" else "extra flush"}") += 1
           }
-          fill = (fill + n * size) % 8
+          fill = (fill + n * size) % wb
         }
         if (vl == 0) seen("vl 0") += 1
         if (vl > 0 && selected.isEmpty) seen("no element selected") += 1
         if (nested) seen("vs1 in the vs2 group") += 1
         if ((vl until vlen).exists(bit)) seen("mask bits above vl") += 1
-        if (vl > 64) seen("second mask word") += 1
-        if (vl > 192) seen("fourth mask word") += 1
+        if (vl > dlen) seen("second mask word") += 1
+        if (vl > 3 * dlen) seen("fourth mask word") += 1
         if (lmul < 0) seen("fractional") += 1
 
         dut.io.debug #= false
@@ -107,7 +108,7 @@ class VectorBeatCompressTest extends AnyFunSuite {
         cmd.vd #= vd; cmd.vs2 #= vs2; cmd.vs1 #= vs1; cmd.vl #= vl; cmd.sew #= sew; cmd.vlmax #= vlmax
         tick()
         cmd.valid #= false
-        val writtenWords = (selected.size * size + 7) / 8
+        val writtenWords = (selected.size * size + wb - 1) / wb
         var cycles = 0
         while (!dut.io.done.toBoolean && cycles < 300) {
           sleep(1)
@@ -138,7 +139,7 @@ class VectorBeatCompressTest extends AnyFunSuite {
         dut.io.debug #= true
         for (a <- 0 until p.wordCount) {
           dut.io.readAddress #= a; tick()
-          assert(dut.io.readData.toBigInt == word(a / p.beatsPerReg, (a % p.beatsPerReg) * 8),
+          assert(dut.io.readData.toBigInt == word(a / p.beatsPerReg, (a % p.beatsPerReg) * wb),
             s"readback case $cases sew $sew lmul $lmul vl $vl vd $vd vs2 $vs2 vs1 $vs1 word $a")
         }
         cases += 1
@@ -147,26 +148,28 @@ class VectorBeatCompressTest extends AnyFunSuite {
       val densities = Seq(0.0, 1.0, 0.5, 0.15, 0.85)
       for (sew <- 0 to maxSew; lmul <- -3 to 3 if (8 << sew) <= elen * math.pow(2, lmul)) {
         val vlmax = (vlen / (8 << sew) * math.pow(2, lmul)).toInt
-        val perWord = 8 >> sew
+        val perWord = wb >> sew
         val vls = (Seq(0, 1, perWord - 1, perWord, perWord + 1, 2 * perWord - 1, 2 * perWord + 1, vlmax - 1, vlmax) ++
           Seq.fill(2)(1 + random.nextInt(vlmax))).filter(v => v >= 0 && v <= vlmax).distinct
         for (vl <- vls; d <- densities) execute(sew, lmul, vl, d, nested = random.nextInt(4) == 0)
         for (_ <- 0 until 12) execute(sew, lmul, vlmax, random.nextDouble(), nested = random.nextInt(4) == 0)
       }
       // Each fill and count directly: the first word selects fill bytes, the second count elements
-      for (sew <- 0 to maxSew; fill <- 0 until 8 by (1 << sew); n <- 0 to (8 >> sew)) {
-        val perWord = 8 >> sew
+      for (sew <- 0 to maxSew; fill <- 0 until wb by (1 << sew); n <- 0 to (wb >> sew)) {
+        val perWord = wb >> sew
         execute(sew, 1, 2 * perWord, 0, nested = false, Some(i => if (i < perWord) i < (fill >> sew) else i - perWord < n))
       }
+      // Only one element selected, at the edges of 64- and 128-bit mask words
+      for (e <- Seq(63, 64, 127, 128, 255) if e < vlen) execute(0, 3, vlen, 0, nested = false, Some(_ == e))
       // Every reachable fill and count entering a step: fill a multiple of the element size, count up to a word
-      for (sew <- 0 to maxSew; fill <- 0 until 8 by (1 << sew); n <- 0 to (8 >> sew)) assert(pairs((sew, fill, n)), s"never: e${8 << sew} fill $fill count $n")
-      val wanted = Seq("vl 0", "no element selected", "vs1 in the vs2 group", "mask bits above vl", "second mask word", "fractional") ++
-        (0 to maxSew).flatMap(s => (Seq("none", "exact") ++ (if (s < 3) Seq("merged", "extra flush") else Nil)).map(c => s"e${8 << s} last $c")) ++
-        (if (vlen >= 256) Seq("fourth mask word") else Nil)
+      for (sew <- 0 to maxSew; fill <- 0 until wb by (1 << sew); n <- 0 to (wb >> sew)) assert(pairs((sew, fill, n)), s"never: e${8 << sew} fill $fill count $n")
+      val wanted = Seq("vl 0", "no element selected", "vs1 in the vs2 group", "mask bits above vl", "fractional") ++
+        (0 to maxSew).flatMap(s => (Seq("none", "exact") ++ (if ((1 << s) < wb) Seq("merged", "extra flush") else Nil)).map(c => s"e${8 << s} last $c")) ++
+        (if (vlen >= 2 * dlen) Seq("second mask word") else Nil) ++ (if (vlen >= 4 * dlen) Seq("fourth mask word") else Nil)
       for (w <- wanted) assert(seen(w) > 0, s"never: $w")
       // done a constant number of cycles after the last step, one more with the extra flush
       assert(latencies(false).size == 1 && latencies(true) == mutable.Set(latencies(false).head + 1), s"done latencies $latencies")
-      println(s"VectorBeatCompress VLEN=$vlen XLEN=$xlen ELEN=$elen: $cases cases, $writes writes, done ${latencies(false).head} cycles " +
+      println(s"VectorBeatCompress VLEN=$vlen DLEN=$dlen XLEN=$xlen ELEN=$elen: $cases cases, $writes writes, done ${latencies(false).head} cycles " +
         s"after the last step (+1 with the extra flush), ${pairs.size} fill/count pairs, coverage " +
         seen.toSeq.sorted.map { case (k, v) => s"$k=$v" }.mkString(", ") + ", full physical readback after every case")
     }
@@ -176,4 +179,6 @@ class VectorBeatCompressTest extends AnyFunSuite {
   test("beat compress on RV64") { run(128, 64, 64) }
   test("beat compress with VLMAX 256 on RV32") { run(256, 32, 32) }
   test("beat compress with VLMAX 256 on RV64") { run(256, 64, 64) }
+  test("beat compress with 128-bit words") { run(128, 64, 64, 128) }
+  test("beat compress with 128-bit words at VLEN 256") { run(256, 64, 64, 128) }
 }

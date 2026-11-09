@@ -13,16 +13,17 @@ class VectorBeatPermuteTest extends AnyFunSuite {
   // Command slide field: bit 0 down, bit 1 by one element with the scalar inserted
   val kinds = Seq("vslideup" -> 0, "vslidedown" -> 1, "vslide1up" -> 2, "vslide1down" -> 3, "vrgather" -> 0)
 
-  def run(vlen: Int, xlen: Int, elen: Int): Unit = {
-    val p = VectorRegFileParam(vlen = vlen)
+  def run(vlen: Int, xlen: Int, elen: Int, dlen: Int = 64): Unit = {
+    val p = VectorRegFileParam(vlen = vlen, dlen = dlen)
+    val wb = dlen / 8
     val maxSew = log2Up(elen / 8)
     SimConfig.compile(new VectorArithmeticHarness(p, xlen, elen, slides = true)).doSim { dut =>
-      val random = new Random(37 + xlen + vlen + elen)
+      val random = new Random(37 + xlen + vlen + elen + dlen - 64)
       val regBytes = vlen / 8
       val bytes = Array.fill(32, regBytes)(random.nextInt(256))
       val xmask = (BigInt(1) << xlen) - 1
       def word(reg: Int, offset: Int): BigInt =
-        (0 until 8).map(b => BigInt(bytes(reg)(offset + b)) << (b * 8)).reduce(_ | _)
+        (0 until wb).map(b => BigInt(bytes(reg)(offset + b)) << (b * 8)).reduce(_ | _)
       def tick(): Unit = {
         dut.clockDomain.risingEdge(); sleep(5)
         dut.clockDomain.fallingEdge(); sleep(5)
@@ -48,8 +49,8 @@ class VectorBeatPermuteTest extends AnyFunSuite {
       for (a <- 0 until p.wordCount) {
         dut.io.access.valid #= true
         dut.io.access.address #= a
-        dut.io.access.mask #= 255
-        dut.io.access.data #= word(a / p.beatsPerReg, (a % p.beatsPerReg) * 8)
+        dut.io.access.mask #= (1 << wb) - 1
+        dut.io.access.data #= word(a / p.beatsPerReg, (a % p.beatsPerReg) * wb)
         tick()
       }
       dut.io.access.valid #= false
@@ -110,9 +111,9 @@ class VectorBeatPermuteTest extends AnyFunSuite {
         cmd.vlmax #= vlmax; cmd.slide #= kinds.find(_._1 == kind).get._2
         tick()
         cmd.valid #= false
-        val steps = math.max(1, (vl * size + 7) / 8)
+        val steps = math.max(1, (vl * size + wb - 1) / wb)
         // Source words of the group: VLMAX elements, fewer than a register at fractional LMUL
-        val sourceWords = (vlmax * size + 7) / 8
+        val sourceWords = (vlmax * size + wb - 1) / wb
         var cycles = 0
         while (!dut.io.done.toBoolean && cycles < 300) {
           sleep(1)
@@ -137,7 +138,7 @@ class VectorBeatPermuteTest extends AnyFunSuite {
         dut.io.debug #= true
         for (a <- 0 until p.wordCount) {
           dut.io.readAddress #= a; tick()
-          assert(dut.io.readData.toBigInt == word(a / p.beatsPerReg, (a % p.beatsPerReg) * 8),
+          assert(dut.io.readData.toBigInt == word(a / p.beatsPerReg, (a % p.beatsPerReg) * wb),
             s"readback case $cases $kind sew $sew lmul $lmul vl $vl masked $masked amount $scalar vd $vd vs2 $vs2 word $a")
         }
         cases += 1
@@ -145,8 +146,10 @@ class VectorBeatPermuteTest extends AnyFunSuite {
 
       for (sew <- 0 to maxSew; lmul <- -3 to 3 if (8 << sew) <= elen * math.pow(2, lmul)) {
         val vlmax = (vlen / (8 << sew) * math.pow(2, lmul)).toInt
-        val perWord = 8 >> sew
-        val amounts = (Seq(0, 1, 2, 3, perWord - 1, perWord, perWord + 1, vlmax - 1, vlmax, vlmax + 1).filter(_ >= 0).map(BigInt(_)) ++
+        val perWord = wb >> sew
+        // With 128-bit words also the 64-bit sub-word edge
+        val half = if (wb > 8) Seq((8 >> sew) - 1, 8 >> sew, (8 >> sew) + 1) else Nil
+        val amounts = ((Seq(0, 1, 2, 3, perWord - 1, perWord, perWord + 1) ++ half ++ Seq(vlmax - 1, vlmax, vlmax + 1)).filter(_ >= 0).map(BigInt(_)) ++
           Seq(xmask, BigInt(xlen, random), BigInt(random.nextInt(vlmax + 2))) ++
           (if (xlen == 64) Seq(BigInt(1) << 32, (BigInt(1) << 32) + 1) else Nil)).distinct
         for ((kind, _) <- kinds; vl <- Seq(0, 1, vlmax - 1, vlmax, 1 + random.nextInt(vlmax)).distinct; masked <- Seq(false, true)) {
@@ -161,7 +164,7 @@ class VectorBeatPermuteTest extends AnyFunSuite {
       for (w <- wanted) assert(seen(w) > 0, s"never: $w")
       // Every form streams like SINGLE: done a constant number of cycles after the last step
       assert(latencies.size == 1, s"done latencies $latencies")
-      println(s"VectorBeatPermute VLEN=$vlen XLEN=$xlen ELEN=$elen: $cases cases, $writes writes, done ${latencies.head} cycles " +
+      println(s"VectorBeatPermute VLEN=$vlen DLEN=$dlen XLEN=$xlen ELEN=$elen: $cases cases, $writes writes, done ${latencies.head} cycles " +
         "after the last step, coverage " + seen.toSeq.sorted.map { case (k, v) => s"$k=$v" }.mkString(", ") +
         ", reads checked inside the vs2 group, full physical readback after every case")
     }
@@ -171,4 +174,6 @@ class VectorBeatPermuteTest extends AnyFunSuite {
   test("beat slides and gathers on RV64") { run(128, 64, 64) }
   test("beat slides and gathers with VLMAX 256 on RV32") { run(256, 32, 32) }
   test("beat slides and gathers with VLMAX 256 on RV64") { run(256, 64, 64) }
+  test("beat slides and gathers with 128-bit words") { run(128, 64, 64, 128) }
+  test("beat slides and gathers with 128-bit words at VLEN 256") { run(256, 64, 64, 128) }
 }

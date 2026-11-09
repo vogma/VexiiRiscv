@@ -45,12 +45,17 @@ case class VectorElementCmd(p: VectorRegFileParam, xlen: Int) extends Bundle {
 // finish in t+4 and write in t+5. Division serializes active elements; inactive elements take a cycle and no reads.
 // With ELEN 64 an active SEW-64 multiply takes three passes of the 33 x 33 multiplier, reading its element in each,
 // and the divider, iota counts, gather indices and permuted data are 64 bits wide.
-// vcpop and vfirst take one 64-bit mask word per cycle: read in t, mask in t+1, count and find in t+2.
+// vcpop and vfirst take one DLEN-bit mask word per cycle: read in t, mask in t+1, count and find in t+2.
 class VectorElementUnit(val p: VectorRegFileParam, val xlen: Int, val elen: Int = 32, val slides: Boolean = false,
                         val beatCompress: Boolean = false) extends Component {
-  require(p.dlen == 64 && p.readPorts >= 3)
+  require((p.dlen == 64 || p.dlen == 128) && p.readPorts >= 3)
   require(xlen == 32 || xlen == 64)
   require(elen == 32 || elen == 64)
+  // A result element replicated over the VRF word; the write mask selects its bytes
+  def fill(v: Bits, bits: Int): Bits = {
+    val e = if (v.getWidth == bits) v else v(bits - 1 downto 0)
+    if (bits == p.dlen) e else e #* (p.dlen / bits)
+  }
   val io = new Bundle {
     val cmd = slave(Flow(VectorElementCmd(p, xlen)))
     val reads = Vec.fill(3)(master(VrfReadPort(p)))
@@ -131,7 +136,7 @@ class VectorElementUnit(val p: VectorRegFileParam, val xlen: Int, val elen: Int 
     val valid = RegNext(issue.active) init(False)
     val last = RegNext(issue.last) init(False)
     val pass = elen == 64 generate RegNext(VectorElementUnit.this.pass)
-    val maskBit = RegNext(index.resize(6))
+    val maskBit = RegNext(index.resize(log2Up(p.dlen)))
     val elementIndex = RegNext(index)
     val byte = RegNext(issue.offset.resize(log2Up(p.beatBytes)))
     val vdByte = RegNext(issue.vdOffset.resize(log2Up(p.beatBytes)))
@@ -281,9 +286,9 @@ class VectorElementUnit(val p: VectorRegFileParam, val xlen: Int, val elen: Int 
     val result = divide ? division.result.resize(elen) | multiplyResult
     val vdByte = divide ? division.vdByte | m2.vdByte
     val eew = widen ? (command.sew + 1) | command.sew
-    val data = if (elen == 64) eew.mux(U(0) -> (result(7 downto 0) #* 8), U(1) -> (result(15 downto 0) #* 4),
-      U(2) -> (result(31 downto 0) #* 2), default -> result) else
-      eew.mux(U(0) -> (result(7 downto 0) #* 8), U(1) -> (result(15 downto 0) #* 4), default -> (result #* 2))
+    val data = if (elen == 64) eew.mux(U(0) -> fill(result, 8), U(1) -> fill(result, 16),
+      U(2) -> fill(result, 32), default -> fill(result, 64)) else
+      eew.mux(U(0) -> fill(result, 8), U(1) -> fill(result, 16), default -> fill(result, 32))
     val bytes = if (elen == 64) eew.mux(U(0) -> B"x01", U(1) -> B"x03", U(2) -> B"x0F", default -> B"xFF") else
       eew.mux(U(0) -> B"0001", U(1) -> B"0011", default -> B"1111")
     val mask = (bytes.resize(p.beatBytes) << vdByte).resize(p.beatBytes)
@@ -295,9 +300,9 @@ class VectorElementUnit(val p: VectorRegFileParam, val xlen: Int, val elen: Int 
     val valid = RegNext(finish.write || division.core.io.rsp.fire || (scan && is(VectorElementOp.IOTA) && x1.valid)) init(False)
     val last = RegNext((scan && x1.last) || m2.last || (divide && ((division.core.io.rsp.fire && division.last) || (x1.last && !x1.valid)))) init(False)
     val address = RegNext(scan ? x1.address | (divide ? division.address | m2.address))
-    val scanData = if (elen == 64) command.sew.mux(U(0) -> (count.resize(8).asBits #* 8), U(1) -> (count.resize(16).asBits #* 4),
-      U(2) -> (count.resize(32).asBits #* 2), default -> count.resize(64).asBits) else command.sew.mux(U(0) -> (count.resize(8).asBits #* 8),
-      U(1) -> (count.resize(16).asBits #* 4), default -> (count.resize(32).asBits #* 2))
+    val scanData = if (elen == 64) command.sew.mux(U(0) -> fill(count.resize(8).asBits, 8), U(1) -> fill(count.resize(16).asBits, 16),
+      U(2) -> fill(count.resize(32).asBits, 32), default -> fill(count.resize(64).asBits, 64)) else command.sew.mux(U(0) -> fill(count.resize(8).asBits, 8),
+      U(1) -> fill(count.resize(16).asBits, 16), default -> fill(count.resize(32).asBits, 32))
     val scanBytes = if (elen == 64) command.sew.mux(U(0) -> B"x01", U(1) -> B"x03", U(2) -> B"x0F", default -> B"xFF") else
       command.sew.mux(U(0) -> B"0001", U(1) -> B"0011", default -> B"1111")
     val scanMask = (scanBytes.resize(p.beatBytes) << x1.vdByte).resize(p.beatBytes)
@@ -361,7 +366,7 @@ class VectorElementUnit(val p: VectorRegFileParam, val xlen: Int, val elen: Int 
       spinal.core.is(VectorElementOp.GATHER) { source := offset }
       spinal.core.is(VectorElementOp.GATHEREI16) { source := offset }
     }
-    val selected = !compress || io.reads(0).rsp(index1.resize(6))
+    val selected = !compress || io.reads(0).rsp(index1.resize(log2Up(p.dlen)))
     val write1 = valid1 && keep && selected
     val inRange = source < command.vlmax.resize(indexWidth + 1)
     val sourceOffset = (source.resize(offsetWidth) << command.sew).resize(offsetWidth)
@@ -383,9 +388,9 @@ class VectorElementUnit(val p: VectorRegFileParam, val xlen: Int, val elen: Int 
     // vslide1up/vslide1down sign-extend the scalar to SEW (norm:vslide1up-vx_op)
     val data2 = scalar2 ? (if (elen == 64) command.scalar.asSInt.resize(64).asBits else command.scalar.resize(32)) |
       (zero2 ? B(0, elen bits) | (io.reads(1).rsp >> (byte2 << 3)).resize(elen))
-    val replicated = if (elen == 64) command.sew.mux(U(0) -> (data2(7 downto 0) #* 8), U(1) -> (data2(15 downto 0) #* 4),
-      U(2) -> (data2(31 downto 0) #* 2), default -> data2) else command.sew.mux(U(0) -> (data2(7 downto 0) #* 8),
-      U(1) -> (data2(15 downto 0) #* 4), default -> (data2 #* 2))
+    val replicated = if (elen == 64) command.sew.mux(U(0) -> fill(data2, 8), U(1) -> fill(data2, 16),
+      U(2) -> fill(data2, 32), default -> fill(data2, 64)) else command.sew.mux(U(0) -> fill(data2, 8),
+      U(1) -> fill(data2, 16), default -> fill(data2, 32))
     val bytes = if (elen == 64) command.sew.mux(U(0) -> B"x01", U(1) -> B"x03", U(2) -> B"x0F", default -> B"xFF") else
       command.sew.mux(U(0) -> B"0001", U(1) -> B"0011", default -> B"1111")
     val valid3 = RegNext(valid2) init(False)

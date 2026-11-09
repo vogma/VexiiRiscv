@@ -14,7 +14,7 @@ class VectorElementHarness(p: VectorRegFileParam, xlen: Int, elen: Int = 32) ext
     val debug = in Bool()
     val access = slave(Flow(VrfWriteCmd(p)))
     val readAddress = in UInt(p.addressWidth bits)
-    val readData = out Bits(64 bits)
+    val readData = out Bits(p.dlen bits)
     val initHold, done, busy, saturated = out Bool()
     val write = master(Flow(VrfWriteCmd(p)))
     val divCommand = out Bool()
@@ -64,14 +64,15 @@ class VectorElementUnitTest extends AnyFunSuite {
   def wide(name: String) = name.startsWith("vw")
   def readsVd(name: String) = Seq("vmacc", "vnmsac", "vmadd", "vnmsub").contains(name) || name.startsWith("vwmacc")
 
-  def run(vlen: Int, xlen: Int, exhaustive: Boolean, elen: Int = 32): Unit = {
-    val p = VectorRegFileParam(vlen = vlen)
+  def run(vlen: Int, xlen: Int, exhaustive: Boolean, elen: Int = 32, dlen: Int = 64): Unit = {
+    val p = VectorRegFileParam(vlen = vlen, dlen = dlen)
+    val wb = dlen / 8
     SimConfig.compile(new VectorElementHarness(p, xlen, elen)).doSim { dut =>
-      val random = new Random(1301 + xlen + vlen + (if (elen == 64) 64 else 0))
+      val random = new Random(1301 + xlen + vlen + (if (elen == 64) 64 else 0) + dlen - 64)
       val vlenb = vlen / 8
       val bytes = Array.fill(32, vlenb)(random.nextInt(256))
       def word(reg: Int, offset: Int): BigInt =
-        (0 until 8).map(b => BigInt(bytes(reg)(offset + b)) << (b * 8)).reduce(_ | _)
+        (0 until wb).map(b => BigInt(bytes(reg)(offset + b)) << (b * 8)).reduce(_ | _)
       def tick(): Unit = {
         dut.clockDomain.risingEdge(); sleep(5)
         dut.clockDomain.fallingEdge(); sleep(5)
@@ -96,8 +97,8 @@ class VectorElementUnitTest extends AnyFunSuite {
         for (r <- regs; k <- 0 until p.beatsPerReg) {
           dut.io.access.valid #= true
           dut.io.access.address #= r * p.beatsPerReg + k
-          dut.io.access.mask #= 255
-          dut.io.access.data #= word(r, k * 8)
+          dut.io.access.mask #= (1 << wb) - 1
+          dut.io.access.data #= word(r, k * wb)
           tick()
         }
         dut.io.access.valid #= false
@@ -177,8 +178,8 @@ class VectorElementUnitTest extends AnyFunSuite {
           val bits = value & ((BigInt(1) << (8 * dsize)) - 1)
           val at = i * dsize
           for (b <- 0 until dsize) bytes(vd + (at + b) / vlenb)((at + b) % vlenb) = ((bits >> (8 * b)) & 255).toInt
-          val pos = at % 8
-          val address = vd * p.beatsPerReg + at / 8
+          val pos = at % wb
+          val address = vd * p.beatsPerReg + at / wb
           val data = bits << (8 * pos)
           expected += ((address, data, ((1 << dsize) - 1) << pos))
         }
@@ -205,9 +206,9 @@ class VectorElementUnitTest extends AnyFunSuite {
             if (!divide) assert(cycles == starts(i) + readCycles.size % passes, s"read cycle case $cases $name element $i")
             val want = 1 | (if (vector) 2 else 0) | (if (readsVd(name)) 4 else 0)
             assert(rv == want, s"read ports case $cases $name")
-            assert(dut.io.readAddresses(0).toInt == vs2 * p.beatsPerReg + i * size / 8, s"vs2 word case $cases")
-            if (vector) assert(dut.io.readAddresses(1).toInt == vs1 * p.beatsPerReg + i * size / 8, s"vs1 word case $cases")
-            if (readsVd(name)) assert(dut.io.readAddresses(2).toInt == vd * p.beatsPerReg + i * dsize / 8, s"vd word case $cases")
+            assert(dut.io.readAddresses(0).toInt == vs2 * p.beatsPerReg + i * size / wb, s"vs2 word case $cases")
+            if (vector) assert(dut.io.readAddresses(1).toInt == vs1 * p.beatsPerReg + i * size / wb, s"vs1 word case $cases")
+            if (readsVd(name)) assert(dut.io.readAddresses(2).toInt == vd * p.beatsPerReg + i * dsize / wb, s"vd word case $cases")
             readCycles += cycles
           }
           if (dut.io.write.valid.toBoolean) {
@@ -215,7 +216,7 @@ class VectorElementUnitTest extends AnyFunSuite {
             val (address, data, byteMask) = expected(writeIndex)
             assert(dut.io.write.address.toInt == address, s"address case $cases $name")
             assert(dut.io.write.mask.toInt == byteMask, s"byte enables case $cases $name")
-            val bitMask = (0 until 8).filter(b => (byteMask & (1 << b)) != 0).map(b => BigInt(255) << (8 * b)).reduce(_ | _)
+            val bitMask = (0 until wb).filter(b => (byteMask & (1 << b)) != 0).map(b => BigInt(255) << (8 * b)).reduce(_ | _)
             assert((dut.io.write.data.toBigInt & bitMask) == data,
               s"data case $cases $name sew $sew lmul $lmul element ${actives(writeIndex)} vd $vd vs2 $vs2 vs1 $vs1")
             writeCycles += cycles
@@ -245,7 +246,7 @@ class VectorElementUnitTest extends AnyFunSuite {
           dut.io.debug #= true
           for (a <- 0 until p.wordCount) {
             dut.io.readAddress #= a; tick()
-            assert(dut.io.readData.toBigInt == word(a / p.beatsPerReg, (a % p.beatsPerReg) * 8), s"readback case $cases word $a")
+            assert(dut.io.readData.toBigInt == word(a / p.beatsPerReg, (a % p.beatsPerReg) * wb), s"readback case $cases word $a")
           }
         }
         cases += 1
@@ -307,7 +308,7 @@ class VectorElementUnitTest extends AnyFunSuite {
       for (vxrm <- 0 to 3; r <- 0 to 1) assert((increments((vxrm, r)) > 0) == (vxrm != 2 || r == 0), s"vsmul vxrm $vxrm increment $r")
       assert((passCases > 0) == (elen == 64) && (wide64 > 0) == (elen == 64) && (divide64 > 0) == (elen == 64),
         s"SEW-64 cases $passCases, widening into 64 $wide64, SEW-64 divides $divide64")
-      println(s"VectorElementUnit VLEN=$vlen XLEN=$xlen ELEN=$elen: $cases cases ($passCases three-pass, $wide64 widening into 64, " +
+      println(s"VectorElementUnit VLEN=$vlen DLEN=$dlen XLEN=$xlen ELEN=$elen: $cases cases ($passCases three-pass, $wide64 widening into 64, " +
         s"$divide64 SEW-64 divides), " +
         s"$writes element writes, $overlaps with a source in vd, " +
         s"vsmul saturation $saturations, rounding increments ${increments.toSeq.sorted.mkString(" ")}, full physical readback after every case")
@@ -321,4 +322,6 @@ class VectorElementUnitTest extends AnyFunSuite {
   test("SEW-64 multiplies, divides and widening into 64 on RV32") { run(128, 32, false, 64) }
   test("SEW-64 multiplies, divides and widening into 64 on RV64") { run(128, 64, false, 64) }
   test("SEW-64 multiplies and divides at VLEN 256") { run(256, 64, false, 64) }
+  test("128-bit words") { run(128, 64, false, 64, 128) }
+  test("128-bit words at VLEN 256") { run(256, 64, false, 64, 128) }
 }
