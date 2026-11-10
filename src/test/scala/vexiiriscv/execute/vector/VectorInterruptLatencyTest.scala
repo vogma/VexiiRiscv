@@ -29,6 +29,15 @@ class VectorInterruptLatencyTest extends AnyFunSuite {
           unit.io.cmd.sew.simPublic()
           unit.io.cmd.vl.simPublic()
           unit.io.done.simPublic()
+          if (param.vectorBeatMul) {
+            val beat = dut.cores.head.host[VectorPlugin].logic.arithmetic
+            beat.io.cmd.valid.simPublic()
+            beat.io.cmd.multiply.simPublic()
+            beat.io.cmd.mulOp.simPublic()
+            beat.io.cmd.sew.simPublic()
+            beat.io.cmd.vl.simPublic()
+            beat.io.done.simPublic()
+          }
         }
       }
       dut
@@ -45,6 +54,7 @@ class VectorInterruptLatencyTest extends AnyFunSuite {
     try compiled.doSimUntilVoid(seed = 2) { dut =>
       options.test(dut, f => f)
       val unit = dut.cores.head.host[VectorPlugin].logic.element
+      val beat = dut.cores.head.host[VectorPlugin].logic.arithmetic
       val irq = dut.cores.head.host[PrivilegedPlugin].hart(0).int.m.external
       val cd = dut.cores.head.clockDomain
       var cycle, start, request, done = -1L
@@ -65,15 +75,16 @@ class VectorInterruptLatencyTest extends AnyFunSuite {
           pending = true
           request = cycle
         }
-        if (unit.io.cmd.valid.toBoolean) {
+        val multiply = param.vectorBeatMul && beat.io.cmd.valid.toBoolean && beat.io.cmd.multiply.toBoolean
+        if (unit.io.cmd.valid.toBoolean || multiply) {
           assert(!pending, "previous interrupt has not been acknowledged")
           start = cycle
           done = -1
-          op = unit.io.cmd.op.toInt
-          sew = 8 << unit.io.cmd.sew.toInt
-          vl = unit.io.cmd.vl.toInt
+          op = if (multiply) beat.io.cmd.mulOp.toInt else unit.io.cmd.op.toInt
+          sew = 8 << (if (multiply) beat.io.cmd.sew.toInt else unit.io.cmd.sew.toInt)
+          vl = if (multiply) beat.io.cmd.vl.toInt else unit.io.cmd.vl.toInt
         }
-        if (unit.io.done.toBoolean) done = cycle
+        if (unit.io.done.toBoolean || param.vectorBeatMul && beat.io.done.toBoolean) done = cycle
       }
     } finally out.close()
     val sites = sys.env.get("VEXII_VECTOR_LATENCY_SITES").map(_.toInt).getOrElse(104)

@@ -47,7 +47,7 @@ case class VectorElementCmd(p: VectorRegFileParam, xlen: Int) extends Bundle {
 // and the divider, iota counts, gather indices and permuted data are 64 bits wide.
 // vcpop and vfirst take one DLEN-bit mask word per cycle: read in t, mask in t+1, count and find in t+2.
 class VectorElementUnit(val p: VectorRegFileParam, val xlen: Int, val elen: Int = 32, val slides: Boolean = false,
-                        val beatCompress: Boolean = false) extends Component {
+                        val beatCompress: Boolean = false, val beatMul: Boolean = false) extends Component {
   require((p.dlen == 64 || p.dlen == 128) && p.readPorts >= 3)
   require(xlen == 32 || xlen == 64)
   require(elen == 32 || elen == 64)
@@ -213,7 +213,7 @@ class VectorElementUnit(val p: VectorRegFileParam, val xlen: Int, val elen: Int 
   }
 
   // 33 x 33 signed multiplier with two pipeline registers
-  val operands = new Area {
+  val operands = !beatMul generate new Area {
     val valid = RegNext(x1.valid && !divide && !scan) init(False)
     val last = RegNext(x1.last && !divide && !scan) init(False)
     val vdByte = RegNext(x1.vdByte)
@@ -224,7 +224,7 @@ class VectorElementUnit(val p: VectorRegFileParam, val xlen: Int, val elen: Int 
     val overflow = RegNext(x1.overflow)
     val pass = elen == 64 generate RegNext(x1.pass)
   }
-  val m1 = new Area {
+  val m1 = !beatMul generate new Area {
     val valid = RegNext(operands.valid) init(False)
     val last = RegNext(operands.last) init(False)
     val vdByte = RegNext(operands.vdByte)
@@ -235,14 +235,14 @@ class VectorElementUnit(val p: VectorRegFileParam, val xlen: Int, val elen: Int 
     val pass = elen == 64 generate RegNext(operands.pass)
   }
   val m2 = new Area {
-    val valid = RegNext(m1.valid) init(False)
-    val last = RegNext(m1.last) init(False)
-    val vdByte = RegNext(m1.vdByte)
-    val address = RegNext(m1.address)
-    val product = RegNext(m1.product)
-    val addend = RegNext(m1.addend)
-    val overflow = RegNext(m1.overflow)
-    val pass = elen == 64 generate RegNext(m1.pass)
+    val valid = if (beatMul) False else RegNext(m1.valid) init(False)
+    val last = if (beatMul) False else RegNext(m1.last) init(False)
+    val vdByte = if (beatMul) U(0, log2Up(p.beatBytes) bits) else RegNext(m1.vdByte)
+    val address = if (beatMul) U(0, p.addressWidth bits) else RegNext(m1.address)
+    val product = if (beatMul) S(0, 66 bits) else RegNext(m1.product)
+    val addend = if (beatMul) B(0, elen bits) else RegNext(m1.addend)
+    val overflow = if (beatMul) False else RegNext(m1.overflow)
+    val pass = elen == 64 generate (if (beatMul) U(0, 2 bits) else RegNext(m1.pass))
   }
 
   // Half selection, accumulation, vsmul rounding (norm:vxrm_op) and saturation (norm:vxsat_op_vsmul)

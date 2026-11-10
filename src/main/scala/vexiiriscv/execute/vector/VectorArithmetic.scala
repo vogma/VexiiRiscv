@@ -75,7 +75,7 @@ object VectorShape {
   def width = 4
 }
 
-case class VectorArithmeticCmd(p: VectorRegFileParam, xlen: Int, slides: Boolean = false, beatCompress: Boolean = false) extends Bundle {
+case class VectorArithmeticCmd(p: VectorRegFileParam, xlen: Int, slides: Boolean = false, beatCompress: Boolean = false, beatMul: Boolean = false) extends Bundle {
   val vd, vs1, vs2 = UInt(5 bits)
   val vl = UInt(log2Up(p.vlen) + 1 bits)
   val vstart = UInt(log2Up(p.vlen) bits)
@@ -91,6 +91,8 @@ case class VectorArithmeticCmd(p: VectorRegFileParam, xlen: Int, slides: Boolean
   val vlmax = slides generate UInt(log2Up(p.vlen) + 1 bits)
   val slide = slides generate Bits(2 bits) // SLIDE: bit 0 down, bit 1 by one element with the scalar inserted
   val compress = beatCompress generate Bool() // vcompress.vm: pack the vs2 elements selected by the vs1 mask into vd
+  val multiply, signedVs1, negate = beatMul generate Bool()
+  val mulOp = beatMul generate UInt(VectorElementOp.width bits)
 }
 
 // Shape and op properties of a command, registered with it so the datapath does not decode them
@@ -140,7 +142,8 @@ object VectorArithmeticFlags {
 // lane logic, joined only by the mask, reduction, narrowing, permute and compress structures. With overlap a command may start while the previous one's
 // steps are still in X1 and later; each stage then works from its own copy of the command.
 class VectorArithmetic(val p: VectorRegFileParam, val xlen: Int, val elen: Int = 32, val slides: Boolean = false,
-                        val beatCompress: Boolean = false, val overlap: Boolean = false, val tagWidth: Int = 3) extends Component {
+                        val beatCompress: Boolean = false, val overlap: Boolean = false, val tagWidth: Int = 3,
+                        val beatMul: Boolean = false) extends Component {
   require((p.dlen == 64 || p.dlen == 128) && p.readPorts >= 3)
   require(!beatCompress || slides)
   val wordBytes = p.beatBytes
@@ -152,7 +155,7 @@ class VectorArithmetic(val p: VectorRegFileParam, val xlen: Int, val elen: Int =
   require(xlen == 32 || xlen == 64)
   require(elen == 32 || elen == 64)
   val io = new Bundle {
-    val cmd = slave(Flow(VectorArithmeticCmd(p, xlen, slides, beatCompress)))
+    val cmd = slave(Flow(VectorArithmeticCmd(p, xlen, slides, beatCompress, beatMul)))
     val reads = Vec.fill(3)(master(VrfReadPort(p)))
     val write = master(Flow(VrfWriteCmd(p)))
     val v0 = in Bits(p.vlen bits)
@@ -164,7 +167,10 @@ class VectorArithmetic(val p: VectorRegFileParam, val xlen: Int, val elen: Int =
     val writeTag, doneTag = overlap generate (out UInt(tagWidth bits)) // the command of io.write and of io.done
   }
 
-  val command = Reg(VectorArithmeticCmd(p, xlen, slides, beatCompress))
+  val command = Reg(VectorArithmeticCmd(p, xlen, slides, beatCompress, beatMul))
+  val mulIssueTag = beatMul && overlap generate (RegNextWhen(io.tag, io.cmd.valid) init(0))
+  val mulPass = beatMul generate (RegInit(False))
+  val mulSplit = beatMul generate (if (elen == 64) command.multiply && command.sew === 3 else False)
   val flags = Reg(VectorArithmeticFlags())
   val scalarRead = flags.scalarRead
   val scalarWrite = flags.scalarWrite
@@ -246,6 +252,7 @@ class VectorArithmetic(val p: VectorRegFileParam, val xlen: Int, val elen: Int =
         saturated := False
       }
       step := 0
+      if (beatMul) mulPass := False
       folding := False
       fold := 0
     }
@@ -253,6 +260,7 @@ class VectorArithmetic(val p: VectorRegFileParam, val xlen: Int, val elen: Int =
   if (!overlap) startCommand()
 
   val issue = new Area {
+    val advance = beatMul generate (!mulSplit || mulPass)
     val enables, selects = Bits(wordBytes bits) // selects: v0 bit of the element holding each byte
     // Narrowing writes half step mod 2 of destination word step / 2
     val dstWord = narrow ? (step >> 1) | step
@@ -273,7 +281,7 @@ class VectorArithmetic(val p: VectorRegFileParam, val xlen: Int, val elen: Int =
     val foldLast = fold === (U(maskBits - 4, 2 bits) - laneSew.resize(2))
     // A 64-bit accumulator is one lane: the last step ends the reduction
     val reduceLast = if (elen == 64 && subWords == 1) (laneSew === 3) ? stepsDone | (folding && foldLast) else folding && foldLast
-    val last = running && (scalarRead || scalarWrite || (whole ? wholeLast |
+    val last = (if (beatMul) running && advance else running) && (scalarRead || scalarWrite || (whole ? wholeLast |
       (reduce ? (command.vl === 0 || reduceLast) | stepsDone)))
     // MASK_DST: position of this step's result bits in the destination mask word, and that word
     val offset = ((wide << byteBits) >> command.sew).resize(maskBits)
@@ -291,11 +299,14 @@ class VectorArithmetic(val p: VectorRegFileParam, val xlen: Int, val elen: Int =
       (!reduce || step === 0 && !folding)
     io.reads(1).cmd.payload := word(command.vs1, reduce ? U(0, step.getWidth bits) | ((widening || narrow) ? (step >> 1) | step))
     // The old destination word, whose bits outside the result are kept (norm:vreg_mask_tail_agn, P3)
-    io.reads(2).cmd.valid := active && (maskMm || maskDst && offset === 0)
+    val readAccumulator = beatMul generate (command.multiply && (command.mulOp === VectorElementOp.MACC ||
+      command.mulOp === VectorElementOp.MADD || command.mulOp === VectorElementOp.WMACC))
+    io.reads(2).cmd.valid := active && (if (beatMul) maskMm || maskDst && offset === 0 || readAccumulator else maskMm || maskDst && offset === 0)
     io.reads(2).cmd.payload := word(command.vd, maskDst ? maskWord.resize(step.getWidth) | step)
 
     when(running) {
-      when(!folding) { step := step + 1 }
+      when(if (beatMul) !folding && advance else !folding) { step := step + 1 }
+      if (beatMul) mulPass := mulSplit && !mulPass
       when(reduce && stepsDone) { folding := True }
       when(folding) { fold := fold + 1 }
       when(last) { running := False }
@@ -368,8 +379,8 @@ class VectorArithmetic(val p: VectorRegFileParam, val xlen: Int, val elen: Int =
     val (ext2, ext4, ext8, whole, maskScan) = (flags.ext2, flags.ext4, flags.ext8, flags.whole, flags.maskScan)
     val (scalarRead, subtract, average, laneSew) = (flags.scalarRead, flags.subtract, flags.average, flags.laneSew)
     val begin = overlap generate (RegNext(running && step === 0 && !folding) init(False))
-    val valid = RegNext(issue.active) init(False)
-    val last = RegNext(issue.last) init(False)
+    val valid = RegNext(if (beatMul) issue.active && !VectorArithmetic.this.command.multiply else issue.active) init(False)
+    val last = RegNext(if (beatMul) issue.last && !VectorArithmetic.this.command.multiply else issue.last) init(False)
     // Registered from issue, with the issuing command
     val address = RegNext(word(VectorArithmetic.this.command.vd, VectorArithmetic.this.maskDst ? issue.maskWord.resize(step.getWidth) |
       (VectorArithmetic.this.reduce ? U(0, step.getWidth bits) | issue.dstWord)))
@@ -590,6 +601,35 @@ class VectorArithmetic(val p: VectorRegFileParam, val xlen: Int, val elen: Int =
     }
   }
 
+  val multiplier = beatMul generate new Area {
+    val core = new VectorBeatMultiplier(p.dlen, elen)
+    core.io.valid := RegNext(running && command.multiply) init(False)
+    core.io.pass := RegNext(mulPass)
+    core.io.sew := x1.command.sew
+    core.io.wide := x1.flags.widening
+    core.io.half := x1.part(0)
+    core.io.op := x1.command.mulOp
+    core.io.signedA := x1.command.signed
+    core.io.signedB := x1.command.signedVs1
+    core.io.negate := x1.command.negate
+    core.io.vxrm := x1.command.vxrm
+    core.io.a := io.reads(0).rsp
+    core.io.b := x1.command.scalarOperand ? x1.scalarBeat | io.reads(1).rsp
+    core.io.c := io.reads(2).rsp
+    val address = RegNext(RegNext(x1.address))
+    val mask = RegNext(RegNext(x1.mask))
+    val last = RegNext(RegNext(RegNext(issue.last && command.multiply) init(False)) init(False)) init(False)
+    val begin = RegNext(RegNext(RegNext(running && command.multiply && step === 0 && issue.advance) init(False)) init(False)) init(False)
+    val tag = overlap generate RegNext(RegNext(RegNext(mulIssueTag)))
+    val saturating = core.io.outputValid && (core.io.saturated & mask).orR
+    val seen = RegInit(False)
+    val sofar = !begin && seen || saturating
+    when(core.io.outputValid) { seen := sofar }
+    val total = RegNextWhen(sofar, last) init(False)
+    if (!overlap) when(saturating) { saturated := True }
+    assert(!(last && !core.io.outputValid), "vector multiply completed before its final pass")
+  }
+
   // Shifts with rounding (norm:vssrl_vssra_op), saturation (norm:vsaddu_vsadd_vssubu_vssub_op_overflow_vxsat_op_vsaddsub), mask merging
   val x2 = new Area {
     val command = stage(x1.command)
@@ -808,13 +848,20 @@ class VectorArithmetic(val p: VectorRegFileParam, val xlen: Int, val elen: Int =
 
   val writeback = new Area {
     def packed[T <: Data](compressed: => T, other: T): T = if (beatCompress) pack.active ? compressed | other else other
-    val valid = RegNext(packed(pack.write, x2.valid && !x2.scalarRead && x2.wordLast)) init(False)
-    val last = RegNext(packed(pack.last, x2.last)) init(False)
-    val address = RegNext(packed(pack.writeAddress, x2.address))
+    def multiplied[T <: Data](value: => T, other: T): T = if (beatMul) multiplier.core.io.outputValid ? value | other else other
+    val valid = RegNext(multiplied(multiplier.mask.orR, packed(pack.write, x2.valid && !x2.scalarRead && x2.wordLast))) init(False)
+    val last = RegNext(if (beatMul) multiplier.last || packed(pack.last, x2.last) else packed(pack.last, x2.last)) init(False)
+    val address = RegNext(multiplied(multiplier.address, packed(pack.writeAddress, x2.address)))
     // Reductions write element 0 only; the rest of vd is tail (norm:vreduction_tail_policy)
     val elementZero = Vec((0 until wordBytes).map(j => (U(j, byteBits bits) >> x2.laneSew) === 0)).asBits
-    val mask = RegNext(packed(pack.writeMask, (x2.maskDst || x2.maskMm) ? ones(wordBytes) | (x2.reduce ? elementZero | x2.mask)))
-    val data = RegNext(packed(pack.writeData, x2.output))
+    val mask = RegNext(multiplied(multiplier.mask, packed(pack.writeMask, (x2.maskDst || x2.maskMm) ? ones(wordBytes) | (x2.reduce ? elementZero | x2.mask))))
+    val data = RegNext(multiplied(multiplier.core.io.result, packed(pack.writeData, x2.output)))
+    val multiply = beatMul generate (RegNext(multiplier.last) init(False))
+    val mulTag = beatMul && overlap generate RegNext(multiplier.tag)
+    if (beatMul) {
+      val active = multiplier.core.io.outputValid
+      assert(!(active && (x2.valid || x2.last)), "vector multiply and ALU pipelines collide")
+    }
     io.write.valid := valid
     io.write.address := address
     io.write.mask := mask
@@ -831,13 +878,14 @@ class VectorArithmetic(val p: VectorRegFileParam, val xlen: Int, val elen: Int =
     val inUnitNext = inUnit + U(io.cmd.valid).resized - U(io.done).resized
     inUnit := inUnitNext
     busy := inUnitNext =/= 0
-    val issueTag = RegNextWhen(io.tag, io.cmd.valid) init(0)
+    val issueTag = if (beatMul) mulIssueTag else RegNextWhen(io.tag, io.cmd.valid) init(0)
     val x1Tag = RegNext(issueTag) init(0)
     val x2Tag = RegNext(x1Tag) init(0)
     val writeTag = RegNext(x2Tag) init(0)
-    io.writeTag := writeTag
-    io.doneTag := RegNextWhen(writeTag, writeback.last) init(0)
-    io.saturated := RegNextWhen(x2.sticky.total, writeback.last) init(False)
+    val selectedTag = if (beatMul) writeback.multiply ? writeback.mulTag | writeTag else writeTag
+    io.writeTag := (if (beatMul) (RegNext(multiplier.core.io.outputValid) init(False)) ? writeback.mulTag | writeTag else writeTag)
+    io.doneTag := RegNextWhen(selectedTag, writeback.last) init(0)
+    io.saturated := RegNextWhen(if (beatMul) writeback.multiply ? multiplier.total | x2.sticky.total else x2.sticky.total, writeback.last) init(False)
     assert(!(inUnit === 0 && io.done), "vector beat unit done without a command")
     assert(!(io.cmd.valid && !io.ready), "vector beat command while the unit is not ready")
   }

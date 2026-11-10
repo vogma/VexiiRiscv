@@ -5,9 +5,9 @@ import spinal.lib._
 
 // One accepted arithmetic instruction: the command of the unit that runs it and its tag
 case class VectorQueueEntry(p: VectorRegFileParam, xlen: Int, tagWidth: Int, slides: Boolean = false,
-                            beatCompress: Boolean = false, overlap: Boolean = false) extends Bundle {
+                            beatCompress: Boolean = false, overlap: Boolean = false, beatMul: Boolean = false) extends Bundle {
   val element = Bool()
-  val arith = VectorArithmeticCmd(p, xlen, slides, beatCompress)
+  val arith = VectorArithmeticCmd(p, xlen, slides, beatCompress, beatMul)
   val elem = VectorElementCmd(p, xlen)
   val tag = UInt(tagWidth bits)
   // Registers the instruction reads and writes, whole registers; used by overlapped issue only
@@ -22,16 +22,16 @@ case class VectorQueueEntry(p: VectorRegFileParam, xlen: Int, tagWidth: Int, sli
  * state, so they are exact in every cycle.
  */
 class VectorQueue(p: VectorRegFileParam, xlen: Int, val depth: Int, slides: Boolean = false, beatCompress: Boolean = false,
-                  val overlap: Boolean = false) extends Area {
+                  val overlap: Boolean = false, beatMul: Boolean = false) extends Area {
   require(depth >= 1 && depth <= 4)
   val capacity = depth + 1
   val tagWidth = 3 // 2^3 > depth + 1, so no tag is reused while outstanding
 
-  val push = Flow(VectorQueueEntry(p, xlen, tagWidth, slides, beatCompress, overlap)) // accept; the queue sets its tag
+  val push = Flow(VectorQueueEntry(p, xlen, tagWidth, slides, beatCompress, overlap, beatMul)) // accept; the queue sets its tag
   val done = Bool() // the running unit's done, one per instruction in accept order
   val beatReady = overlap generate Bool() // the beat unit can take a command behind the running ones
 
-  val entries = Vec.fill(depth)(Reg(VectorQueueEntry(p, xlen, tagWidth, slides, beatCompress, overlap)))
+  val entries = Vec.fill(depth)(Reg(VectorQueueEntry(p, xlen, tagWidth, slides, beatCompress, overlap, beatMul)))
   val count = Reg(UInt(log2Up(depth + 1) bits)) init(0)
   val ptrWidth = log2Up(depth) max 1
   val readPtr, writePtr = Reg(UInt(ptrWidth bits)) init(0)
@@ -57,7 +57,10 @@ class VectorQueue(p: VectorRegFileParam, xlen: Int, val depth: Int, slides: Bool
     val valid = Vec.fill(1 << tagWidth)(RegInit(False))
     val pending = (0 until (1 << tagWidth)).map(i => valid(i) ? writes(i) | B(0, 32 bits)).reduce(_ | _)
     val hazard = (head.reads & pending).orR
-    val behind = !running && !of(head) && beatReady && !hazard
+    val multiply = beatMul generate (RegInit(False))
+    val sameClass = beatMul generate (multiply === head.arith.multiply)
+    val behind = if (beatMul) !running && !of(head) && beatReady && !hazard && sameClass
+      else !running && !of(head) && beatReady && !hazard
   }
   val pop = if (overlap) count =/= 0 && (!running || serial.behind) else count =/= 0 && !running
 
@@ -82,6 +85,7 @@ class VectorQueue(p: VectorRegFileParam, xlen: Int, val depth: Int, slides: Bool
     }
     when(pop) {
       serial.running := serial.of(head)
+      if (beatMul) serial.multiply := head.arith.multiply
       serial.writes(head.tag) := head.writes
       serial.valid(head.tag) := True
     }
@@ -103,6 +107,10 @@ class VectorQueue(p: VectorRegFileParam, xlen: Int, val depth: Int, slides: Bool
   else {
     assert(!(serial.running && executing > 1), "vector instruction that runs alone overlaps another")
     assert(!(running && !serial.valid(runningTag)), "oldest executing vector instruction not tracked")
+    if (beatMul) {
+      assert(!(pop && running && !serial.sameClass), "vector latency classes overlap")
+      assert(!(pop && serial.valid(head.tag)), "vector queue reused a live execution tag")
+    }
   }
   // Tags run without gaps from the oldest outstanding instruction to the next accept
   val oldestTag = running ? runningTag | head.tag

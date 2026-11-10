@@ -76,7 +76,8 @@ case class VectorMemoryDescriptor(indexWidth : Int, split : Boolean = false, bea
  */
 class VectorPlugin(val layer : LaneLayer, val dlen : Int = 64, var withMemory : Boolean = true, val elen : Int = 32,
                    val queueDepth : Int = 0, val beatSlides : Boolean = false, val beatCompress : Boolean = false,
-                   val overlapIssue : Boolean = false, val noFence : Boolean = false, val trapAtE0 : Boolean = false)
+                   val overlapIssue : Boolean = false, val noFence : Boolean = false, val trapAtE0 : Boolean = false,
+                   val beatMul : Boolean = false)
   extends FiberPlugin with InitService {
   require(elen == 32 || elen == 64)
   require(!beatCompress || beatSlides, "beat compress requires beat slides")
@@ -97,6 +98,7 @@ class VectorPlugin(val layer : LaneLayer, val dlen : Int = 64, var withMemory : 
   val ARITH, SCALAR_OPERAND, IMMEDIATE, SIGNED, SATURATE, MASK_DATA = Payload(Bool())
   val ELEMENT, SIGNED_VS1, NEGATE = Payload(Bool()) // element unit; vs1 or scalar signed; product subtracted
   val ELEMENT_OP = Payload(UInt(VectorElementOp.width bits))
+  val BEAT_MUL = beatMul generate Payload(Bool())
   val SHAPE = Payload(UInt(VectorShape.width bits))
   val ALU_OP = Payload(UInt(VectorAluOp.width bits))
   val RESULT = Payload(Bits(XLEN bits))
@@ -138,6 +140,7 @@ class VectorPlugin(val layer : LaneLayer, val dlen : Int = 64, var withMemory : 
     elp.setDecodingDefault(ALU_OP, U(VectorAluOp.ADD, VectorAluOp.width bits))
     elp.setDecodingDefault(SHAPE, U(VectorShape.SINGLE, VectorShape.width bits))
     elp.setDecodingDefault(ELEMENT_OP, U(VectorElementOp.MUL, VectorElementOp.width bits))
+    if (beatMul) elp.setDecodingDefault(BEAT_MUL, False)
     for (key <- List(OVERLAP_VS1, OVERLAP_VS2)) elp.setDecodingDefault(key, U(VectorOverlap.ANY, VectorOverlap.width bits))
     elp.setDecodingDefault(RANGE, U(VectorRange.ANY, VectorRange.width bits))
     for (key <- List(EMUL_VD, EMUL_VS1, EMUL_VS2)) elp.setDecodingDefault(key, U(VectorEmul.NONE, VectorEmul.width bits))
@@ -276,7 +279,8 @@ class VectorPlugin(val layer : LaneLayer, val dlen : Int = 64, var withMemory : 
     for ((name, op, signed, signedVs1, negate) <- elementOps; form <- Seq("vv", "vx") if Rvv.all.contains(s"$name.$form")) {
       val vector = form == "vv"
       val wide = op == VectorElementOp.WMUL || op == VectorElementOp.WMACC
-      add(Rvv.all(s"$name.$form"), ELEMENT -> True, ELEMENT_OP -> U(op, VectorElementOp.width bits), SIGNED -> Bool(signed),
+      val beat = beatMul && op <= VectorElementOp.SMUL
+      val spec = add(Rvv.all(s"$name.$form"), ELEMENT -> Bool(!beat), ELEMENT_OP -> U(op, VectorElementOp.width bits), SIGNED -> Bool(signed),
         SIGNED_VS1 -> Bool(signedVs1), NEGATE -> Bool(negate), SCALAR_OPERAND -> Bool(!vector),
         CHECK_VILL -> True, CHECK_VSTART -> True, EMUL_VD -> emul(if (wide) VectorEmul.W else VectorEmul.L),
         EMUL_VS1 -> emul(if (vector) VectorEmul.L else VectorEmul.NONE), EMUL_VS2 -> emul(VectorEmul.L), MASK_NOT_V0 -> True,
@@ -284,6 +288,9 @@ class VectorPlugin(val layer : LaneLayer, val dlen : Int = 64, var withMemory : 
         OVERLAP_VS1 -> overlap(if (wide && vector) VectorOverlap.WIDEN else VectorOverlap.ANY),
         RANGE -> U(if (wide) VectorRange.WIDE else if (elen == 64 && (op == VectorElementOp.MULH || op == VectorElementOp.SMUL))
           VectorRange.NO64 else VectorRange.ANY, VectorRange.width bits))
+      if (beat) spec.addDecoding(ARITH -> True, BEAT_MUL -> True,
+        SHAPE -> U(if (wide) VectorShape.WIDE_VV else VectorShape.SINGLE, VectorShape.width bits),
+        ALU_OP -> U(VectorAluOp.ADD, VectorAluOp.width bits))
     }
     // Reductions into element 0 of vd: only vs2 is a group; vd = v0 is legal when masked (norm:vreduction_vd_overlap_vs)
     for ((name, op, signed) <- Seq(("vredsum", VectorAluOp.ADD, false), ("vredand", VectorAluOp.AND, false),
@@ -353,8 +360,8 @@ class VectorPlugin(val layer : LaneLayer, val dlen : Int = 64, var withMemory : 
     val vlen = vcs.vlen
     val vlWidth = vcs.vlWidth
     val vrf = regFile.vrf
-    val arithmetic = new VectorArithmetic(vrf.p, XLEN, elen, beatSlides, beatCompress, overlapIssue)
-    val element = new VectorElementUnit(vrf.p, XLEN, elen, beatSlides, beatCompress)
+    val arithmetic = new VectorArithmetic(vrf.p, XLEN, elen, beatSlides, beatCompress, overlapIssue, beatMul = beatMul)
+    val element = new VectorElementUnit(vrf.p, XLEN, elen, beatSlides, beatCompress, beatMul)
     vrf.io.write := arithmetic.io.write
     when(element.io.busy) { vrf.io.write := element.io.write }
     arithmetic.io.v0 := vrf.io.v0
@@ -577,14 +584,14 @@ class VectorPlugin(val layer : LaneLayer, val dlen : Int = 64, var withMemory : 
 
       val decoupled = queueDepth > 0
       val queue = decoupled generate new Area {
-        val q = new VectorQueue(vrf.p, XLEN, queueDepth, beatSlides, beatCompress, overlapIssue)
+        val q = new VectorQueue(vrf.p, XLEN, queueDepth, beatSlides, beatCompress, overlapIssue, beatMul)
         val pp = host[PrivilegedPlugin]
         val forceSync = if (pp.p.withDebug) pp.logic.harts(0).debugMode || pp.logic.harts(0).debug.dcsr.step else False
         // Everything without a scalar result; in debug mode or while stepping, everything runs synchronously
         val queued = (ARITH && SHAPE =/= VectorShape.SCALAR_READ ||
           ELEMENT && ELEMENT_OP =/= VectorElementOp.CPOP && ELEMENT_OP =/= VectorElementOp.FIRST) && !forceSync
         val accept = fire && queued
-        val e0Arith = Flow(VectorArithmeticCmd(vrf.p, XLEN, beatSlides, beatCompress))
+        val e0Arith = Flow(VectorArithmeticCmd(vrf.p, XLEN, beatSlides, beatCompress, beatMul))
         val e0Element = Flow(VectorElementCmd(vrf.p, XLEN))
         q.push.valid := accept
         q.push.element := ELEMENT
@@ -600,10 +607,13 @@ class VectorPlugin(val layer : LaneLayer, val dlen : Int = 64, var withMemory : 
           val readsVs2 = SHAPE === VectorShape.SCALAR_READ || SHAPE =/= VectorShape.SCALAR_WRITE && op =/= VectorAluOp.MOVE && op =/= VectorAluOp.INDEX
           val noVs1 = List(VectorShape.SCALAR_READ, VectorShape.EXT2, VectorShape.EXT4, VectorShape.EXT8, VectorShape.WHOLE).map(SHAPE === _).orR
           val readsVs1 = !SCALAR_OPERAND && !noVs1 && op =/= VectorAluOp.INDEX && !scanOp
-          val readsVd = SHAPE === VectorShape.MASK_DST || SHAPE === VectorShape.MASK_MM
+          val mulAccumulator = if (beatMul) BEAT_MUL && (ELEMENT_OP === VectorElementOp.MACC ||
+            ELEMENT_OP === VectorElementOp.MADD || ELEMENT_OP === VectorElementOp.WMACC) else False
+          val readsVd = if (beatMul) SHAPE === VectorShape.MASK_DST || SHAPE === VectorShape.MASK_MM || mulAccumulator
+            else SHAPE === VectorShape.MASK_DST || SHAPE === VectorShape.MASK_MM
           val readsV0 = !vm || MASK_DATA
           q.push.reads := (readsVs2 ? regs(vs2, l.vs2Log2) | B(0, 32 bits)) | (readsVs1 ? regs(vs1, l.vs1Log2) | B(0, 32 bits)) |
-            (readsVd ? regs(vd, S(0, 4 bits)) | B(0, 32 bits)) | (readsV0 ? B(1, 32 bits) | B(0, 32 bits))
+            (readsVd ? regs(vd, if (beatMul) mulAccumulator ? l.vdLog2 | S(0, 4 bits) else S(0, 4 bits)) | B(0, 32 bits)) | (readsV0 ? B(1, 32 bits) | B(0, 32 bits))
           q.push.writes := regs(vd, l.vdLog2)
           q.beatReady := arithmetic.io.ready
           arithmetic.io.tag := q.head.tag
@@ -638,6 +648,12 @@ class VectorPlugin(val layer : LaneLayer, val dlen : Int = 64, var withMemory : 
         armCmd.saturate := SATURATE
         armCmd.vxrm := vcs.vxrm
         armCmd.nreg := Decode.UOP(17 downto 15).asUInt.resize(4) + 1
+        if (beatMul) {
+          armCmd.multiply := BEAT_MUL
+          armCmd.mulOp := ELEMENT_OP
+          armCmd.signedVs1 := SIGNED_VS1
+          armCmd.negate := NEGATE
+        }
         if (beatSlides) {
           armCmd.vlmax := vlmaxOf(vtype.vsew, vtype.vlmul)
           // funct6 bit 0 selects down; the OPMVX forms are vslide1up and vslide1down
