@@ -196,6 +196,8 @@ class ParamSimple() {
   var vectorNoFence = false
   var vectorTrapE0 = false
   var vectorBeatMul = false
+  var vectorChaining = false
+  var vectorClassOverlap = false
   var narrowIoWindow = false
   val prefetcherRptParam = new PrefetcherRptParam()
 
@@ -629,6 +631,8 @@ class ParamSimple() {
     if (extension.withZve32x && vectorBeatSlides) r += "vbs"
     if (extension.withZve32x && vectorBeatCompress) r += "vbc"
     if (extension.withZve32x && vectorBeatMul) r += "vbm"
+    if (extension.withZve32x && vectorChaining) r += "vch"
+    if (extension.withZve32x && vectorClassOverlap) r += "vcx"
     if (extension.withZve32x && vectorOverlap) r += "vov"
     if (extension.withZve32x && vectorNoFence) r += "vnf"
     if (extension.withZve32x && vectorTrapE0) r += "vte0"
@@ -938,6 +942,9 @@ class ParamSimple() {
       .text("Run vslide* and vrgather.vx/.vi in the beat unit, one destination word per cycle.")
     opt[Unit]("vector-beat-compress").action { (v, c) => vectorBeatCompress = true }
       .text("Run vcompress.vm in the beat unit, one source word per cycle; requires --vector-beat-slides.")
+    opt[Unit]("vector-chaining").action { (v, c) => vectorChaining = true }
+    opt[Unit]("vector-class-overlap").action { (v, c) => vectorClassOverlap = true }
+      .text("Let ordinary and multiply beat commands overlap; requires --vector-beat-mul and --vector-overlap.")
     opt[Unit]("vector-beat-mul").action { (v, c) => vectorBeatMul = true }
       .text("Run integer multiplies in a shared destination-word multiplier array.")
     opt[Unit]("vector-overlap").action { (v, c) => vectorOverlap = true }
@@ -1002,6 +1009,8 @@ class ParamSimple() {
       assert(lsuL1Enable, "the vector unit needs the LSU L1 (--lsu-l1)")
       assert(!extension.withHypervisor, "the vector unit does not support the hypervisor extension")
       assert(vectorQueue >= 0 && vectorQueue <= 4, s"the vector queue depth must be 0 to 4, got $vectorQueue")
+      assert(!vectorChaining || vectorQueue > 0 && vectorOverlap, "--vector-chaining needs the vector queue and --vector-overlap")
+      assert(!vectorClassOverlap || vectorBeatMul && vectorOverlap, "--vector-class-overlap needs --vector-beat-mul and --vector-overlap")
       assert(!(vectorOverlap || vectorNoFence) || vectorQueue > 0, "--vector-overlap and --vector-nofence need the vector queue")
     } else {
       assert(zvlActive.isEmpty, "zvl*b needs a vector extension")
@@ -1464,7 +1473,8 @@ class ParamSimple() {
     if (extension.withZve32x) {
       plugins += new execute.vector.VectorCsrPlugin(vlen = vlen, withAccessHold = vectorQueue > 0)
       plugins += new execute.vector.VectorPlugin(early0, dlen = vectorDlen, elen = if (extension.withZve64x) 64 else 32, queueDepth = vectorQueue,
-        beatSlides = vectorBeatSlides, beatCompress = vectorBeatCompress, overlapIssue = vectorOverlap, noFence = vectorNoFence, trapAtE0 = vectorTrapE0, beatMul = vectorBeatMul)
+        beatSlides = vectorBeatSlides, beatCompress = vectorBeatCompress, overlapIssue = vectorOverlap, noFence = vectorNoFence, trapAtE0 = vectorTrapE0, beatMul = vectorBeatMul, chaining = vectorChaining,
+        classOverlap = vectorClassOverlap)
     }
 
     plugins += new WhiteboxerPlugin(

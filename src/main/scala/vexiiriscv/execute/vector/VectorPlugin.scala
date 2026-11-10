@@ -71,18 +71,22 @@ case class VectorMemoryDescriptor(indexWidth : Int, split : Boolean = false, bea
  * queueDepth > 0 instead accepts arithmetic without a scalar result into a queue of that depth when it leaves E0;
  * it retires there and runs later. Every reader of its results waits until nothing is outstanding.
  * overlapIssue starts a queued beat command behind running ones when it reads no register they still write;
+ * classOverlap also starts an ordinary beat command behind a multiply one, and the reverse.
  * noFence dispatches queued uops and vset* without waiting for older instructions to leave the pipeline.
  * trapAtE0 raises the illegal-instruction trap at E0, so a younger vector uop may follow one stage behind.
  */
 class VectorPlugin(val layer : LaneLayer, val dlen : Int = 64, var withMemory : Boolean = true, val elen : Int = 32,
                    val queueDepth : Int = 0, val beatSlides : Boolean = false, val beatCompress : Boolean = false,
                    val overlapIssue : Boolean = false, val noFence : Boolean = false, val trapAtE0 : Boolean = false,
-                   val beatMul : Boolean = false)
+                   val beatMul : Boolean = false,
+                   val chaining : Boolean = false,
+                   val classOverlap : Boolean = false)
   extends FiberPlugin with InitService {
   require(elen == 32 || elen == 64)
   require(!beatCompress || beatSlides, "beat compress requires beat slides")
   require(queueDepth >= 0 && queueDepth <= 4)
   require(!(overlapIssue || noFence) || queueDepth > 0, "overlapIssue and noFence need the queue")
+  require(!classOverlap || beatMul && overlapIssue, "classOverlap needs beatMul and overlapIssue")
   override def initHold(): Bool = regFile.vrf.io.initHold
 
   // Initialization must be available before the trap controller finishes building.
@@ -360,14 +364,15 @@ class VectorPlugin(val layer : LaneLayer, val dlen : Int = 64, var withMemory : 
     val vlen = vcs.vlen
     val vlWidth = vcs.vlWidth
     val vrf = regFile.vrf
-    val arithmetic = new VectorArithmetic(vrf.p, XLEN, elen, beatSlides, beatCompress, overlapIssue, beatMul = beatMul)
+    val arithmetic = new VectorArithmetic(vrf.p, XLEN, elen, beatSlides, beatCompress, overlapIssue, beatMul = beatMul, chaining = chaining,
+      classOverlap = classOverlap)
     val element = new VectorElementUnit(vrf.p, XLEN, elen, beatSlides, beatCompress, beatMul)
     vrf.io.write := arithmetic.io.write
     when(element.io.busy) { vrf.io.write := element.io.write }
     arithmetic.io.v0 := vrf.io.v0
     element.io.v0 := vrf.io.v0
     for (i <- 0 until 3) {
-      arithmetic.io.reads(i).rsp := vrf.io.reads(i).rsp
+      if (!chaining) arithmetic.io.reads(i).rsp := vrf.io.reads(i).rsp
       element.io.reads(i).rsp := vrf.io.reads(i).rsp
     }
     assert(!(arithmetic.io.busy && element.io.busy), "both vector units busy")
@@ -387,6 +392,18 @@ class VectorPlugin(val layer : LaneLayer, val dlen : Int = 64, var withMemory : 
     for (port <- vrf.io.reads.drop(3)) {
       port.cmd.valid := False
       port.cmd.payload.assignDontCare()
+    }
+
+    val forwarding = chaining generate new Area {
+      val olderWrite = Bool()
+      val forward = new VectorReadForwarding(vrf.p)
+      forward.io.write := vrf.io.writeEvent
+      forward.io.older := olderWrite && arithmetic.io.busy && !element.io.busy && !vrf.io.initHold
+      for (i <- 0 until 3) {
+        forward.io.reads(i).cmd := arithmetic.io.reads(i).cmd
+        forward.io.raw(i) := vrf.io.reads(i).rsp
+        arithmetic.io.reads(i).rsp := forward.io.reads(i).rsp
+      }
     }
 
     // log2(VLMAX) = log2(VLEN) - log2(SEW) + log2(LMUL), only meaningful for a legal vtype
@@ -584,7 +601,7 @@ class VectorPlugin(val layer : LaneLayer, val dlen : Int = 64, var withMemory : 
 
       val decoupled = queueDepth > 0
       val queue = decoupled generate new Area {
-        val q = new VectorQueue(vrf.p, XLEN, queueDepth, beatSlides, beatCompress, overlapIssue, beatMul)
+        val q = new VectorQueue(vrf.p, XLEN, queueDepth, beatSlides, beatCompress, overlapIssue, beatMul, chaining, classOverlap)
         val pp = host[PrivilegedPlugin]
         val forceSync = if (pp.p.withDebug) pp.logic.harts(0).debugMode || pp.logic.harts(0).debug.dcsr.step else False
         // Everything without a scalar result; in debug mode or while stepping, everything runs synchronously
@@ -615,7 +632,17 @@ class VectorPlugin(val layer : LaneLayer, val dlen : Int = 64, var withMemory : 
           q.push.reads := (readsVs2 ? regs(vs2, l.vs2Log2) | B(0, 32 bits)) | (readsVs1 ? regs(vs1, l.vs1Log2) | B(0, 32 bits)) |
             (readsVd ? regs(vd, if (beatMul) mulAccumulator ? l.vdLog2 | S(0, 4 bits) else S(0, 4 bits)) | B(0, 32 bits)) | (readsV0 ? B(1, 32 bits) | B(0, 32 bits))
           q.push.writes := regs(vd, l.vdLog2)
+          if (chaining) {
+            forwarding.olderWrite := q.running && q.words.older(arithmetic.io.writeTag, arithmetic.io.readTag)
+            q.push.shadow := readsV0
+            q.words.progress := arithmetic.io.progress
+            q.words.progress.valid.allowOverride() := arithmetic.io.progress.valid && q.running
+            q.words.consumer := arithmetic.io.readTag
+            q.words.reads := arithmetic.io.candidates
+            arithmetic.io.sourceReady := q.words.ready
+          }
           q.beatReady := arithmetic.io.ready
+          if (classOverlap) q.beatTailMultiply := arithmetic.io.tailMultiply
           arithmetic.io.tag := q.head.tag
         }
         // A unit takes the queue head on a pop, or a synchronizing command from E0 once nothing is outstanding

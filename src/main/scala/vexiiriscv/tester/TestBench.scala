@@ -647,7 +647,7 @@ class TestOptions {
     peripheral.withStdIn = withStdIn
     if(vectorIrqInject) {
       require(vectorSystemTrace, "interrupt injection requires the system trace")
-      val names = Seq("irq_div_timer", "irq_add_timer", "irq_div_software", "irq_add_software", "irq_load_timer", "irq_ff_timer")
+      val names = Seq("irq_div_timer", "irq_add_timer", "irq_div_software", "irq_add_software", "irq_load_timer", "irq_ff_timer", "irq_compress_timer")
       val sites = loadedElfs.flatMap(elf => names.flatMap(n =>
         Option(elf.getELFSymbol(n)).map(s => ((if(xlen == 32) s.st_value & 0xffffffffL else s.st_value), n))
       )).toMap
@@ -713,6 +713,15 @@ class TestOptions {
         if(v.complete.toBoolean) event("complete", v.completeTag.toInt)
         if(v.accept.toBoolean) event("accept", v.acceptTag.toInt, v.instruction.toBigInt)
         if(v.start.toBoolean) event("start", v.startTag.toInt, BigInt(v.startElement.toBoolean.toInt))
+        if(v.issue.toBoolean) event("issue", v.issueTag.toInt, BigInt(v.issueLast.toBoolean.toInt))
+        if(v.rawWait.toBoolean) event("raw_wait", v.issueTag.toInt)
+        if(v.write.toBoolean) event("write", v.writeTag.toInt)
+        if(v.progress.toBoolean) event("progress", v.progressTag.toInt)
+        if(v.compressIssue.toBoolean) event("compress_issue", v.issueTag.toInt, BigInt(v.issueLast.toBoolean.toInt))
+        if(v.reserve.toBoolean) event("compress_reserve", v.issueTag.toInt)
+        if(v.x2.toBoolean) event("x2", v.x2Tag.toInt, BigInt(v.x2Last.toBoolean.toInt))
+        if(v.flush.toBoolean) event("compress_flush", v.flushTag.toInt)
+        if(v.flushWrite.toBoolean) event("compress_flush_write", v.writeTag.toInt)
         if(v.syncStart.toBoolean) event("sync_start")
         if(v.syncDone.toBoolean) event("sync_done")
         if(v.config.toBoolean) event("config")
