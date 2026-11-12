@@ -74,24 +74,28 @@ case class VectorMemoryDescriptor(indexWidth : Int, split : Boolean = false, bea
  * classOverlap also starts an ordinary beat command behind a multiply one, and the reverse.
  * noFence dispatches queued uops and vset* without waiting for older instructions to leave the pipeline.
  * trapAtE0 raises the illegal-instruction trap at E0, so a younger vector uop may follow one stage behind.
+ * memoryOverlap starts a load or store behind outstanding queued arithmetic when none of them writes a register it
+ * reads or writes and none still reads a register it writes; memory gets two read ports of its own.
  */
 class VectorPlugin(val layer : LaneLayer, val dlen : Int = 64, var withMemory : Boolean = true, val elen : Int = 32,
                    val queueDepth : Int = 0, val beatSlides : Boolean = false, val beatCompress : Boolean = false,
                    val overlapIssue : Boolean = false, val noFence : Boolean = false, val trapAtE0 : Boolean = false,
                    val beatMul : Boolean = false,
                    val chaining : Boolean = false,
-                   val classOverlap : Boolean = false)
+                   val classOverlap : Boolean = false,
+                   val memoryOverlap : Boolean = false)
   extends FiberPlugin with InitService {
   require(elen == 32 || elen == 64)
   require(!beatCompress || beatSlides, "beat compress requires beat slides")
   require(queueDepth >= 0 && queueDepth <= 4)
   require(!(overlapIssue || noFence) || queueDepth > 0, "overlapIssue and noFence need the queue")
   require(!classOverlap || beatMul && overlapIssue, "classOverlap needs beatMul and overlapIssue")
+  require(!memoryOverlap || overlapIssue, "memoryOverlap needs overlapIssue")
   override def initHold(): Bool = regFile.vrf.io.initHold
 
   // Initialization must be available before the trap controller finishes building.
   val regFile = during build new Area {
-    val vrf = new VectorRegFile(VectorRegFileParam(vlen = host[VectorCsrService].vlen, dlen = dlen))
+    val vrf = new VectorRegFile(VectorRegFileParam(vlen = host[VectorCsrService].vlen, dlen = dlen, readPorts = if (memoryOverlap) 5 else 3))
   }
 
   val SEL = Payload(Bool())
@@ -365,7 +369,7 @@ class VectorPlugin(val layer : LaneLayer, val dlen : Int = 64, var withMemory : 
     val vlWidth = vcs.vlWidth
     val vrf = regFile.vrf
     val arithmetic = new VectorArithmetic(vrf.p, XLEN, elen, beatSlides, beatCompress, overlapIssue, beatMul = beatMul, chaining = chaining,
-      classOverlap = classOverlap)
+      classOverlap = classOverlap, readsDrained = memoryOverlap)
     val element = new VectorElementUnit(vrf.p, XLEN, elen, beatSlides, beatCompress, beatMul)
     vrf.io.write := arithmetic.io.write
     when(element.io.busy) { vrf.io.write := element.io.write }
@@ -378,18 +382,35 @@ class VectorPlugin(val layer : LaneLayer, val dlen : Int = 64, var withMemory : 
     assert(!(arithmetic.io.busy && element.io.busy), "both vector units busy")
     val indexRead = Flow(UInt(vrf.p.addressWidth bits))
     if (!withMemory) indexRead.setIdle()
-    vrf.io.reads(0).cmd := indexRead
-    when(arithmetic.io.busy) { vrf.io.reads(0).cmd := arithmetic.io.reads(0).cmd }
-    when(element.io.busy) { vrf.io.reads(0).cmd := element.io.reads(0).cmd }
-    vrf.io.reads(1).cmd := arithmetic.io.reads(1).cmd
-    when(element.io.busy) { vrf.io.reads(1).cmd := element.io.reads(1).cmd }
+    if (!memoryOverlap) {
+      vrf.io.reads(0).cmd := indexRead
+      when(arithmetic.io.busy) { vrf.io.reads(0).cmd := arithmetic.io.reads(0).cmd }
+      when(element.io.busy) { vrf.io.reads(0).cmd := element.io.reads(0).cmd }
+      vrf.io.reads(1).cmd := arithmetic.io.reads(1).cmd
+      when(element.io.busy) { vrf.io.reads(1).cmd := element.io.reads(1).cmd }
+    }
     // Port C belongs to a unit from its command until done, otherwise to the memory side
     val storeRead = Flow(UInt(vrf.p.addressWidth bits))
     if (!withMemory) storeRead.setIdle()
-    vrf.io.reads(2).cmd := storeRead
-    when(arithmetic.io.busy) { vrf.io.reads(2).cmd := arithmetic.io.reads(2).cmd }
-    when(element.io.busy) { vrf.io.reads(2).cmd := element.io.reads(2).cmd }
-    for (port <- vrf.io.reads.drop(3)) {
+    // With memoryOverlap, store data and indices have ports 3 and 4 and the units keep ports 0 to 2
+    val storePort = if (memoryOverlap) 3 else 2
+    val indexPort = if (memoryOverlap) 4 else 0
+    if (!memoryOverlap) {
+      vrf.io.reads(2).cmd := storeRead
+      when(arithmetic.io.busy) { vrf.io.reads(2).cmd := arithmetic.io.reads(2).cmd }
+      when(element.io.busy) { vrf.io.reads(2).cmd := element.io.reads(2).cmd }
+    } else {
+      for (i <- 0 until 3) {
+        vrf.io.reads(i).cmd := arithmetic.io.reads(i).cmd
+        when(element.io.busy) { vrf.io.reads(i).cmd := element.io.reads(i).cmd }
+      }
+      vrf.io.reads(storePort).cmd := storeRead
+      vrf.io.reads(indexPort).cmd := indexRead
+    }
+    // A load writes the VRF this cycle
+    val loadWrite = memoryOverlap generate Bool()
+    if (memoryOverlap && !withMemory) loadWrite := False
+    for (port <- vrf.io.reads.drop(if (memoryOverlap) 5 else 3)) {
       port.cmd.valid := False
       port.cmd.payload.assignDontCare()
     }
@@ -398,6 +419,8 @@ class VectorPlugin(val layer : LaneLayer, val dlen : Int = 64, var withMemory : 
       val olderWrite = Bool()
       val forward = new VectorReadForwarding(vrf.p)
       forward.io.write := vrf.io.writeEvent
+      // Load data never forwards into a unit read: no older unit reads what a running load writes
+      if (memoryOverlap) forward.io.write.valid.allowOverride() := vrf.io.writeEvent.valid && !loadWrite
       forward.io.older := olderWrite && arithmetic.io.busy && !element.io.busy && !vrf.io.initHold
       for (i <- 0 until 3) {
         forward.io.reads(i).cmd := arithmetic.io.reads(i).cmd
@@ -601,7 +624,7 @@ class VectorPlugin(val layer : LaneLayer, val dlen : Int = 64, var withMemory : 
 
       val decoupled = queueDepth > 0
       val queue = decoupled generate new Area {
-        val q = new VectorQueue(vrf.p, XLEN, queueDepth, beatSlides, beatCompress, overlapIssue, beatMul, chaining, classOverlap)
+        val q = new VectorQueue(vrf.p, XLEN, queueDepth, beatSlides, beatCompress, overlapIssue, beatMul, chaining, classOverlap, memoryOverlap)
         val pp = host[PrivilegedPlugin]
         val forceSync = if (pp.p.withDebug) pp.logic.harts(0).debugMode || pp.logic.harts(0).debug.dcsr.step else False
         // Everything without a scalar result; in debug mode or while stepping, everything runs synchronously
@@ -642,6 +665,11 @@ class VectorPlugin(val layer : LaneLayer, val dlen : Int = 64, var withMemory : 
             arithmetic.io.sourceReady := q.words.ready
           }
           q.beatReady := arithmetic.io.ready
+          if (memoryOverlap) {
+            // Only queued commands own tags; a synchronous command issues under a stale one
+            q.memory.drained.valid := arithmetic.io.drained.valid && q.running
+            q.memory.drained.payload := arithmetic.io.drained.payload
+          }
           if (classOverlap) q.beatTailMultiply := arithmetic.io.tailMultiply
           arithmetic.io.tag := q.head.tag
         }
@@ -786,8 +814,52 @@ class VectorPlugin(val layer : LaneLayer, val dlen : Int = 64, var withMemory : 
       val evl = RegNext(count)
       val unmasked = RegNext(seq.uop(25))
       walker.io.start := seq.valid && seq.first && !inflight && !seq.fire && evl === count && unmasked === seq.uop(25)
-      // Memory starts only once no accepted arithmetic is outstanding
-      if (e0.decoupled) when(!e0.queue.q.idle) { walker.io.start := False }
+
+      // Whole registers the candidate reads and writes, all fields and the full group whatever vl and the mask;
+      // forms whose registers are not a legal group get no footprint and wait for an idle queue
+      val footprint = memoryOverlap generate new Area {
+        val uop = seq.uop
+        val vtype = vcs.vtype
+        val load = !uop(5)
+        val vd = uop(Const.rdRange).asUInt
+        val vs2 = uop(Const.rs2Range).asUInt
+        val nf = uop(31 downto 29).asUInt
+        val wholeReg = whole(uop)
+        val maskReg = maskMemory(uop)
+        val dataLog2 = dataLog2Of(uop)
+        val indexLog2 = eewLog2Of(uop(Const.funct3Range)) - S(3, 5 bits) - vtype.vsew.resize(5).asSInt + vtype.vlmul.asSInt.resize(5)
+        val inRange = dataLog2 >= S(-3) && dataLog2 <= S(3) && (!indexed(uop) || indexLog2 >= S(-3) && indexLog2 <= S(3))
+        val data4 = dataLog2.resize(4)
+        val index4 = indexLog2.resize(4)
+        val wholeLog2 = nf.mux(0 -> S(0, 4 bits), 1 -> S(1, 4 bits), 3 -> S(2, 4 bits), default -> S(3, 4 bits))
+        val wholeOk = nf === 0 || nf === 1 || nf === 3 || nf === 7
+        // Fields of a segment are consecutive groups of max(EMUL, 1) registers
+        val span = UInt(7 bits)
+        span := ((nf.resize(4) + 1) * groupSize(data4)).resize(7)
+        when(wholeReg) { span := (nf.resize(7) + 1) }
+        when(maskReg) { span := 1 }
+        val shapeOk = wholeReg ? (wholeOk && aligned(vd, wholeLog2)) | (maskReg || inRange && aligned(vd, data4) &&
+          span <= 8 && (!indexed(uop) || aligned(vs2, index4)))
+        val ok = shapeOk && vd.resize(7) + span <= 32 && (wholeReg || !vtype.vill)
+        def run(base : UInt, n : UInt) : Bits = (((U(1, 33 bits) << n) - 1).resize(32) << base).resize(32).asBits
+        val data = run(vd, span)
+        val index = (indexed(uop) && !wholeReg && !maskReg) ? run(vs2, groupSize(index4).resize(7)) | B(0, 32 bits)
+        val v0 = (!uop(25)) ? B(1, 32 bits) | B(0, 32 bits)
+        val reads = load ? (index | v0) | (data | index | v0)
+        val writes = load ? data | B(0, 32 bits)
+      }
+      // Registered permission for a footprint: computed while nothing older can still be accepted. Pops and
+      // completions only remove hazards, so it holds a cycle later for the same registers.
+      val permission = memoryOverlap generate new Area {
+        val q = e0.queue.q
+        val sample = seq.valid && seq.first && !inflight && !seq.cancel && footprint.ok && !q.push.valid
+        val valid = RegNext(sample && q.memory.clear(footprint.reads, footprint.writes)) init(False)
+        val reads = RegNext(footprint.reads)
+        val writes = RegNext(footprint.writes)
+        val current = valid && footprint.ok && reads === footprint.reads && writes === footprint.writes
+      }
+      // Memory starts once no accepted arithmetic is outstanding, or with memoryOverlap once none conflicts
+      if (e0.decoupled) when(if (memoryOverlap) !e0.queue.q.idle && !permission.current else !e0.queue.q.idle) { walker.io.start := False }
       walker.io.evl := evl
       walker.io.vstart := vcs.vstart
       walker.io.unmasked := unmasked
@@ -895,10 +967,10 @@ class VectorPlugin(val layer : LaneLayer, val dlen : Int = 64, var withMemory : 
         val size = dataSize(Decode.UOP)
         val offset = groupOffset(d.index, size)
         val illegal = e0.legality.illegal
-        val word = vrf.io.reads(2).rsp
+        val word = vrf.io.reads(storePort).rsp
         port.cmd.valid := isValid && MEM
         val indexOffset = groupOffset(d.index, sizeOf(Decode.UOP))
-        val indexWord = vrf.io.reads(0).rsp >> (indexOffset.resize(log2Up(vrf.p.beatBytes)) << 3)
+        val indexWord = vrf.io.reads(indexPort).rsp >> (indexOffset.resize(log2Up(vrf.p.beatBytes)) << 3)
         val indexElement = if (elen == 64 && XLEN.get == 64) sizeOf(Decode.UOP).mux(
           U(0) -> indexWord(7 downto 0).asUInt.resize(XLEN),
           U(1) -> indexWord(15 downto 0).asUInt.resize(XLEN),
@@ -1012,6 +1084,13 @@ class VectorPlugin(val layer : LaneLayer, val dlen : Int = 64, var withMemory : 
           vrf.io.write := write
         }
         assert(!(write.valid && (arithmetic.io.write.valid || element.io.write.valid)), "VRF write port requested by a vector unit and a load")
+        // Unit writes cannot wait: a load that may write holds at this stage while a unit writes
+        val unitWrite = memoryOverlap generate (arithmetic.io.write.valid || element.io.write.valid)
+        val conflict = memoryOverlap generate (isValid && MEM && !Decode.UOP(5) && unitWrite)
+        if (memoryOverlap) {
+          elp.freezeWhen(conflict)
+          loadWrite := write.valid
+        }
       }
     }
     buildBefore.release()
@@ -1039,7 +1118,7 @@ class VectorPlugin(val layer : LaneLayer, val dlen : Int = 64, var withMemory : 
         assert(!(arithmetic.io.done && q.running && arithmetic.io.doneTag =/= q.runningTag), "vector beat command completed out of order")
       }
       assert(!(q.done && !q.running && !(e0.sequencer.started && !e0.sequencer.completed)), "vector unit done without a running instruction")
-      if (withMemory) assert(!(memory.seq.fire && !q.idle), "vector memory micro-op issued while arithmetic is outstanding")
+      if (withMemory && !memoryOverlap) assert(!(memory.seq.fire && !q.idle), "vector memory micro-op issued while arithmetic is outstanding")
       val xret = !trap.pending.state.exception && trap.pending.state.code === TrapReason.PRIV_RET
       val events = Bits(8 bits)
       events(0) := q.full
@@ -1050,6 +1129,53 @@ class VectorPlugin(val layer : LaneLayer, val dlen : Int = 64, var withMemory : 
       events(5) := hold && fsm.isActive(fsm.TRAP_WAIT)
       events(6) := (if (fsm.ENTER_DEBUG_WAIT != null) hold && fsm.isActive(fsm.ENTER_DEBUG_WAIT) else False)
       events(7) := hold && fsm.isActive(fsm.COMPUTE) && xret
+    }
+
+    // Simulation checks of memory behind queued arithmetic, from the registers actually read and written
+    val memoryChecks = (memoryOverlap && withMemory) generate new Area {
+      val q = e0.queue.q
+      val fp = memory.footprint
+      def regOf(address : UInt) : UInt = (address >> vrf.p.beatWidth).resize(5)
+      assert(!(memory.walker.io.start && !q.idle && !q.memory.clear(fp.reads, fp.writes)), "vector memory started over a hazard")
+      // Memory work in flight: micro-ops being sequenced or anywhere up to the response
+      val stages = (0 to lsu.timingParameter.ctrlAt).map(i => elp.execute(i).isValid && elp.execute(i)(MEM)).orR
+      val busy = memory.seq.valid && !memory.seq.first || stages
+      assert(!(e0.queue.accept && busy), "vector instruction accepted while a vector memory instruction runs")
+      // Live tags: accepted, not completed. A load write forbids that register to every live (older) tag.
+      val live = Vec.fill(1 << q.tagWidth)(RegInit(False))
+      val forbidden = Vec.fill(1 << q.tagWidth)(Reg(Bits(32 bits)))
+      val load = memory.complete.write
+      val loadReg = regOf(load.address)
+      for (i <- 0 until (1 << q.tagWidth)) {
+        when(load.valid && live(i)) { forbidden(i)(loadReg) := True }
+        when(q.complete && q.runningTag === i) { live(i) := False }
+        when(q.push.valid && q.push.tag === i) { live(i) := True; forbidden(i) := 0 }
+      }
+      assert(!(load.valid && ((q.memory.pendingWrites | q.memory.pendingReads) >> loadReg).lsb),
+        "vector load write into a register outstanding arithmetic uses")
+      // Unit operand reads and writes after the load write, by owner
+      val inElement = element.io.busy
+      val issueTag = arithmetic.lifecycle.issueTag.pull()
+      val readTag = inElement ? q.runningTag | issueTag
+      for (i <- 0 until 3) {
+        val r = vrf.io.reads(i).cmd
+        assert(!(q.running && r.valid && forbidden(readTag)(regOf(r.payload))), s"vector unit read port $i after a younger load wrote it")
+      }
+      // v0 is used at issue and, for mask scans, in X1; the drain event is the X1 cycle of the final issue
+      def usesForbiddenV0(tag : UInt) : Bool = q.memory.reads(tag)(0) && forbidden(tag)(0)
+      val issuing = arithmetic.running.pull() && arithmetic.issueFire.pull()
+      assert(!(q.running && (inElement ? usesForbiddenV0(q.runningTag) | issuing && usesForbiddenV0(issueTag))),
+        "vector unit used v0 after a younger load wrote it")
+      assert(!(q.running && arithmetic.io.drained.valid && usesForbiddenV0(arithmetic.io.drained.payload)),
+        "vector unit used v0 in X1 after a younger load wrote it")
+      val writeTag = inElement ? q.runningTag | arithmetic.io.writeTag
+      val unitWrite = inElement ? element.io.write | arithmetic.io.write
+      assert(!(q.running && unitWrite.valid && forbidden(writeTag)(regOf(unitWrite.payload.address))), "vector unit wrote a register after a younger load")
+      // Store data and index reads of real micro-ops never read a register outstanding arithmetic still writes
+      val read = memory.read
+      val storeData = read.isValid && read(MEM) && read(Decode.UOP)(5) && storeRead.valid
+      assert(!(storeData && (q.memory.pendingWrites >> regOf(storeRead.payload)).lsb), "vector store data read before its producer completed")
+      assert(!(indexRead.valid && (q.memory.pendingWrites >> regOf(indexRead.payload)).lsb), "vector index read before its producer completed")
     }
 
     // Interrupts and debug halts wait until the retried instruction commits or traps
@@ -1124,6 +1250,8 @@ class VectorPlugin(val layer : LaneLayer, val dlen : Int = 64, var withMemory : 
       val memoryIssue = CombInit(e0.fire && e0(MEM)).simPublic()
       val memoryComplete = (if (withMemory) CombInit(memory.port.rsp.valid) else False).simPublic()
       val memoryUopId = (if (withMemory) CombInit(memory.port.rsp.uopId) else U(0, Decode.UOP_ID_WIDTH bits)).simPublic()
+      // The VRF write of this cycle is a load's; with memoryOverlap a unit may write beside a memory response
+      val memoryWrite = memoryOverlap generate CombInit(if (withMemory) loadWrite else False).simPublic()
       val configValid = CombInit(vcs.configWrite.valid).simPublic()
       val configVl = CombInit(vcs.configWrite.vl).simPublic()
       val configVtype = CombInit(vtypeBits(vcs.configWrite.vtype)).simPublic()

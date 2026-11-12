@@ -725,6 +725,11 @@ class TestOptions {
         if(v.syncStart.toBoolean) event("sync_start")
         if(v.syncDone.toBoolean) event("sync_done")
         if(v.config.toBoolean) event("config")
+        if(v.memoryStart.toBoolean) event("memory_start")
+        if(v.memoryWrite.toBoolean) event("memory_write")
+        if(v.memoryStore.toBoolean) event("memory_store")
+        if(v.memoryConflict.toBoolean) event("memory_conflict")
+        if(v.drained.toBoolean) event("reads_drained", v.drainedTag.toInt)
       }
       onSimEnd { out.close() }
     }

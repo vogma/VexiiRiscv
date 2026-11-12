@@ -26,11 +26,14 @@ case class VectorQueueEntry(p: VectorRegFileParam, xlen: Int, tagWidth: Int, sli
  * runs. With overlap a beat command also starts behind running beat commands once the unit is ready and it reads no
  * register they still write; element commands run alone. full and idle are registered from the next
  * state, so they are exact in every cycle.
+ * memoryOverlap also tracks the registers every outstanding instruction reads and writes, so that a memory
+ * instruction can start behind them: a beat command's reads end at its drain event, everything else at completion.
  */
 class VectorQueue(p: VectorRegFileParam, xlen: Int, val depth: Int, slides: Boolean = false, beatCompress: Boolean = false,
                   val overlap: Boolean = false, beatMul: Boolean = false, val chaining: Boolean = false,
-                  val classOverlap: Boolean = false) extends Area {
+                  val classOverlap: Boolean = false, val memoryOverlap: Boolean = false) extends Area {
   require(!chaining || overlap)
+  require(!memoryOverlap || overlap)
   require(!classOverlap || beatMul && overlap)
   require(depth >= 1 && depth <= 4)
   val capacity = depth + 1
@@ -142,6 +145,32 @@ class VectorQueue(p: VectorRegFileParam, xlen: Int, val depth: Int, slides: Bool
     assert(!(pop && serial.valid(head.tag)), "vector queue reused a live tag")
     assert(!(progress.valid && !serial.valid(progress.tag)), "vector progress without live producer")
     if (beatCompress) assert(!(progress.valid && serial.compress(progress.tag)), "vector compress emitted word progress")
+  }
+
+  val memory = memoryOverlap generate new Area {
+    val drained = Flow(UInt(tagWidth bits)) // the beat command of that tag consumed its last operand
+    val reads = Vec.fill(1 << tagWidth)(Reg(Bits(32 bits)))
+    val released = Vec.fill(1 << tagWidth)(RegInit(False))
+    for (i <- 0 until (1 << tagWidth)) {
+      when(drained.valid && drained.payload === i) { released(i) := True }
+      when(pop && head.tag === i) {
+        reads(i) := head.reads
+        released(i) := False
+      }
+    }
+    assert(!(drained.valid && (!serial.valid(drained.payload) || released(drained.payload))), "vector read release of a tag without live reads")
+    assert(!(drained.valid && pop && head.tag === drained.payload), "vector read release of a tag being started")
+    // Waiting entries: the count slots from readPtr, wrapping explicitly
+    val occupied = (0 until depth).map(k => (0 until depth).map(r =>
+      (if (depth == 1) True else readPtr === r) && count > ((k - r + depth) % depth)).orR)
+    val waitingReads = (0 until depth).map(k => occupied(k) ? entries(k).reads | B(0, 32 bits)).reduce(_ | _)
+    val waitingWrites = (0 until depth).map(k => occupied(k) ? entries(k).writes | B(0, 32 bits)).reduce(_ | _)
+    val pendingWrites = waitingWrites | serial.pending
+    val pendingReads = waitingReads | (0 until (1 << tagWidth)).map(i =>
+      (serial.valid(i) && !released(i)) ? reads(i) | B(0, 32 bits)).reduce(_ | _)
+    // No outstanding write to what the memory instruction reads or writes, no outstanding read of what it writes
+    def clear(memReads: Bits, memWrites: Bits): Bool =
+      !((memReads | memWrites) & pendingWrites).orR && !(memWrites & pendingReads).orR
   }
 
   val countNext = count + U(push.valid) - U(pop)

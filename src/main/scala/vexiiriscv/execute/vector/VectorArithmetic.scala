@@ -144,9 +144,10 @@ object VectorArithmeticFlags {
 class VectorArithmetic(val p: VectorRegFileParam, val xlen: Int, val elen: Int = 32, val slides: Boolean = false,
                         val beatCompress: Boolean = false, val overlap: Boolean = false, val tagWidth: Int = 3,
                         val beatMul: Boolean = false, val chaining: Boolean = false,
-                        val classOverlap: Boolean = false) extends Component {
+                        val classOverlap: Boolean = false, val readsDrained: Boolean = false) extends Component {
   require((p.dlen == 64 || p.dlen == 128) && p.readPorts >= 3)
   require(!classOverlap || beatMul && overlap)
+  require(!readsDrained || overlap)
   require(!beatCompress || slides)
   require(!chaining || overlap)
   val wordBytes = p.beatBytes
@@ -173,6 +174,7 @@ class VectorArithmetic(val p: VectorRegFileParam, val xlen: Int, val elen: Int =
     val tag = overlap generate (in UInt(tagWidth bits)) // taken with the command
     val writeTag, doneTag = overlap generate (out UInt(tagWidth bits)) // the command of io.write and of io.done
     val tailMultiply = classOverlap generate (out Bool()) // a multiply command is issuing; an ordinary one must wait
+    val drained = readsDrained generate master(Flow(UInt(tagWidth bits))) // a command consumed its last operand and v0
   }
 
   def issueFire: Bool = if (chaining) io.sourceReady else True
@@ -985,6 +987,11 @@ class VectorArithmetic(val p: VectorRegFileParam, val xlen: Int, val elen: Int =
     }
     assert(!(inUnit === 0 && io.done), "vector beat unit done without a command")
     assert(!(io.cmd.valid && !io.ready), "vector beat command while the unit is not ready")
+  }
+  // Every operand, including live v0, is consumed by X1; the X1 cycle of the final issue ends a command's reads
+  val drain = readsDrained generate new Area {
+    io.drained.valid := RegNext(issue.last) init(False)
+    io.drained.payload := lifecycle.x1Tag
   }
   if (chaining) {
     for (i <- 0 until 3) {

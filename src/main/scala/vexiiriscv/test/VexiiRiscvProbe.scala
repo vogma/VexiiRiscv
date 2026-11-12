@@ -75,6 +75,8 @@ class VexiiRiscvProbe(cpu : VexiiRiscv, kb : Option[konata.Backend], var withRvl
   val vectorQueue = cpu.host.get[VectorPlugin].exists(_.queueDepth > 0)
   // Unfenced vector uops may set VS Dirty while older uops are in flight: report it with the owning uop's commit
   val vectorVsAtCommit = cpu.host.get[VectorPlugin].exists(_.noFence)
+  // Vector memory may run behind older accepted instructions: only their committed, completed prefix is reported first
+  val vectorMemoryOverlap = cpu.host.get[VectorPlugin].exists(_.memoryOverlap)
   def withVectorDeferral = vectorDeferReports >= 0 || vectorDeferEarly || vectorQueue
   def vectorIdle = vwb.forall(v => v.queueIdle == null || v.queueIdle.toBoolean)
   // Cycles in which each queue coverage event of the RTL was seen
@@ -290,7 +292,7 @@ class VexiiRiscvProbe(cpu : VexiiRiscv, kb : Option[konata.Backend], var withRvl
 
     def openVector(uop: MicroOpCtx): VectorRecord = {
       if(vectorRecord == null) {
-        if(withVectorDeferral) vectorReports.drain()
+        if(withVectorDeferral) { if(vectorMemoryOverlap) vectorReports.flushReadyPrefix() else vectorReports.drain() }
         vectorRecord = new VectorRecord(uop.pc, uop.instruction)
       }
       require(vectorRecord.pc == uop.pc && vectorRecord.instruction == uop.instruction, "vector retry changed instruction identity")
@@ -310,6 +312,7 @@ class VexiiRiscvProbe(cpu : VexiiRiscv, kb : Option[konata.Backend], var withRvl
       val record = vectorRecord
       require(record != null, "no open vector memory instruction")
       require(record.vstart.nonEmpty, "vector memory boundary has no final vstart")
+      if(withVectorDeferral && vectorMemoryOverlap) vectorReports.flushReadyPrefix()
       for((reg, mask, data) <- record.writes) backends.foreach(_.writeVrf(hartId, reg, mask, data))
       record.vstart.foreach(value => backends.foreach(_.writeRf(hartId, 5, 0x008, BigInt(value).toBytes(64))))
       for((vl, vtype) <- record.config) {
@@ -349,6 +352,7 @@ class VexiiRiscvProbe(cpu : VexiiRiscv, kb : Option[konata.Backend], var withRvl
         )
         // RV32 with 8-byte vector elements: IO elements take an access fault where Spike performs the access
         if (cpu.host.get[VectorLsuService].exists(s => s.withVector && s.vectorElen == 64) && get(Riscv.LSLEN) < 64) tracer.setPolicy(hartId, "ioWideFault=1")
+        if (vectorMemoryOverlap) tracer.setPolicy(hartId, "memoryBehindDeferred=1")
         val pc = if(xlen == 32) 0x80000000l else 0x80000000l
         tracer.setPc(hartId, pc)
       }
@@ -718,7 +722,7 @@ class VexiiRiscvProbe(cpu : VexiiRiscv, kb : Option[konata.Backend], var withRvl
           mask(index / 8) = (mask(index / 8) | (1 << (index % 8))).toByte
         }
         val write = (reg, mask, vectorShadow(reg).clone())
-        if(v.memoryComplete.toBoolean) harts(0).openVector(harts(0).microOp(v.memoryUopId.toInt)).writes += write
+        if((if(vectorMemoryOverlap) v.memoryWrite else v.memoryComplete).toBoolean) harts(0).openVector(harts(0).microOp(v.memoryUopId.toInt)).writes += write
         else {
           val hart = harts(0)
           val uop = hart.microOp(v.uopId.toInt)
@@ -931,7 +935,8 @@ class VexiiRiscvProbe(cpu : VexiiRiscv, kb : Option[konata.Backend], var withRvl
         if(withVectorDeferral && uop.didCommit) {
           val config = (uop.instruction & 0x707F) == 0x7057
           val vectorObserver = isVectorInstruction(uop.instruction) && !config && !deferred
-          if(vectorObserver || uop.csrValid && VectorTraceBuffer.csrObserver(uop.csrAddress, uop.csrWriteDone)) hart.vectorReports.drain(committedOnly = true)
+          if(vectorMemoryOverlap && isVectorMemory(uop.instruction)) hart.vectorReports.flushReadyPrefix()
+          else if(vectorObserver || uop.csrValid && VectorTraceBuffer.csrObserver(uop.csrAddress, uop.csrWriteDone)) hart.vectorReports.drain(committedOnly = true)
         }
         for (io <- uop.ioAccesses) backends.foreach(_.ioAccess(hartId, io))
         if (uop.vectorDirty) {

@@ -100,6 +100,11 @@ class VectorTraceBuffer(hartId: Int, backends: () => Seq[TraceBackend], maxDelay
     while(headReady && pending.head._2.due <= cycle) emitHead()
   }
 
+  // Reports every committed and completed head, ignoring report delays; stops at the first other head
+  def flushReadyPrefix(): Unit = {
+    while(headReady) emitHead()
+  }
+
   // committedOnly leaves the accepted but uncommitted entries, which are younger than the retiring observer
   def drain(committedOnly: Boolean = false): Unit = {
     if(fault == "late" && !faultUsed && pending.nonEmpty) {

@@ -41,6 +41,15 @@ class VectorPerformanceSignals(plugin: VectorPlugin) extends Area {
   val syncStart = tap(v.e0.sequencer.unitStarts)
   val syncDone = tap(v.e0.sequencer.unitDone)
   val config = tap(v.whitebox.configValid)
+  // Memory behind queued arithmetic: first micro-op with work outstanding, load write and store issue beside it,
+  // a load held for a unit write, and the end of a beat command's reads
+  private val mo = plugin.memoryOverlap
+  val memoryStart = tap(if (mo) v.memory.seq.fire && v.memory.seq.first && !q.idle else False)
+  val memoryWrite = tap(if (mo) v.loadWrite && !q.idle else False)
+  val memoryStore = tap(if (mo) v.e0.fire && v.e0(plugin.MEM) && v.e0(Decode.UOP)(5) && !q.idle else False)
+  val memoryConflict = tap(if (mo) v.memory.complete.conflict else False)
+  val drained = tap(if (mo) q.memory.drained.valid else False)
+  val drainedTag = tap(if (mo) q.memory.drained.payload else U(0, 3 bits))
   val state = Bits(9 bits)
   state(0) := q.running
   state(1) := v.e0.sel && v.e0.queue.queued && q.full
