@@ -13,7 +13,7 @@ import spinal.lib.misc.plugin.FiberPlugin
 import spinal.lib.system.tag.PmaRegion
 import vexiiriscv.decode.{Decode, DecoderService}
 import vexiiriscv.decode.Decode.UOP
-import vexiiriscv.memory.{AddressTranslationPortUsage, AddressTranslationReq, AddressTranslationService, DBusAccessService, PmaLoad, PmaLoadExecute, PmaLogic, PmaPort, PmaStore, PmpService}
+import vexiiriscv.memory.{AddressTranslationPortUsage, AddressTranslationReq, AddressTranslationService, DBusAccessService, PmaLoad, PmaLoadExecute, PmaLogic, PmaPort, PmaStore, PmpPortParameter, PmpService}
 import vexiiriscv.misc.{AddressToMask, LsuTriggerService, PerformanceCounterService, PrivilegedPlugin, TrapArg, TrapReason, TrapService}
 import vexiiriscv.riscv.Riscv.{FLEN, LSLEN, XLEN}
 import vexiiriscv.riscv._
@@ -32,7 +32,7 @@ object LsuL1CmdOpcode extends SpinalEnum{
 case class LsuL1Cmd() extends Bundle {
   val op = LsuL1CmdOpcode()
   val address = LsuL1.MIXED_ADDRESS()
-  val size = SIZE()
+  val size = LsuL1.SIZE() // AGU sizes zero-extended; a wide vector word may be larger
   val load, store, execute, atomic = Bool()
   val clean, invalidate = Bool()
   val guest = Bool()
@@ -93,7 +93,7 @@ class LsuPlugin(var layer : LaneLayer,
   override def withSoftwarePrefetch: Boolean = softwarePrefetch
   override def getLsuCachelessBus(): LsuCachelessBus = logic.bus
   override def lsuCommitProbe: Flow[LsuCommitProbe] = logic.commitProbe
-  override def getBlockSize: Int = LsuL1.LINE_BYTES.get
+  override def getBlockSize: Int = LsuL1.LINE_BYTES.get; override def vectorWordWidth: Int = LsuL1.CPU_DATA_WIDTH.get
 
   // bus refer to the IO memory bus
   def busParam = LsuCachelessBusParam(
@@ -292,13 +292,13 @@ class LsuPlugin(var layer : LaneLayer,
     val llcBus = withLlcFlush generate master(FlushBus(FlushParam(llcFlushAddressWidth, 0)))
 
     accessRetainer.await()
-    val l1 = LsuL1
+    val l1 = LsuL1; val cachedBits = LsuL1.CPU_DATA_WIDTH.get; val wideAccess = cachedBits > LSLEN.get // L1 words wider than scalar accesses
     val FROM_ACCESS = Payload(Bool())
     val FROM_LSU = Payload(Bool())
     val FROM_WB = Payload(Bool())
     val FORCE_PHYSICAL = Payload(Bool())
     val FROM_PREFETCH = Payload(Bool())
-    val MMU_FAILURE, MMU_PAGE_FAULT = Payload(Bool())
+    val MMU_FAILURE, MMU_PAGE_FAULT = Payload(Bool()); val PMP_UPPER_FAULT = Payload(Bool()) // wide L1 word: PMP denies its upper LSLEN half
     val GUEST_MMU_FAILURE, GUEST_MMU_PAGE_FAULT = Payload(Bool())
 
     // Area which can be used to wait until the L1 finish the refills which triggered the wait.
@@ -436,7 +436,7 @@ class LsuPlugin(var layer : LaneLayer,
       bus.load    := l1.LOAD || l1.EXECUTE
       bus.store   := l1.STORE
       bus.virtual := l1.MIXED_ADDRESS
-      bus.size    := l1.SIZE
+      bus.size    := l1.SIZE.resized
 
       val HITS = insert(if (vectorSplit) vector.triggerHits(this, bus) else bus.hits)
       val HIT = insert(if (vectorSplit) apply(HITS).orR else bus.hits.orR)
@@ -474,7 +474,7 @@ class LsuPlugin(var layer : LaneLayer,
         val port = ports.addRet(Stream(LsuL1Cmd()))
         port.valid := (if (withVector) isValid && SEL && vector.access(this) else isValid && SEL)
         port.address := (if (withVector) vector.address(this, srcp.ADD_SUB.asUInt) else srcp.ADD_SUB.asUInt).resized
-        port.size := (if (withVector) vector.size(this) else apply(SIZE))
+        port.size := (if (withVector) vector.size(this) else apply(SIZE).resized)
         port.load := LOAD
         port.store := STORE
         port.execute := EXECUTE
@@ -577,7 +577,7 @@ class LsuPlugin(var layer : LaneLayer,
       l1.SEL := arbiter.io.output.valid
       if(withLlcFlush) l1.SEL clearWhen(arbiter.io.output.clean || arbiter.io.output.invalidate) //Avoid enabling the L1 cache on flush
       l1.MIXED_ADDRESS := arbiter.io.output.address
-      l1.MASK := (if (vectorBeat) vector.l1Mask(this, arbiter.io.output, if (withStoreBuffer) storeBuffer.pop.op.mask else null) else AddressToMask(arbiter.io.output.address, arbiter.io.output.size, Riscv.LSLEN / 8))
+      l1.MASK := (if (vectorBeat) vector.l1Mask(this, arbiter.io.output, if (withStoreBuffer) storeBuffer.pop.op.mask else null) else AddressToMask(arbiter.io.output.address, arbiter.io.output.size, cachedBits / 8))
       l1.SIZE := arbiter.io.output.size
       l1.LOAD := arbiter.io.output.load
       l1.EXECUTE := arbiter.io.output.execute
@@ -651,7 +651,7 @@ class LsuPlugin(var layer : LaneLayer,
 
     // Pre compute a few things to reduce the combinatorial path pressure on the ctrl stage.
     val preCtrl = new elp.Execute(ctrlAt-1){
-      val MISS_ALIGNED = insert(if (withVector) vector.missAligned(this, (1 to log2Up(LSLEN / 8)).map(i => l1.SIZE === i && l1.MIXED_ADDRESS(i - 1 downto 0) =/= 0).orR) else (1 to log2Up(LSLEN / 8)).map(i => l1.SIZE === i && l1.MIXED_ADDRESS(i - 1 downto 0) =/= 0).orR)
+      val MISS_ALIGNED = insert(if (withVector) vector.missAligned(this, (1 to log2Up(cachedBits / 8)).map(i => l1.SIZE === i && l1.MIXED_ADDRESS(i - 1 downto 0) =/= 0).orR) else (1 to log2Up(cachedBits / 8)).map(i => l1.SIZE === i && l1.MIXED_ADDRESS(i - 1 downto 0) =/= 0).orR)
       if(withCbm) MISS_ALIGNED clearWhen(l1.CLEAN || l1.INVALID)
       val IS_AMO = insert(SEL && l1.ATOMIC && l1.STORE && l1.LOAD)
     }
@@ -663,13 +663,13 @@ class LsuPlugin(var layer : LaneLayer,
       cached.cmd.op(0) := l1.STORE
       cached.cmd.op(1) := l1.EXECUTE
       io.cmd.address := stpk.TRANSLATED
-      io.cmd.size := l1.SIZE.asBits
+      io.cmd.size := l1.SIZE.asBits.resized
       io.cmd.op(0) := l1.STORE
       io.cmd.op(1) := l1.EXECUTE
 
       val CACHED_RSP = insert(cached.rsp)
       val IO_RSP = insert(io.rsp)
-      IO_RSP.fault.setWhen(l1.ATOMIC || FROM_ACCESS); if (vectorSplit) vector.ioFault(this, IO_RSP.fault)
+      IO_RSP.fault.setWhen(l1.ATOMIC || FROM_ACCESS); if (vectorSplit) vector.ioFault(this, IO_RSP.fault); if (wideAccess) IO_RSP.fault.setWhen(l1.SIZE > log2Up(LSLEN.get / 8)) // IO stays LSLEN wide
       val IO = insert(CACHED_RSP.fault && !IO_RSP.fault && !FENCE && !FROM_PREFETCH)
       val FROM_LSU_MSB_FAILED = insert(FROM_LSU && (if (withVector) vector.msbFailed(this, srcp.ADD_SUB.asUInt, tpk.ADDRESS_EXTENSION) else srcp.ADD_SUB.dropLow(Global.MIXED_WIDTH).asBools.map(_ =/= tpk.ADDRESS_EXTENSION).orR))
       MMU_PAGE_FAULT := tpk.PAGE_FAULT
@@ -681,10 +681,10 @@ class LsuPlugin(var layer : LaneLayer,
     // The ctrl stage will take all the decisions, handle AMO/LR/SC and IO accesses as well
     // A loooot of things are happening here.
     val onCtrl = new elp.Execute(ctrlAt) {
-      val lsuTrap = False
+      val lsuTrap = False; def pmpFault: Bool = if (wideAccess) apply(pmpPort.ACCESS_FAULT) || apply(PMP_UPPER_FAULT) else apply(pmpPort.ACCESS_FAULT)
 
       // Data which should be written to the memory, before being aligned to the memory address
-      val writeData = Bits(Riscv.LSLEN bits)
+      val writeData = Bits(cachedBits bits)
       writeData.assignDontCare()
       writeData(0, XLEN bits) := up(elp(IntRegFile, riscv.RS2))
       if(Riscv.withFpu) when(FLOAT){
@@ -706,9 +706,9 @@ class LsuPlugin(var layer : LaneLayer,
         bus.cmd.valid := doItReg && !cmdSent && allowIt && !tooEarly
         bus.cmd.write := l1.STORE
         bus.cmd.address := l1.PHYSICAL_ADDRESS
-        bus.cmd.data := l1.WRITE_DATA
-        bus.cmd.size := l1.SIZE
-        bus.cmd.mask := l1.MASK
+        bus.cmd.data := l1.WRITE_DATA.resized // replicated, so the low word fits any scalar lane
+        bus.cmd.size := l1.SIZE.resized
+        bus.cmd.mask := (if (wideAccess) l1.MASK.subdivideIn(LSLEN / 8 bits)(l1.PHYSICAL_ADDRESS(log2Up(cachedBits / 8) - 1 downto log2Up(LSLEN / 8))) else l1.MASK: Bits)
         bus.cmd.io := True
         bus.cmd.fromHart := True
         bus.cmd.hartId := Global.HART_ID
@@ -725,7 +725,7 @@ class LsuPlugin(var layer : LaneLayer,
 
       // Extract the data from the memory read, into the wished register file format.
       val loadData = new Area {
-        val input = io.cmdSent.mux[Bits](io.rsp.data, l1.READ_DATA)
+        val input = io.cmdSent.mux[Bits](io.rsp.data, if (wideAccess) l1.READ_DATA.subdivideIn(LSLEN bits)(l1.MIXED_ADDRESS(log2Up(cachedBits / 8) - 1 downto log2Up(LSLEN / 8))) else l1.READ_DATA: Bits)
         val splitted = input.subdivideIn(8 bits)
         val shifted = Bits(LSLEN bits)
         val wordBytes = LSLEN / 8
@@ -746,9 +746,9 @@ class LsuPlugin(var layer : LaneLayer,
       // So for instance, let's say the want to write 0xABCD on a given 16 bits location on a 64 bits memory bus,
       // then hardware will generate 0xABCD_ABCD_ABCD_ABCD, allowing the write to happen with every aligned byte mask possible.
       val storeData = new Area {
-        val mapping = for(size <- 0 to log2Up(Riscv.LSLEN / 8)) yield {
+        val mapping = for(size <- 0 to log2Up(cachedBits / 8)) yield {
           val w = (1 << size) * 8
-          size -> writeData(0, w bits).#*(Riscv.LSLEN / w)
+          size -> writeData(0, w bits).#*(cachedBits / w)
         }
         l1.WRITE_DATA := l1.SIZE.muxListDc(mapping)
       }
@@ -854,7 +854,7 @@ class LsuPlugin(var layer : LaneLayer,
         trapPort.code.assignDontCare()
         trapPort.arg.allowOverride() := 0
 
-        val accessFault = (onPma.CACHED_RSP.fault).mux[Bool](io.rsp.valid && io.rsp.error, l1.FAULT) || pmpPort.ACCESS_FAULT
+        val accessFault = (onPma.CACHED_RSP.fault).mux[Bool](io.rsp.valid && io.rsp.error, l1.FAULT) || pmpFault
         when(accessFault) {
           lsuTrap := True
           trapPort.exception := True
@@ -1036,7 +1036,7 @@ class LsuPlugin(var layer : LaneLayer,
           fenceTrap.doIt := True
         }
       }
-      if (withVector) vector.complete(this, lsuTrap, trapPort, loadData.RESULT, if (withStoreBuffer) storeBuffer.empty else True, l1.READ_DATA, !tpk.REFILL && !tpk.HAZARD && (onPma.CACHED_RSP.fault || l1.FAULT || pmpPort.ACCESS_FAULT || MMU_PAGE_FAULT || tpk.ACCESS_FAULT || onPma.FROM_LSU_MSB_FAILED || preCtrl.MISS_ALIGNED || onTrigger.HIT))
+      if (withVector) vector.complete(this, lsuTrap, trapPort, loadData.RESULT, if (withStoreBuffer) storeBuffer.empty else True, l1.READ_DATA, !tpk.REFILL && !tpk.HAZARD && (onPma.CACHED_RSP.fault || l1.FAULT || pmpFault || MMU_PAGE_FAULT || tpk.ACCESS_FAULT || onPma.FROM_LSU_MSB_FAILED || preCtrl.MISS_ALIGNED || onTrigger.HIT))
       when(isValid && SEL) {
         val t = when(lsuTrap) {
           trapPort.valid := True
@@ -1070,7 +1070,7 @@ class LsuPlugin(var layer : LaneLayer,
       skipsWrite += l1.MISS || l1.MISS_UNIQUE
       skipsWrite += l1.FAULT
       skipsWrite += preCtrl.MISS_ALIGNED
-      skipsWrite += FROM_LSU && (onTrigger.HIT || pmpPort.ACCESS_FAULT)
+      skipsWrite += FROM_LSU && (onTrigger.HIT || pmpFault)
       skipsWrite += FROM_PREFETCH
       if(withZalrsc) skipsWrite += l1.ATOMIC && !(l1.LOAD || l1.EXECUTE) && scMiss
       if (withStoreBuffer) skipsWrite += wb.selfHazard || !FROM_WB && wb.hit
@@ -1103,7 +1103,7 @@ class LsuPlugin(var layer : LaneLayer,
         val rsp = dbusAccesses.head.rsp
         rsp.valid    := l1.SEL && FROM_ACCESS && !elp.isFreezed()
         rsp.data     := loadData.RESULT.resized // loadData.RESULT instead of l1.READ_DATA (because it rv32fd)
-        rsp.error    := l1.FAULT || pmpPort.ACCESS_FAULT
+        rsp.error    := l1.FAULT || pmpFault
         rsp.redo     := traps.l1Failed
         rsp.waitSlot := 0
         rsp.waitAny  := False //TODO
@@ -1171,6 +1171,43 @@ class LsuPlugin(var layer : LaneLayer,
     }
 
     if(withStoreBuffer) storeBuffer.ops.pip.build()
+
+    // An L1 word wider than LSLEN may cross a PMP granule boundary: check its upper half too, with the same
+    // classification and response stage. Only accesses wider than LSLEN use the result.
+    val pmpUpper = wideAccess generate new Area {
+      val spec = pmpPortParameter match {
+        case p: PmpPortParameter => p
+        case _ => SpinalError("L1 words wider than LSLEN need a pipelined PMP port specification")
+      }
+      require(isPow2(cachedBits) && cachedBits == 2 * LSLEN.get, "wide L1 words must be twice LSLEN")
+      val address = new elp.Execute(spec.napotMatchAt min spec.torCmpAt) {
+        val UPPER = insert(stpk.TRANSLATED | U(LSLEN.get / 8, widthOf(stpk.TRANSLATED) bits))
+      }
+      val port = ps.createPmpPort(
+        nodes = List.tabulate(ctrlAt+1)(elp.execute(_).down),
+        physicalAddress = address.UPPER,
+        forceCheck = _(FROM_ACCESS),
+        read = e => e(l1.LOAD) || (e(l1.EXECUTE) && e(l1.GUEST)),
+        write = _(l1.STORE),
+        execute = e => e(l1.EXECUTE) && e(l1.GUEST),
+        portSpec = pmpPortParameter,
+        storageSpec = null
+      )
+      val result = new elp.Execute(ctrlAt) {
+        val wide = l1.SIZE > log2Up(LSLEN.get / 8)
+        PMP_UPPER_FAULT := wide && apply(port.ACCESS_FAULT)
+        // Only aligned vector beats are wider than LSLEN, and they never reach the IO bus
+        val lsuWide = isValid && l1.SEL && FROM_LSU && wide
+        assert(!(lsuWide && (if (withVector && vectorBeat) !(VECTOR && apply(vector.ELEMENT).beats.enable) else True)), "L1 access wider than LSLEN that is not a vector beat")
+        assert(!(lsuWide && l1.MIXED_ADDRESS(log2Up(cachedBits / 8) - 1 downto 0) =/= 0), "misaligned wide L1 access")
+        assert(!(onCtrl.io.doIt && wide), "wide L1 word on the IO path")
+        // Event signals for simulation monitors: an attempt, with upper-half bytes, rejected by PMP or by the PMA
+        val fire = lsuWide && !elp.isFreezed()
+        val upperBytes = fire && apply(l1.MASK)(cachedBits / 8 - 1 downto LSLEN.get / 8).orR
+        val upperDenied = fire && apply(port.ACCESS_FAULT)
+        val ioDenied = fire && apply(onPma.CACHED_RSP).fault
+      }
+    }
     buildBefore.release()
   }
 

@@ -31,8 +31,8 @@ class VectorLsuHookDriver extends FiberPlugin {
         when(Decode.UOP(Const.rdRange).asUInt === 28) { port.cmd.address(40) := False }
       }
       port.cmd.size := Decode.UOP(Const.funct3Range).mux(
-        B"000" -> U(0, LSU_SIZE_WIDTH bits), B"101" -> U(1, LSU_SIZE_WIDTH bits), default -> U(2, LSU_SIZE_WIDTH bits))
-      port.cmd.storeData := B(BigInt("89abcdef", 16), LSLEN bits)
+        B"000" -> U(0, widthOf(port.cmd.size) bits), B"101" -> U(1, widthOf(port.cmd.size) bits), default -> U(2, widthOf(port.cmd.size) bits))
+      port.cmd.storeData := B(BigInt("89abcdef", 16), widthOf(port.cmd.storeData) bits)
       port.cmd.access := Decode.UOP(Const.rdRange).asUInt =/= 31
       port.cmd.last := Decode.UOP(Const.rdRange).asUInt =/= 30
       if (port.cmd.beats != null) { port.cmd.beats.enable := False; port.cmd.beats.mask := 0 }

@@ -19,7 +19,7 @@ class VectorLsuHooks(lsu: LsuPlugin, frontend: AguFrontend, ds: DecoderService) 
   require(addressAt == 0 && ctrlAt == wbAt, "vector elements require E0 address capture and control-stage writeback")
   lsu.vectorLsuLock.await()
   val port = lsu.vectorLsuPort
-  val ELEMENT = Payload(VectorLsuElement(lsu.vectorSplit, lsu.vectorBeat))
+  val ELEMENT = Payload(VectorLsuElement(lsu.vectorSplit, lsu.vectorBeat, lsu.vectorWordWidth))
   val DECODE_VECTOR = Payload(Bool())
   for (uop <- frontend.vectorOps) {
     layer(uop).mayFlushUpTo(ctrlAt).setCompletion(ctrlAt)
@@ -39,11 +39,11 @@ class VectorLsuHooks(lsu: LsuPlugin, frontend: AguFrontend, ds: DecoderService) 
         assert(!(isValid && !isCancel && VECTOR) || p.cmd.valid, "vector LSU uop has no descriptor")
       case None => apply(ELEMENT).assignFromBits(B(0, apply(ELEMENT).getBitsWidth bits))
     }
-    when(VECTOR) { bypass(SIZE) := apply(ELEMENT).size }
+    when(VECTOR) { bypass(SIZE) := apply(ELEMENT).size.resized } // truncated for words wider than LSLEN; the L1 uses size()
   }
 
   def size(e: CtrlLaneApi): UInt =
-    e(VECTOR) ? e(ELEMENT).size | e(SIZE)
+    e(VECTOR) ? e(ELEMENT).size | e(SIZE).resize(widthOf(e(ELEMENT).size))
 
   def access(e: CtrlLaneApi): Bool = !e(VECTOR) || e(ELEMENT).access
 
@@ -81,7 +81,7 @@ class VectorLsuHooks(lsu: LsuPlugin, frontend: AguFrontend, ds: DecoderService) 
 
   // A beat enables its elements' bytes; a store-buffer retry uses the mask its store was pushed with
   def l1Mask(e: CtrlLaneApi, cmd: LsuL1Cmd, stored: Bits): Bits = {
-    val mask = CombInit(AddressToMask(cmd.address, cmd.size, LSLEN / 8))
+    val mask = CombInit(AddressToMask(cmd.address, cmd.size, lsu.vectorWordWidth / 8))
     when(cmd.op === LsuL1CmdOpcode.LSU && e(VECTOR) && e(ELEMENT).beats.enable) { mask := e(ELEMENT).beats.mask }
     if (stored != null) when(cmd.op === LsuL1CmdOpcode.STORE_BUFFER) { mask := stored }
     mask

@@ -171,7 +171,7 @@ class PmpPlugin(val p : PmpParam) extends FiberPlugin with PmpService{
       csr.writeCancel(CSR.PMPADDR + i, isLocked)
       csr.read(address(address.bitsRange.drop(extraBit.toInt)), CSR.PMPADDR + i, granularityWidth-2)
       csr.write(address(address.bitsRange), CSR.PMPADDR + i, granularityWidth-2-extraBit.toInt)
-      if(granularity > 4 && p.withNapot) csr.read(U(granularityWidth-2 bits, default -> isNapot, granularityWidth-3 -> (address.lsb && isNapot)), CSR.PMPADDR + i) //WTF
+      if(granularity > 4 && p.withNapot) csr.read(if(granularity == 8) U(address.lsb && isNapot) else U(granularityWidth-2 bits, default -> isNapot, granularityWidth-3 -> (address.lsb && isNapot)), CSR.PMPADDR + i) //WTF
       csr.read(CSR.PMPCFG + cfgId,  0+cfgOffset -> cfg.read, 1+cfgOffset -> cfg.write, 2+cfgOffset -> cfg.execute, 3+cfgOffset -> cfg.kind, 7+cfgOffset -> cfg.locked)
       csr.write(CSR.PMPCFG + cfgId,  0+cfgOffset -> cfgNext.read, 1+cfgOffset -> cfgNext.write, 2+cfgOffset -> cfgNext.execute, 3+cfgOffset -> cfgNext.kind, 7+cfgOffset -> cfgNext.locked)
     }

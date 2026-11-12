@@ -199,6 +199,7 @@ class ParamSimple() {
   var vectorChaining = false
   var vectorClassOverlap = false
   var vectorMemoryOverlap = false
+  var vectorMemoryWidth = 0 // L1 word for vector beats in bits; 0 keeps the scalar LSU width
   var narrowIoWindow = false
   val prefetcherRptParam = new PrefetcherRptParam()
 
@@ -377,7 +378,9 @@ class ParamSimple() {
 
   def alignerPluginFetchAt = fetchL1Enable.mux(2, 1+fetchForkAt) + extension.withRvh.toInt
   def fetchMemDataWidth = 32*decoders max fetchMemDataWidthMin
-  def lsuMemDataWidth = xlen max lsuMemDataWidthMin max extension.withRvd.mux(64, 0) max extension.withRvq.mux(128, 0)
+  def lsuMemDataWidth = xlen max lsuMemDataWidthMin max extension.withRvd.mux(64, 0) max extension.withRvq.mux(128, 0) max lsuCpuDataWidth
+  // L1 CPU-side word: the scalar LSU width, or the wider vector beat word
+  def lsuCpuDataWidth = (xlen max extension.withRvd.mux(64, 0) max extension.withRvq.mux(128, 0)) max vectorMemoryWidth
   def memDataWidth = List(fetchMemDataWidth, lsuMemDataWidth).max
 
   //  Debug modifiers
@@ -635,6 +638,7 @@ class ParamSimple() {
     if (extension.withZve32x && vectorChaining) r += "vch"
     if (extension.withZve32x && vectorClassOverlap) r += "vcx"
     if (extension.withZve32x && vectorMemoryOverlap) r += "vmo"
+    if (extension.withZve32x && vectorMemoryWidth != 0) r += s"vmw$vectorMemoryWidth"
     if (extension.withZve32x && vectorOverlap) r += "vov"
     if (extension.withZve32x && vectorNoFence) r += "vnf"
     if (extension.withZve32x && vectorTrapE0) r += "vte0"
@@ -949,6 +953,8 @@ class ParamSimple() {
       .text("Let ordinary and multiply beat commands overlap; requires --vector-beat-mul and --vector-overlap.")
     opt[Unit]("vector-memory-overlap").action { (v, c) => vectorMemoryOverlap = true }
       .text("Start vector loads and stores behind older queued arithmetic; requires the vector queue and --vector-overlap.")
+    opt[Int]("vector-memory-width").action { (v, c) => vectorMemoryWidth = v }
+      .text("Move vector beats in L1 words of this many bits (0, the default, or 128); 128 needs RV64, DLEN 128 and beat memory. Scalar and IO accesses keep their widths.")
     opt[Unit]("vector-beat-mul").action { (v, c) => vectorBeatMul = true }
       .text("Run integer multiplies in a shared destination-word multiplier array.")
     opt[Unit]("vector-overlap").action { (v, c) => vectorOverlap = true }
@@ -1017,8 +1023,16 @@ class ParamSimple() {
       assert(!vectorClassOverlap || vectorBeatMul && vectorOverlap, "--vector-class-overlap needs --vector-beat-mul and --vector-overlap")
       assert(!vectorMemoryOverlap || vectorQueue > 0 && vectorOverlap, "--vector-memory-overlap needs the vector queue and --vector-overlap")
       assert(!(vectorOverlap || vectorNoFence) || vectorQueue > 0, "--vector-overlap and --vector-nofence need the vector queue")
+      assert(vectorMemoryWidth == 0 || vectorMemoryWidth == 128, s"--vector-memory-width must be 0 or 128, got $vectorMemoryWidth")
+      if (vectorMemoryWidth != 0) {
+        assert(xlen == 64 && !extension.withRvq, "--vector-memory-width=128 needs RV64 without Q (the L1 word must be twice the scalar width)")
+        assert(vectorDlen == 128, "--vector-memory-width=128 needs --vector-dlen=128")
+        assert(vectorBeatMemory, "--vector-memory-width=128 needs vector beat memory (drop --no-vector-beat-memory)")
+        assert(pmpParam.pmpSize == 0 || pmpParam.granularity >= 8, "--vector-memory-width=128 needs a PMP granularity of at least 8 bytes")
+      }
     } else {
       assert(zvlActive.isEmpty, "zvl*b needs a vector extension")
+      assert(vectorMemoryWidth == 0, "--vector-memory-width needs a vector extension")
     }
 
     plugins += new riscv.RiscvPlugin(xlen, hartCount, isa = extension.getIsaNameArray(includeIgnored = true).toSet)
@@ -1296,7 +1310,7 @@ class ParamSimple() {
       plugins += new LsuL1Plugin(
         lane           = lane0,
         memDataWidth   = lsuMemDataWidth,
-        cpuDataWidth   = xlen max extension.withRvd.mux(64, 0) max extension.withRvq.mux(128, 0),
+        cpuDataWidth   = lsuCpuDataWidth,
         refillCount    = lsuL1RefillCount,
         writebackCount = lsuL1WritebackCount,
         setCount       = lsuL1Sets,

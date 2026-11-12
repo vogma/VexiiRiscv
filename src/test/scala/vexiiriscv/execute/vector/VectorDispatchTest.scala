@@ -57,7 +57,7 @@ class VectorSequenceDriver extends FiberPlugin {
     }
 
     def sizeOf(uop: Bits): UInt = uop(Const.funct3Range).mux(
-      B"000" -> U(0, LSU_SIZE_WIDTH bits), B"101" -> U(1, LSU_SIZE_WIDTH bits), default -> U(2, LSU_SIZE_WIDTH bits))
+      B"000" -> U(0, widthOf(port.cmd.size) bits), B"101" -> U(1, widthOf(port.cmd.size) bits), default -> U(2, widthOf(port.cmd.size) bits))
 
     val e0 = new layer.Execute(0) {
       val d = apply(DESCRIPTOR)
@@ -65,7 +65,7 @@ class VectorSequenceDriver extends FiberPlugin {
       port.cmd.valid := isValid && AguPlugin.VECTOR
       port.cmd.address := (up(lane(IntRegFile, RS1)).asUInt + (d.index << size).resize(XLEN)).resized
       port.cmd.size := size
-      port.cmd.storeData := (U(0x40, 8 bits) + d.index.resize(8)).asBits #* (LSLEN / 8)
+      port.cmd.storeData := (U(0x40, 8 bits) + d.index.resize(8)).asBits #* (widthOf(port.cmd.storeData) / 8)
       port.cmd.access := d.access
       port.cmd.last := d.last
       if (port.cmd.beats != null) { port.cmd.beats.enable := False; port.cmd.beats.mask := 0 }

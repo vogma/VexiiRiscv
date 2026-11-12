@@ -469,7 +469,7 @@ class VectorPlugin(val layer : LaneLayer, val dlen : Int = 64, var withMemory : 
     val split = withMemory && lsu.vectorSplit
     val beats = withMemory && lsu.vectorBeat
     val DESCRIPTOR = Payload(VectorMemoryDescriptor(vcs.vstartWidth, split, beats, dlen / 8))
-    val lsuBytes = LSLEN.get / 8
+    val lsuBytes = (if (withMemory) lsu.vectorWordWidth else LSLEN.get) / 8 // a beat moves one L1 word
     // Unit-stride forms without segments; whole-register and mask transfers count their nf as registers
     def unitStride(uop : Bits) : Bool = uop(27 downto 26) === 0 && (whole(uop) || maskMemory(uop) ||
       (uop(Const.rs2Range) === 0 || faultOnlyFirst(uop)) && uop(31 downto 29) === 0)
@@ -894,7 +894,7 @@ class VectorPlugin(val layer : LaneLayer, val dlen : Int = 64, var withMemory : 
             (s.tdata1.m || s.tdata1.s || s.tdata1.u) && (s.tdata1.load || s.tdata1.store)).orR else False
         }
         val size = sizeOf(seq.uop)
-        val eligible = unitStride(seq.uop) && size < log2Up(lsuBytes) && !elementwise && !armed
+        val eligible = (if (lsuBytes > 8) unitStride(seq.uop) else unitStride(seq.uop) && size < log2Up(lsuBytes)) && !elementwise && !armed
         when(unitStride(seq.uop)) { strideRead.address := seq.uop(Const.rs1Range).asUInt.resized }
         val candidate = RegNextWhen(eligible, walker.io.start) init(False)
         val ready = RegNext(prepared && walker.io.start && !seq.cancel) init(False)
@@ -902,6 +902,8 @@ class VectorPlugin(val layer : LaneLayer, val dlen : Int = 64, var withMemory : 
 
         val chunk = RegInit(False)
         val wordBytes = dlen / 8
+        // A VRF word holds whole L1 words; chunk numbers count the L1-word boundaries inside it, at most three
+        require(wordBytes % lsuBytes == 0 && wordBytes / lsuBytes <= 3, s"beats need DLEN a multiple of the L1 word, got $dlen / ${lsuBytes * 8}")
         val posWidth = log2Up(wordBytes)
         val wordMask = Reg(UInt(posWidth bits)) init(0)
         val table = Reg(Vec.fill(wordBytes)(UInt(2 bits)))
@@ -938,6 +940,8 @@ class VectorPlugin(val layer : LaneLayer, val dlen : Int = 64, var withMemory : 
           0 -> active,
           1 -> Cat((0 until dlen / 8).map(p => active(p >> 1))),
           default -> Cat((0 until dlen / 8).map(p => active(p >> 2))))
+        // Words wider than 8 bytes also pack EEW-64 elements
+        if (lsuBytes > 8) when(size === 3) { descriptor.beats.mask := Cat((0 until dlen / 8).map(p => active(p >> 3))) }
         val p0 = (walker.io.index << size).resize(log2Up(dlen / 8))
         val q0 = (stride(log2Up(lsuBytes) - 1 downto 0).asUInt + p0).resize(log2Up(lsuBytes))
         descriptor.beats.rotate := p0 - q0.resize(log2Up(dlen / 8))
@@ -985,12 +989,12 @@ class VectorPlugin(val layer : LaneLayer, val dlen : Int = 64, var withMemory : 
           val upper = U(d.half) << 2
           port.cmd.address := (up(elp(IntRegFile, RS1)).asUInt + apply(read.OFFSET) + (indexed(Decode.UOP) ? indexElement | U(0, XLEN bits)) + upper).resized
           port.cmd.size := ((size === 3) ? U(2, 2 bits) | size).resized
-          port.cmd.storeData := (word >> ((offset.resize(log2Up(vrf.p.beatBytes)) | upper.resized) << 3)).resize(LSLEN)
+          port.cmd.storeData := (word >> ((offset.resize(log2Up(vrf.p.beatBytes)) | upper.resized) << 3)).resize(lsuBytes * 8)
           port.cmd.wide := size === 3 && !d.half
         } else {
           port.cmd.address := (up(elp(IntRegFile, RS1)).asUInt + apply(read.OFFSET) + (indexed(Decode.UOP) ? indexElement | U(0, XLEN bits))).resized
           port.cmd.size := size.resized
-          port.cmd.storeData := (word >> (offset.resize(log2Up(vrf.p.beatBytes)) << 3)).resize(LSLEN)
+          port.cmd.storeData := (word >> (offset.resize(log2Up(vrf.p.beatBytes)) << 3)).resize(lsuBytes * 8)
         }
         if (beats) {
           port.cmd.beats.enable := d.beats.enable
@@ -998,7 +1002,7 @@ class VectorPlugin(val layer : LaneLayer, val dlen : Int = 64, var withMemory : 
           when(d.beats.enable) {
             port.cmd.address := ((up(elp(IntRegFile, RS1)).asUInt + apply(read.OFFSET)) & ~U(lsuBytes - 1, XLEN bits)).resized
             port.cmd.size := U(log2Up(lsuBytes), widthOf(port.cmd.size) bits)
-            port.cmd.storeData := word.rotateRight(d.beats.rotate << 3).resize(LSLEN)
+            port.cmd.storeData := word.rotateRight(d.beats.rotate << 3).resize(lsuBytes * 8)
           }
         }
         port.cmd.access := d.access && !illegal // an illegal micro-op only carries its trap
@@ -1040,7 +1044,7 @@ class VectorPlugin(val layer : LaneLayer, val dlen : Int = 64, var withMemory : 
 
         // A beat writes the chunk's bytes, rotated from the aligned memory word (doubled when narrower than a VRF word)
         if (beats) when(d.beats.enable) {
-          val doubled = (dlen / LSLEN.get) match { case 1 => rsp.raw; case 2 => rsp.raw ## rsp.raw; case n => rsp.raw #* n }
+          val doubled = (dlen / (lsuBytes * 8)) match { case 1 => rsp.raw; case 2 => rsp.raw ## rsp.raw; case n => rsp.raw #* n }
           write.data := doubled.rotateLeft(d.beats.rotate << 3)
           write.mask := d.beats.mask
         }

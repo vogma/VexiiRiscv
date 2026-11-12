@@ -25,12 +25,12 @@ object LsuL1 extends AreaObject {
   val LOAD, STORE, EXECUTE, ATOMIC, FLUSH, PREFETCH, CLEAN, INVALID, GUEST = Payload(Bool()) // Specifies the kind of memory request
   val MIXED_ADDRESS = Payload(Global.MIXED_ADDRESS) // Address before the MMU, can only use the 4K page LSB
   val PHYSICAL_ADDRESS = Payload(Global.PHYSICAL_ADDRESS)
-  val WRITE_DATA = Payload(Bits(Riscv.LSLEN bits))
-  val MASK = Payload(Bits(Riscv.LSLEN / 8 bits)) // Also needed for loads
-  val SIZE = Payload(UInt(Riscv.LSU_SIZE_WIDTH bits)) // Also needed for loads
+  val WRITE_DATA = Payload(Bits(CPU_DATA_WIDTH bits))
+  val MASK = Payload(Bits(CPU_DATA_WIDTH / 8 bits)) // Also needed for loads
+  val SIZE = Payload(UInt(log2Up(log2Up(CPU_DATA_WIDTH / 8 + 1)) bits)) // Also needed for loads; may exceed the scalar access sizes
 
   // L1 -> LSU
-  val READ_DATA = Payload(Bits(Riscv.LSLEN bits))
+  val READ_DATA = Payload(Bits(CPU_DATA_WIDTH bits))
   val HAZARD, MISS, MISS_UNIQUE, FAULT, FLUSH_HAZARD, CBM_REDO = Payload(Bool()) // From the ctrl stage, provide the status of the request to the LSU
   val FLUSH_HIT = Payload(Bool()) //you also need to redo the flush until no hit anymore
   val REFILL_HIT = Payload(Bool()) // A ongoing refill is on the same cache set (this is just an optional detail, HAZARD is already set)
@@ -46,7 +46,7 @@ object LsuL1 extends AreaObject {
   val lockPort = blocking[LockPort]
   val ackUnlock = blocking[Bool]
   val freezeUnlock = blocking[Bool]
-  val coherency = blocking[Boolean]
+  val coherency = blocking[Boolean]; val CPU_DATA_WIDTH = blocking[Int] // CPU-side data width: LSLEN, or wider for wide vector accesses
 }
 
 // Allows to lock a physical address into unique state while a LR/SC sequence is going on.
@@ -146,7 +146,7 @@ class LsuL1Plugin(val lane : ExecuteLaneService,
 
     assert(coherentCtrlAt <= ctrlAt) // To ensure that slots valid timings vs pipeline
 
-    SETS.set(setCount)
+    SETS.set(setCount); CPU_DATA_WIDTH.set(cpuDataWidth)
     WAYS.set(wayCount)
     LINE_BYTES.set(lineSize)
     lockPort.set(LockPort())
@@ -190,7 +190,7 @@ class LsuL1Plugin(val lane : ExecuteLaneService,
     val bankWord = HardType(Bits(bankWidth bits))
     val bankWordPerLine = lineSize * 8 / bankWidth
 
-    assert(bankWidth <= memDataWidth)
+    assert(bankWidth <= memDataWidth && cpuDataWidth <= bankWidth, s"L1 CPU width $cpuDataWidth needs banks and memory words at least as wide (bank $bankWidth, memory $memDataWidth)")
 
     val bus = master(LsuL1Bus(memParameter)).simPublic()
 

@@ -30,7 +30,7 @@ class WhiteboxerPlugin(withOutputs : Boolean) extends FiberPlugin{
   class Logic extends Area{
     val pbp = host[PipelineBuilderPlugin]
     val buildBefore = retains(pbp.elaborationLock)
-    awaitBuild()
+    awaitBuild(); val lsuWord = host.get[LsuPlugin].map(_.vectorWordWidth).getOrElse(0) max Riscv.LSLEN.get; val lsuWide = lsuWord > Riscv.LSLEN.get // vector beats wider than LSLEN
 
     def wrap[T <: Data](that: T): T = {
       val buffered = CombInit(that).simPublic
@@ -161,9 +161,9 @@ class WhiteboxerPlugin(withOutputs : Boolean) extends FiberPlugin{
       val fire = Bool()
       val hartId = Global.HART_ID()
       val uopId = Decode.UOP_ID()
-      val size = UInt(Riscv.LSU_SIZE_WIDTH bits)
+      val size = UInt(lsuWide.mux(log2Up(log2Up(lsuWord / 8 + 1)), Riscv.LSU_SIZE_WIDTH) bits)
       val address = Global.PHYSICAL_ADDRESS()
-      val data = Bits(Riscv.LSLEN bits)
+      val data = Bits(lsuWord bits)
 
       SimPublic(fire, hartId, uopId, size, address, data)
 
@@ -194,7 +194,7 @@ class WhiteboxerPlugin(withOutputs : Boolean) extends FiberPlugin{
         }
         if(p.withVector) when(c(AguPlugin.VECTOR)) {
           fire := c.down.isFiring && c(AguPlugin.SEL) && c(AguPlugin.LOAD) && c(p.logic.vector.ELEMENT).access && !c(TRAP) && !c(p.logic.onPma.IO)
-          data := c(p.logic.onCtrl.loadData.RESULT).resized
+          data := c(p.logic.onCtrl.loadData.RESULT).resized; if (lsuWide) { size := c(LsuL1.SIZE); when(c(p.logic.vector.ELEMENT).beats.enable) { data := c(LsuL1.READ_DATA) } }
         }
       })
     }
@@ -204,10 +204,10 @@ class WhiteboxerPlugin(withOutputs : Boolean) extends FiberPlugin{
       val hartId = Global.HART_ID()
       val uopId = Decode.UOP_ID()
       val storeId = Decode.STORE_ID()
-      val size = UInt(Riscv.LSU_SIZE_WIDTH bits)
+      val size = UInt(lsuWide.mux(log2Up(log2Up(lsuWord / 8 + 1)), Riscv.LSU_SIZE_WIDTH) bits)
       val address = Global.PHYSICAL_ADDRESS()
-      val data = Bits(Riscv.LSLEN bits)
-      val amo = Bool(); val mask = host.get[LsuPlugin].exists(_.vectorBeat) generate Bits(Riscv.LSLEN / 8 bits) // enabled bytes
+      val data = Bits(lsuWord bits)
+      val amo = Bool(); val mask = host.get[LsuPlugin].exists(_.vectorBeat) generate Bits(widthOf(data) / 8 bits) // enabled bytes
       SimPublic(fire, hartId, uopId, storeId, size, address, data, amo); if (mask != null) SimPublic(mask)
 
       val lcp = host.get[LsuCachelessPlugin] map (p => new Area {
@@ -228,13 +228,13 @@ class WhiteboxerPlugin(withOutputs : Boolean) extends FiberPlugin{
         fire := c.storeFire
         hartId := c(Global.HART_ID)
         uopId := c(Decode.UOP_ID)
-        size := c(AguPlugin.SIZE)
+        size := c(AguPlugin.SIZE).resized
         address := c(LsuL1.PHYSICAL_ADDRESS)
         data := c(LsuL1.WRITE_DATA)
         storeId := c(Decode.STORE_ID)
         amo := False; if (mask != null) mask := c(LsuL1.MASK)
         if(p.withVector) when(c(AguPlugin.VECTOR)) {
-          fire := c.storeFire && c(p.logic.vector.ELEMENT).access && !c(TRAP)
+          fire := c.storeFire && c(p.logic.vector.ELEMENT).access && !c(TRAP); if (lsuWide) size := c(LsuL1.SIZE)
         }
       })
     }
@@ -470,7 +470,7 @@ class WhiteboxerPlugin(withOutputs : Boolean) extends FiberPlugin{
       val size = storeCommit.size.simProxy()
       val address = storeCommit.address.simProxy()
       val data = storeCommit.data.simProxy()
-      val amo = storeCommit.amo.simProxy(); val mask = if (storeCommit.mask != null) storeCommit.mask.simProxy() else null
+      val amo = storeCommit.amo.simProxy(); val mask = if (storeCommit.mask != null) storeCommit.mask.simProxy() else null; val maskBytes = if (storeCommit.mask != null) widthOf(storeCommit.mask) else 0
     }
 
     class StoreConditionalProxy {

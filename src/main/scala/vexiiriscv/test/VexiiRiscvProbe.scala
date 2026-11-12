@@ -353,6 +353,7 @@ class VexiiRiscvProbe(cpu : VexiiRiscv, kb : Option[konata.Backend], var withRvl
         // RV32 with 8-byte vector elements: IO elements take an access fault where Spike performs the access
         if (cpu.host.get[VectorLsuService].exists(s => s.withVector && s.vectorElen == 64) && get(Riscv.LSLEN) < 64) tracer.setPolicy(hartId, "ioWideFault=1")
         if (vectorMemoryOverlap) tracer.setPolicy(hartId, "memoryBehindDeferred=1")
+        cpu.host.get[PmpPlugin].filter(p => p.p.pmpSize > 0 && p.p.granularity != 4096).foreach(p => tracer.setPolicy(hartId, s"pmpGranularity=${p.p.granularity}"))
         val pc = if(xlen == 32) 0x80000000l else 0x80000000l
         tracer.setPc(hartId, pc)
       }
@@ -642,8 +643,8 @@ class VexiiRiscvProbe(cpu : VexiiRiscv, kb : Option[konata.Backend], var withRvl
         val record = hart.openVector(uop)
         require(!hart.vectorStores.contains(uop.storeSqId), "vector store ID reused before broadcast")
         val id = (scalarStoreIds until vectorStoreIdEnd).find(!hart.liveVectorStoreIds.contains(_)).get
-        // A full-width store may be a beat whose byte mask enables only its elements
-        val enabled = if (storeCommit.mask != null && bytes == get(Riscv.LSLEN) / 8) storeCommit.mask.toLong else -1l
+        // A store as wide as the L1 word may be a beat whose byte mask enables only its elements
+        val enabled = if (storeCommit.mask != null && bytes == storeCommit.maskBytes) storeCommit.mask.toLong else -1l
         val access = new VectorAccess(id, address, uop.storeData.clone(), enabled)
         record.stores += access
         hart.vectorStores(uop.storeSqId) = access
