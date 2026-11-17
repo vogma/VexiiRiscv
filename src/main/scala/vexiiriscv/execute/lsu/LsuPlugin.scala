@@ -80,7 +80,7 @@ class LsuPlugin(var layer : LaneLayer,
                 var withLlcFlush : Boolean = false,
                 var storeRs2At : Int = 0, //Note that currently, it only apply for integer store (not float store)
                 var storeBufferSlots : Int = 0,
-                var storeBufferOps : Int = 0, val withVector : Boolean = false, val vectorElen : Int = 32, val vectorBeat : Boolean = false) extends FiberPlugin with DBusAccessService with LsuCachelessBusProvider with LsuService with CmoService with VectorLsuService{
+                var storeBufferOps : Int = 0, val withVector : Boolean = false, val vectorElen : Int = 32, val vectorBeat : Boolean = false, val vectorProbe : Boolean = false) extends FiberPlugin with DBusAccessService with LsuCachelessBusProvider with LsuService with CmoService with VectorLsuService{
   import timingParameter._
 
   if(withLlcFlush) assert(withCbm)
@@ -157,7 +157,7 @@ class LsuPlugin(var layer : LaneLayer,
     val trapPort = ts.newTrap(layer.lane.getExecuteAge(ctrlAt), Execute.LANE_AGE_WIDTH)
     val flushPort = ss.newFlushPort(layer.lane.getExecuteAge(ctrlAt), laneAgeWidth = Execute.LANE_AGE_WIDTH, withUopId = true)
     val frontend = new AguFrontend(layer, host, withRvcbm = withCbm, withVector = withVector, vectorElen = vectorElen)
-    val commitProbe = Flow(LsuCommitProbe()) // Used by the hardware prefetching plugin to learn about the software behavior
+    val commitProbe = Flow(LsuCommitProbe(vectorProbe)) // Used by the hardware prefetching plugin to learn about the software behavior
     val vector = withVector generate new VectorLsuHooks(LsuPlugin.this, frontend, ds)
     // Extends the instruction specifications done by the AGU with sign extensions and flush behavior
     val iwb = ifp.access(wbAt)
@@ -1139,7 +1139,7 @@ class LsuPlugin(var layer : LaneLayer,
       commitProbe.miss := (l1.MISS || l1.MISS_UNIQUE || l1.HAZARD) && !MMU_FAILURE && !GUEST_MMU_FAILURE && withStoreBuffer.mux(!(l1.STORE && wb.hit), True) //We threat most L1 failure as a miss (pessimistic)
       commitProbe.io := onPma.IO
       commitProbe.prefetchFailed := FROM_PREFETCH
-      commitProbe.pc := Global.PC
+      commitProbe.pc := Global.PC; if (vectorProbe) commitProbe.vector := VECTOR
     }
 
     // Drive the write back interface

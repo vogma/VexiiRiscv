@@ -15,10 +15,10 @@ case class PrefetchCmd() extends Bundle {
   val unique = Bool()
 }
 
-case class LsuCommitProbe() extends Bundle {
+case class LsuCommitProbe(withVector : Boolean = false) extends Bundle {
   val pc = Global.PC()
   val address = LsuL1.MIXED_ADDRESS()
-  val load, store, trap, io, prefetchFailed, miss = Bool()
+  val load, store, trap, io, prefetchFailed, miss = Bool(); val vector = withVector generate Bool() // a vector memory micro-op
 }
 
 
@@ -60,7 +60,7 @@ case class PrefetcherRptParam (
   var scoreConflict: Int = 2,
   var scoreOffset: Int = 3,
   var scoreShift: Int = 0,
-  var queueSize: Int = 4
+  var queueSize: Int = 4, var vectorTrain: Boolean = false, var vectorYield: Boolean = false, var yieldGap: Int = 3 // see PrefetcherVector.scala
 )
 class PrefetcherRptPlugin(p : PrefetcherRptParam,  bootMemClear : Boolean = false) extends PrefetcherPlugin  with InitService {
   import p._
@@ -76,7 +76,7 @@ class PrefetcherRptPlugin(p : PrefetcherRptParam,  bootMemClear : Boolean = fals
 
     val csr = new Area{
       val disable = RegInit(False)
-      cp.readWrite(0x7FF, 1 -> disable)
+      cp.readWrite(0x7FF, 1 -> disable); val tune = (vectorTrain || vectorYield) generate PrefetcherVectorTune(vectorTrain, vectorYield, cp)
     }
 
     earlyLock.release()
@@ -87,7 +87,7 @@ class PrefetcherRptPlugin(p : PrefetcherRptParam,  bootMemClear : Boolean = fals
     val SCORE = Payload(UInt(log2Up(scoreMax + 1) bits))
     val ADDRESS = Payload(UInt(addressWidth bits))
     val ADVANCE = Payload(UInt(log2Up(blockAheadMax + 1) bits))
-    val PROBE = Payload(LsuCommitProbe())
+    val PROBE = Payload(LsuCommitProbe(vectorTrain))
     val ENTRY = Payload(Entry())
     val TAG_HIT, STRIDE_HIT, NEW_BLOCK = Payload(Bool())
 
@@ -125,7 +125,7 @@ class PrefetcherRptPlugin(p : PrefetcherRptParam,  bootMemClear : Boolean = fals
 
     //Dispatch throttling to ensure some prefetching goes through when the instruction stream is very heavy in load/store
     dp.haltDispatchWhen(RegNext(occupancy > queueSize/2) init(False))
-
+    val yielder = vectorYield generate PrefetcherVectorYield(io.get, csr.tune.yieldOn, yieldGap, dp)
     def hashAddress(pc: UInt) = pc(Fetch.SLICE_RANGE_LOW, log2Up(sets) bits)
     def hashTag(pc: UInt) = pc(Fetch.SLICE_RANGE_LOW.get + log2Up(sets), tagWidth bits)
 
@@ -147,7 +147,7 @@ class PrefetcherRptPlugin(p : PrefetcherRptParam,  bootMemClear : Boolean = fals
     val pip = new StagePipeline()
     val insert = new pip.Area(0){
       arbitrateFrom(lsu.lsuCommitProbe.throwWhen(lsu.lsuCommitProbe.io))
-      PROBE := lsu.lsuCommitProbe.payload
+      PROBE := lsu.lsuCommitProbe.payload; if (vectorTrain) when(csr.tune.filter && lsu.lsuCommitProbe.vector) { PROBE.address := ((lsu.lsuCommitProbe.address >> log2Up(lsu.getBlockSize)) << log2Up(lsu.getBlockSize)).resized } // vector probes train on line addresses
     }
 
     val onRead0 = new pip.Area(readAt){
@@ -159,9 +159,9 @@ class PrefetcherRptPlugin(p : PrefetcherRptParam,  bootMemClear : Boolean = fals
       ENTRY := storage.read.rsp
       when(onRead0.WRITTEN.valid && onRead0.WRITTEN.payload.address === hashAddress(PROBE.pc)){
         ENTRY := onRead0.WRITTEN.payload.data
-      }
+      }; if (vectorTrain) when(csr.tune.bypass && storage.write.valid && storage.write.address === hashAddress(PROBE.pc)) { ENTRY := storage.write.data } // the probe one stage ahead writes this cycle
     }
-    val onTag = new pip.Area(tagAt) {
+    val onTag = new pip.Area(if (vectorTrain) ctrlAt else tagAt) { // with the bypass, after it
       TAG_HIT := ENTRY.tag === hashTag(PROBE.pc)
       STRIDE_EXTENDED := S(PROBE.address - ENTRY.address).resized
       NEW_BLOCK := (PROBE.address.resized ^ ENTRY.address) >> log2Up(lsu.getBlockSize) =/= 0
@@ -223,6 +223,12 @@ class PrefetcherRptPlugin(p : PrefetcherRptParam,  bootMemClear : Boolean = fals
         when(advanceSubed < blockAheadMax && advanceSubed < advanceAllowed){
           orderAsk := True
         }
+      }
+
+      // Further vector probes into the line last seen by this entry leave it unchanged
+      if (vectorTrain) when(csr.tune.filter && PROBE.vector && TAG_HIT && !NEW_BLOCK) {
+        unfiltred.valid := False
+        storage.write.valid := False
       }
 
       when(csr.disable){
