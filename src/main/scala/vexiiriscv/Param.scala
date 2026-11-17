@@ -200,7 +200,6 @@ class ParamSimple() {
   var vectorClassOverlap = false
   var vectorMemoryOverlap = false
   var vectorPrefetchTrain = false
-  var vectorPrefetchYield = false
   var vectorMemoryWidth = 0 // L1 word for vector beats in bits; 0 keeps the scalar LSU width
   var narrowIoWindow = false
   val prefetcherRptParam = new PrefetcherRptParam()
@@ -642,7 +641,6 @@ class ParamSimple() {
     if (extension.withZve32x && vectorMemoryOverlap) r += "vmo"
     if (extension.withZve32x && vectorMemoryWidth != 0) r += s"vmw$vectorMemoryWidth"
     if (extension.withZve32x && vectorPrefetchTrain) r += "vpt"
-    if (extension.withZve32x && vectorPrefetchYield) r += "vpy"
     if (extension.withZve32x && vectorOverlap) r += "vov"
     if (extension.withZve32x && vectorNoFence) r += "vnf"
     if (extension.withZve32x && vectorTrapE0) r += "vte0"
@@ -959,8 +957,6 @@ class ParamSimple() {
       .text("Start vector loads and stores behind older queued arithmetic; requires the vector queue and --vector-overlap.")
     opt[Unit]("vector-prefetch-train").action { (v, c) => vectorPrefetchTrain = true }
       .text("Train the RPT prefetcher once per line on vector accesses and bypass back-to-back same-set updates; needs --lsu-hardware-prefetch rpt.")
-    opt[Unit]("vector-prefetch-yield").action { (v, c) => vectorPrefetchYield = true }
-      .text("Halt dispatch for a cycle when an RPT prefetch waits behind lane accesses; needs --lsu-hardware-prefetch rpt.")
     opt[Int]("vector-memory-width").action { (v, c) => vectorMemoryWidth = v }
       .text("Move vector beats in L1 words of this many bits (0, the default, or 128); 128 needs RV64, DLEN 128 and beat memory. Scalar and IO accesses keep their widths.")
     opt[Unit]("vector-beat-mul").action { (v, c) => vectorBeatMul = true }
@@ -1032,7 +1028,7 @@ class ParamSimple() {
       assert(!vectorMemoryOverlap || vectorQueue > 0 && vectorOverlap, "--vector-memory-overlap needs the vector queue and --vector-overlap")
       assert(!(vectorOverlap || vectorNoFence) || vectorQueue > 0, "--vector-overlap and --vector-nofence need the vector queue")
       assert(vectorMemoryWidth == 0 || vectorMemoryWidth == 128, s"--vector-memory-width must be 0 or 128, got $vectorMemoryWidth")
-      assert(!(vectorPrefetchTrain || vectorPrefetchYield) || lsuHardwarePrefetch == "rpt", "--vector-prefetch-train/-yield need --lsu-hardware-prefetch rpt")
+      assert(!vectorPrefetchTrain || lsuHardwarePrefetch == "rpt", "--vector-prefetch-train needs --lsu-hardware-prefetch rpt")
       if (vectorMemoryWidth != 0) {
         assert(xlen == 64 && !extension.withRvq, "--vector-memory-width=128 needs RV64 without Q (the L1 word must be twice the scalar width)")
         assert(vectorDlen == 128, "--vector-memory-width=128 needs --vector-dlen=128")
@@ -1042,7 +1038,7 @@ class ParamSimple() {
     } else {
       assert(zvlActive.isEmpty, "zvl*b needs a vector extension")
       assert(vectorMemoryWidth == 0, "--vector-memory-width needs a vector extension")
-      assert(!vectorPrefetchTrain && !vectorPrefetchYield, "--vector-prefetch-train/-yield need a vector extension")
+      assert(!vectorPrefetchTrain, "--vector-prefetch-train needs a vector extension")
     }
 
     plugins += new riscv.RiscvPlugin(xlen, hartCount, isa = extension.getIsaNameArray(includeIgnored = true).toSet)
@@ -1341,7 +1337,6 @@ class ParamSimple() {
         case "nl" => plugins += new lsu.PrefetcherNextLinePlugin
         case "rpt" =>
           prefetcherRptParam.vectorTrain = extension.withZve32x && vectorPrefetchTrain
-          prefetcherRptParam.vectorYield = extension.withZve32x && vectorPrefetchYield
           plugins += new lsu.PrefetcherRptPlugin(
           p = prefetcherRptParam,
           bootMemClear = bootMemClear

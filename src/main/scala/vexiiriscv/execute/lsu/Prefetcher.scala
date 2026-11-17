@@ -60,7 +60,7 @@ case class PrefetcherRptParam (
   var scoreConflict: Int = 2,
   var scoreOffset: Int = 3,
   var scoreShift: Int = 0,
-  var queueSize: Int = 4, var vectorTrain: Boolean = false, var vectorYield: Boolean = false, var yieldGap: Int = 3 // see PrefetcherVector.scala
+  var queueSize: Int = 4, var vectorTrain: Boolean = false // see PrefetcherVector.scala
 )
 class PrefetcherRptPlugin(p : PrefetcherRptParam,  bootMemClear : Boolean = false) extends PrefetcherPlugin  with InitService {
   import p._
@@ -76,7 +76,7 @@ class PrefetcherRptPlugin(p : PrefetcherRptParam,  bootMemClear : Boolean = fals
 
     val csr = new Area{
       val disable = RegInit(False)
-      cp.readWrite(0x7FF, 1 -> disable); val tune = (vectorTrain || vectorYield) generate PrefetcherVectorTune(vectorTrain, vectorYield, cp)
+      cp.readWrite(0x7FF, 1 -> disable); val tune = vectorTrain generate PrefetcherVectorTune(cp)
     }
 
     earlyLock.release()
@@ -125,7 +125,7 @@ class PrefetcherRptPlugin(p : PrefetcherRptParam,  bootMemClear : Boolean = fals
 
     //Dispatch throttling to ensure some prefetching goes through when the instruction stream is very heavy in load/store
     dp.haltDispatchWhen(RegNext(occupancy > queueSize/2) init(False))
-    val yielder = vectorYield generate PrefetcherVectorYield(io.get, csr.tune.yieldOn, yieldGap, dp)
+
     def hashAddress(pc: UInt) = pc(Fetch.SLICE_RANGE_LOW, log2Up(sets) bits)
     def hashTag(pc: UInt) = pc(Fetch.SLICE_RANGE_LOW.get + log2Up(sets), tagWidth bits)
 
