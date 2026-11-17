@@ -44,7 +44,7 @@ class VectorScanHarness(p: VectorRegFileParam, xlen: Int, elen: Int = 32) extend
     vrf.io.reads(0).cmd.payload := io.readAddress
   }
   io.readData := vrf.io.reads(0).rsp
-  io.result := e.io.result
+  io.result := io.useElement ? e.io.result | a.io.result
   io.done := io.useElement ? e.io.done | a.io.done
   io.busy := io.useElement ? e.io.busy | a.io.busy
   io.saturated := io.useElement ? e.io.saturated | a.io.saturated

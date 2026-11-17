@@ -194,6 +194,7 @@ class ParamSimple() {
   var vectorBeatCompress = false
   var vectorOverlap = false
   var vectorNoFence = false
+  var vectorScalarUnfenced = false
   var vectorTrapE0 = false
   var vectorBeatMul = false
   var vectorChaining = false
@@ -643,6 +644,7 @@ class ParamSimple() {
     if (extension.withZve32x && vectorPrefetchTrain) r += "vpt"
     if (extension.withZve32x && vectorOverlap) r += "vov"
     if (extension.withZve32x && vectorNoFence) r += "vnf"
+    if (extension.withZve32x && vectorScalarUnfenced) r += "vsu"
     if (extension.withZve32x && vectorTrapE0) r += "vte0"
     if (privParam.withImsic) r += s"if${privParam.imsicInterrupts}gf${privParam.guestExternalInterruptFiles}"
     if (privParam.withDebug) r += s"pdbg"
@@ -965,6 +967,8 @@ class ParamSimple() {
       .text("Start an independent queued beat command once the previous one has issued its last step; requires the queue.")
     opt[Unit]("vector-nofence").action { (v, c) => vectorNoFence = true }
       .text("Dispatch queued vector arithmetic and vset* without waiting for older instructions; requires the queue.")
+    opt[Unit]("vector-scalar-unfenced").action { (v, c) => vectorScalarUnfenced = true }
+      .text("Dispatch synchronous vector scalar results without the older-instruction fence; requires the queue and --vector-nofence.")
     opt[Unit]("vector-trap-e0").action { (v, c) => vectorTrapE0 = true }
       .text("Raise the vector illegal-instruction trap at E0 instead of E1 (longer freeze path, adjacent vector uops one cycle closer).")
     opt[Unit]("narrow-io-window").action { (v, c) => narrowIoWindow = true }
@@ -1027,6 +1031,7 @@ class ParamSimple() {
       assert(!vectorClassOverlap || vectorBeatMul && vectorOverlap, "--vector-class-overlap needs --vector-beat-mul and --vector-overlap")
       assert(!vectorMemoryOverlap || vectorQueue > 0 && vectorOverlap, "--vector-memory-overlap needs the vector queue and --vector-overlap")
       assert(!(vectorOverlap || vectorNoFence) || vectorQueue > 0, "--vector-overlap and --vector-nofence need the vector queue")
+      assert(!vectorScalarUnfenced || vectorQueue > 0 && vectorNoFence, "--vector-scalar-unfenced needs the vector queue and --vector-nofence")
       assert(vectorMemoryWidth == 0 || vectorMemoryWidth == 128, s"--vector-memory-width must be 0 or 128, got $vectorMemoryWidth")
       assert(!vectorPrefetchTrain || lsuHardwarePrefetch == "rpt", "--vector-prefetch-train needs --lsu-hardware-prefetch rpt")
       if (vectorMemoryWidth != 0) {
@@ -1039,6 +1044,7 @@ class ParamSimple() {
       assert(zvlActive.isEmpty, "zvl*b needs a vector extension")
       assert(vectorMemoryWidth == 0, "--vector-memory-width needs a vector extension")
       assert(!vectorPrefetchTrain, "--vector-prefetch-train needs a vector extension")
+      assert(!vectorScalarUnfenced, "--vector-scalar-unfenced needs a vector extension")
     }
 
     plugins += new riscv.RiscvPlugin(xlen, hartCount, isa = extension.getIsaNameArray(includeIgnored = true).toSet)
@@ -1501,7 +1507,7 @@ class ParamSimple() {
       plugins += new execute.vector.VectorCsrPlugin(vlen = vlen, withAccessHold = vectorQueue > 0)
       plugins += new execute.vector.VectorPlugin(early0, dlen = vectorDlen, elen = if (extension.withZve64x) 64 else 32, queueDepth = vectorQueue,
         beatSlides = vectorBeatSlides, beatCompress = vectorBeatCompress, overlapIssue = vectorOverlap, noFence = vectorNoFence, trapAtE0 = vectorTrapE0, beatMul = vectorBeatMul, chaining = vectorChaining,
-        classOverlap = vectorClassOverlap, memoryOverlap = vectorMemoryOverlap)
+        classOverlap = vectorClassOverlap, memoryOverlap = vectorMemoryOverlap, scalarUnfenced = vectorScalarUnfenced)
     }
 
     plugins += new WhiteboxerPlugin(

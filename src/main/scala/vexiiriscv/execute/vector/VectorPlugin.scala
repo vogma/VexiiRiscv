@@ -83,7 +83,7 @@ class VectorPlugin(val layer : LaneLayer, val dlen : Int = 64, var withMemory : 
                    val beatMul : Boolean = false,
                    val chaining : Boolean = false,
                    val classOverlap : Boolean = false,
-                   val memoryOverlap : Boolean = false)
+                   val memoryOverlap : Boolean = false, val scalarUnfenced : Boolean = false)
   extends FiberPlugin with InitService {
   require(elen == 32 || elen == 64)
   require(!beatCompress || beatSlides, "beat compress requires beat slides")
@@ -91,6 +91,7 @@ class VectorPlugin(val layer : LaneLayer, val dlen : Int = 64, var withMemory : 
   require(!(overlapIssue || noFence) || queueDepth > 0, "overlapIssue and noFence need the queue")
   require(!classOverlap || beatMul && overlapIssue, "classOverlap needs beatMul and overlapIssue")
   require(!memoryOverlap || overlapIssue, "memoryOverlap needs overlapIssue")
+  require(!scalarUnfenced || queueDepth > 0 && noFence, "scalarUnfenced needs the queue and noFence")
   override def initHold(): Bool = regFile.vrf.io.initHold
 
   // Initialization must be available before the trap controller finishes building.
@@ -160,15 +161,14 @@ class VectorPlugin(val layer : LaneLayer, val dlen : Int = 64, var withMemory : 
 
     val wb = ifp.access(1)
     val trapStage = if (trapAtE0) 0 else 1
-    // Uops that may have a scalar result or run synchronously wait for older instructions; with noFence the others
-    // (queued arithmetic and vset*) dispatch once no older uop can flush them
+    // With noFence, queued arithmetic and vset* omit the older-uop fence; scalarUnfenced also exempts scalar results
     val synchronous = Set[MicroOp](Rvv.all("vmv.x.s"), Rvv.all("vcpop.m"), Rvv.all("vfirst.m"))
     def add(op : MicroOp, decodings : (Payload[_ <: BaseType], Any)*) : UopLayerSpec = {
       val spec = layer.add(op)
       spec.addDecoding(SEL -> True)
       spec.addDecoding(decodings)
       ds.addMicroOpDecoding(op, VECTOR, True)
-      if (!noFence || synchronous(op)) dp.fenceOlder(op)
+      if (!noFence || synchronous(op) && !scalarUnfenced) dp.fenceOlder(op)
       spec.mayFlushUpTo(trapStage)
       spec.dontFlushFrom(0)
       op.resources.foreach {
@@ -731,11 +731,11 @@ class VectorPlugin(val layer : LaneLayer, val dlen : Int = 64, var withMemory : 
         elemCmd.negate := NEGATE
         elemCmd.vxrm := vcs.vxrm
         val unit = ARITH || ELEMENT
-        // An illegal uop is held for one cycle before it leaves for its trap, which keeps the checks out of the freeze
         val illegalHeld = RegInit(False)
-        // A queued uop waits only for room in the queue; the others until their unit is done
-        def hold = if (trapAtE0) sel && unit && !legality.illegal && (if (decoupled) queue.queued ? queue.q.full | !completed else !completed)
-          else if (decoupled) sel && unit && (queue.queued ? queue.q.full | !illegalHeld && !completed) else sel && unit && !illegalHeld && !completed
+        def syncComplete = if (scalarUnfenced) completed || started && unitDone &&
+          (ARITH && SHAPE === VectorShape.SCALAR_READ || ELEMENT && (ELEMENT_OP === VectorElementOp.CPOP || ELEMENT_OP === VectorElementOp.FIRST)) else completed
+        def hold = if (trapAtE0) sel && unit && !legality.illegal && (if (decoupled) queue.queued ? queue.q.full | !syncComplete else !syncComplete)
+          else if (decoupled) sel && unit && (queue.queued ? queue.q.full | !illegalHeld && !syncComplete) else sel && unit && !illegalHeld && !syncComplete
         elp.freezeWhen(hold)
         when(sel && legality.illegal) { illegalHeld := True }
         when(isReady) { illegalHeld := False }
@@ -1290,6 +1290,13 @@ class VectorPlugin(val layer : LaneLayer, val dlen : Int = 64, var withMemory : 
       val trapTval = CombInit(trap.fsm.buffer.trap.tval).simPublic()
       if (withMemory) when(memory.triggerPending) { trapTval := memory.triggerAddress.asBits.resized }
     }
+
+    val synchronousChecks = (scalarUnfenced && withMemory) generate new Area {
+      val stages = (0 to lsu.timingParameter.ctrlAt).map(i => elp.execute(i).isValid && elp.execute(i)(MEM)).orR
+      val memoryBusy = memory.seq.valid && !memory.seq.first || stages
+      assert(!(e0.sequencer.unitStarts && memoryBusy), "synchronous vector unit started while vector memory runs")
+    }
+
   }
 
   // Architectural vtype value: vill at bit XLEN-1
