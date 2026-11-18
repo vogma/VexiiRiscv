@@ -173,7 +173,7 @@ class DecoderPlugin(var decodeAt : Int) extends FiberPlugin with DecoderService 
           case RS1 => riscv.Const.rs1Range
           case RS2 => riscv.Const.rs2Range
           case RS3 => riscv.Const.rs3Range
-          case RD  => riscv.Const.rdRange
+          case RDS | RD => riscv.Const.rdRange
         }).asUInt(keys.physWidth-1 downto 0)
       }
 

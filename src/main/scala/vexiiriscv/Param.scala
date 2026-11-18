@@ -14,6 +14,7 @@ import vexiiriscv.execute._
 import vexiiriscv.execute.cfu.{CfuBusParameter, CfuPlugin, CfuPluginEncoding}
 import vexiiriscv.execute.fpu.{FpuAddSharedParam, FpuMulParam}
 import vexiiriscv.execute.lsu._
+import vexiiriscv.execute.rvp.RvpPluginSuite
 import vexiiriscv.fetch.{FetchCachelessAxi4Plugin, FetchCachelessPlugin, FetchCachelessWishbonePlugin, FetchL1Axi4Plugin, FetchL1Plugin, FetchL1WishbonePlugin, PrefetcherNextLinePlugin}
 import vexiiriscv.memory.{MmuPortParameter, MmuSpec, MmuStorageLevel, MmuStorageParameter, PmpParam, PmpPlugin, PmpPortParameter, ShadowMmuPlugin, TranslatedDBusAccessPlugin}
 import vexiiriscv.misc._
@@ -117,6 +118,8 @@ class ParamSimple() {
   var regFileSync = true
   var regFileDualPortRam = true
   var regFileRegBasedRam = false
+  var withRvp = false
+  var withRvpPairs = true // RV32 register-pair ops; --rvp-no-pairs drops them (no-pairs configuration)
   var withGShare = false
   var withBtb = false
   var withRas = false
@@ -593,7 +596,7 @@ class ParamSimple() {
   // Generate a human readable name from most of the supported configuration
   def getName() : String = {
     def opt(that : Boolean, v : String) = that.mux(v, "")
-    val isa = s"rv${xlen}${extension.getIsaStr()}"
+    val isa = s"rv${xlen}${extension.getIsaStr()}" + (if (withRvp) (if (withRvpPairs || xlen == 64) "Xrvp" else "XrvpNopair") else "")
     val r = new ArrayBuffer[String]()
     r += isa
     r += s"d${decoders}At${decoderAt}"
@@ -688,6 +691,10 @@ class ParamSimple() {
       .text("Enable A extension; suggest --with-isa a.")
     opt[Unit]("with-rvf").action { (v, c) => addISA("f") }
       .text("Enable F extension; suggest --with-isa f.")
+    opt[Unit]("with-rvp").action { (v, c) => withRvp = true }
+      .text("Enable the draft RISC-V P (packed SIMD) extension (non-standard Xrvp, misa.P stays clear).")
+    opt[Unit]("rvp-no-pairs").action { (v, c) => withRvpPairs = false }
+      .text("With --with-rvp on RV32, omit the register-pair instructions.")
     opt[Unit]("with-rvd").action { (v, c) => addISA("f", "d") }
       .text("Enable F and D extensions; suggest --with-isa f,d.")
     opt[Unit]("with-rvc").action { (v, c) => addISA("c") }
@@ -1125,6 +1132,7 @@ class ParamSimple() {
     if (extension.withZknh) plugins ++= ZknhPlugin.make(layer = early0, xlen = xlen)
     if (extension.withZksh) plugins += new Sm3ZkshPlugin(layer = early0)
     if (extension.withZksed) plugins += new Sm4ZksedPlugin(layer = early0)
+    if (withRvp) RvpPluginSuite.install(plugins, early0, lane0, intWritebackAt, xlen, pairs = withRvpPairs)
     if(withCfu) plugins += new CfuPlugin(
       layer = early0,
       forkAt = 0,
@@ -1166,7 +1174,8 @@ class ParamSimple() {
       exts = extension,
       xlen = xlen,
       executeAt=0,
-      formatAt=0
+      formatAt=0,
+      zextHandledByRvp = withRvp
     )
 
     lsuBus match {
@@ -1321,7 +1330,8 @@ class ParamSimple() {
         exts = extension,
         xlen = xlen,
         executeAt=lateAluAt,
-        formatAt=lateAluAt
+        formatAt=lateAluAt,
+        zextHandledByRvp = withRvp
       )
     }
 
@@ -1343,7 +1353,8 @@ class ParamSimple() {
         exts = extension,
         xlen = xlen,
         executeAt=0,
-        formatAt=0
+        formatAt=0,
+        zextHandledByRvp = withRvp
       )
 
       // Late ALU in the Second execution pipeline
@@ -1358,7 +1369,8 @@ class ParamSimple() {
           exts = extension,
           xlen = xlen,
           executeAt=lateAluAt,
-          formatAt=lateAluAt
+          formatAt=lateAluAt,
+          zextHandledByRvp = withRvp
         )
       }
 //      if (withMul) {

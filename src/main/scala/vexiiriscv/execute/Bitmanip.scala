@@ -13,13 +13,15 @@ import vexiiriscv.riscv.Riscv
 import vexiiriscv.ExtensionManager
 
 import scala.collection.mutable.ArrayBuffer
+import scala.language.postfixOps
 
 object ZbPlugin {
   def make(layer: LaneLayer,
            exts: ExtensionManager,
            xlen: Int,
            executeAt: Int,
-           formatAt: Int) = {
+           formatAt: Int,
+           zextHandledByRvp : Boolean = false) = {
     val plugins = ArrayBuffer[FiberPlugin]()
 
     if(exts.withZba) plugins ++= List(
@@ -36,7 +38,7 @@ object ZbPlugin {
       new ZbbCountPlugin(layer, executeAt, formatAt),
       new ZbbMinMaxPlugin(layer, executeAt, formatAt),
       new ZbbOrPlugin(layer, executeAt, formatAt),
-      new ZbbExtendPlugin(layer, formatAt)
+      new ZbbExtendPlugin(layer, formatAt, zextHandledByRvp)
     )
 
     if(exts.withZbc) plugins ++= List(
@@ -344,7 +346,8 @@ class ZbbByteReversePlugin(val layer: LaneLayer,
 }
 
 class ZbbExtendPlugin(val layer: LaneLayer,
-                      val formatAt: Int = 0) extends ExecutionUnitElementSimple(layer) {
+                      val formatAt: Int = 0,
+                      val zextHandledByRvp: Boolean = false) extends ExecutionUnitElementSimple(layer) {
   val logic = during setup new Logic {
     awaitBuild()
     import SrcKeys._
@@ -355,9 +358,18 @@ class ZbbExtendPlugin(val layer: LaneLayer,
     add(RvZbx.SEXTH).srcs(SRC1.RF)
     ifp.signExtend(wb, layer(RvZbx.SEXTH), 16)
 
-    val zeroExtend = if(Riscv.XLEN.get == 32) { RvZbx.ZEXTH_32 } else { RvZbx.ZEXTH_64 }
-    add(zeroExtend).srcs(SRC1.RF)
-    ifp.zeroExtend(wb, layer(zeroExtend), 16)
+    // RV32 zext.h is pack rd,rs1,x0: its encoding is a subset of RvpMisc's PACK,
+    // and two uops matching the same word would OR their decodings (WIDTH_ID goes
+    // out of range, no extension applied, rd commits as rs1). When RVP is present
+    // it must own the whole PACK space; pack with rs2=x0 already yields the
+    // architecturally correct zext.h result. ZEXTH_64 (opcode 0111011) is disjoint
+    // from every RVP encoding, so RV64 always keeps its own uop.
+    val zextOwnedByRvp = zextHandledByRvp && Riscv.XLEN.get == 32
+    if(!zextOwnedByRvp) {
+      val zeroExtend = if(Riscv.XLEN.get == 32) { RvZbx.ZEXTH_32 } else { RvZbx.ZEXTH_64 }
+      add(zeroExtend).srcs(SRC1.RF)
+      ifp.zeroExtend(wb, layer(zeroExtend), 16)
+    }
     uopRetainer.release()
 
     val format = new el.Execute(formatAt) {

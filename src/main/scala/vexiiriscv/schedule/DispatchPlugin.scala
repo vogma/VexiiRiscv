@@ -147,7 +147,7 @@ class DispatchPlugin(var dispatchAt : Int,
 
       // +1 because the flush hazard on the same warp are handled somewhere else, here we just need
       // to care about past cycles
-      val hazardRange = dontFlushFromMin + 1 to flushUpTo 
+      val hazardRange = dontFlushFromMin + 1 to flushUpTo
       eusFlushHazardUpTo(elp) = flushUpTo
       for (i <- hazardRange) hmKeys += getDontFlush(i)
     }
@@ -155,7 +155,7 @@ class DispatchPlugin(var dispatchAt : Int,
       for ((uop, dontFlushFrom) <- uopsDontFlushFrom) {
         // Answer the question : For this uop, when it reach the dontFlush point in the pipeline,
         // is it not ok to have another op which emit flushes in the given spec.at stage
-        dp.addMicroOpDecoding(uop, spec.value, Bool(dontFlushFrom < spec.at)) 
+        dp.addMicroOpDecoding(uop, spec.value, Bool(dontFlushFrom < spec.at))
       }
     }
 
@@ -272,8 +272,8 @@ class DispatchPlugin(var dispatchAt : Int,
               for (id <- hazardRange) {
                 assert(id-offset >= 1)
                 val node = writeEu.ctrl(id-offset) //id - hazardFrom + 1
-                hazards += c.ctx.hm(enable) && node.up(rdKeys.ENABLE) && node.up(rdKeys.PHYS) === c.ctx.hm(rs.self.PHYS) && node.up(rdKeys.RFID) === c.ctx.hm(rs.self.RFID) && !node(getBypassed(writeEu, id))
-              }
+                hazards += c.ctx.hm(enable) && node.up(rdKeys.ENABLE) && node.up(rdKeys.PHYS) === c.ctx.hm(rs.self.PHYS) && node.up(rdKeys.RFID) === c.ctx.hm(rs.self.RFID) && !node(getBypassed(writeEu, id)); pairRdSpecs.get(writeEu).foreach { PAIR_RD => hazards += c.ctx.hm(enable) && node.up(rdKeys.ENABLE) && node.up(rdKeys.RFID) === c.ctx.hm(rs.self.RFID) && node(PAIR_RD) && c.ctx.hm(rs.self.PHYS)(0) && node.up(rdKeys.PHYS)(node.up(rdKeys.PHYS).getWidth-1 downto 1) === c.ctx.hm(rs.self.PHYS)(c.ctx.hm(rs.self.PHYS).getWidth-1 downto 1) }
+              }; pairRdSpecs.get(writeEu).foreach { PAIR_RD => for (id <- ((hazardRange.end + 1) max cFrom) to (writeEu.getUopLayerSpec().filter(e => e.rd.nonEmpty && rs.regFilesList.contains(e.rd.get.rf)).map(_.rd.get.rfReadableFrom).max - 1 min cTo)) { assert(id-offset >= 1); val node = writeEu.ctrl(id-offset); hazards += c.ctx.hm(enable) && node.up(rdKeys.ENABLE) && node.up(rdKeys.RFID) === c.ctx.hm(rs.self.RFID) && node(PAIR_RD) && c.ctx.hm(rs.self.PHYS)(0) && node.up(rdKeys.PHYS)(node.up(rdKeys.PHYS).getWidth-1 downto 1) === c.ctx.hm(rs.self.PHYS)(c.ctx.hm(rs.self.PHYS).getWidth-1 downto 1) } } // RVP: the odd pair half is never covered by the bypass network, so its hazard term spans the full RF round-trip even when allowBypassFrom truncates hazardRange above; the range is empty without bypass (rfReadableFrom == broadcastedFrom) and with an empty pairRdSpecs
             }
           }
           val hazard = c.ctx.hm(rs.self.ENABLE) && hazards.orR
@@ -465,6 +465,9 @@ class DispatchPlugin(var dispatchAt : Int,
 
     buildBefore.release()
   }
+
+  private lazy val pairRdSpecs = mutable.LinkedHashMap[ExecuteLaneService, Payload[Bool]]()
+  def addPairRd(el : ExecuteLaneService, key : Payload[Bool]) = pairRdSpecs(el) = key
 }
 
 /*

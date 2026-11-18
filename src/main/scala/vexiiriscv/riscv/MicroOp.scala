@@ -35,6 +35,7 @@ object RS1 extends RfRead with AreaObject
 object RS2 extends RfRead with AreaObject
 object RS3 extends RfRead with AreaObject
 object RD  extends RfWrite with AreaObject
+object RDS extends RfRead with AreaObject
 object PC_READ  extends Resource with AreaObject
 object INSTRUCTION_SIZE  extends Resource with AreaObject
 object LQ  extends Resource with AreaObject

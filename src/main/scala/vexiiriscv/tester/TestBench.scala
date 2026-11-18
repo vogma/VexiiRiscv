@@ -208,6 +208,7 @@ class TestOptions {
   var traceRvlsLog = false
   var traceSpikeLog = false
   var printStats = false
+  var retireHisto = Option.empty[String]
   var withProbe = true
   var withStdIn = true
   var simSpeedPrinter = Option.empty[Double]
@@ -269,6 +270,8 @@ class TestOptions {
       .text("Disable simulated standard input.")
     opt[Unit]("print-stats").action { (v, c) => printStats = true }
       .text("Print probe statistics when the simulation ends.")
+    opt[String]("retire-histo").action { (v, c) => retireHisto = Some(v) }
+      .text("Write a per-PC retire-count histogram of hart 0 to the given file at simulation end.")
     opt[Unit]("trace-all").action { (v, c) => traceRvlsLog = true; traceKonata = true; traceWave = true; traceSpikeLog = true; printStats = true }
       .text("Enable all available traces and print simulation statistics.")
     opt[Unit]("no-probe").action { (v, c) => withProbe = false; }
@@ -404,6 +407,38 @@ class TestOptions {
       }
 
       probe
+    }
+
+    // --retire-histo: count every retired PC of hart 0 and dump "pc<TAB>count"
+    // at sim end.  Instruction words are recovered from the ELF offline, so the
+    // hot path stays a single array increment -- no boxing, no allocation, which
+    // matters at the ~10^8 retires an application benchmark commits.  Window is
+    // the on-chip RAM image (0x80000000, 1 MiB); PCs outside it are tallied
+    // separately and are expected to be zero.
+    retireHisto.foreach { path =>
+      val base = 0x80000000l
+      val slots = (1 << 20) / 2
+      val counts = new Array[Long](slots)
+      var outside = 0l
+      probes.head.commitsCallbacks += { (hartId, pc) =>
+        if (hartId == 0) {
+          val idx = ((pc & 0xFFFFFFFFl) - base) >> 1
+          if (idx >= 0 && idx < slots) counts(idx.toInt) += 1 else outside += 1
+        }
+      }
+      onSimEnd {
+        val f = new PrintWriter(new File(path))
+        var total = 0l
+        f.println("pc\tcount")
+        for (i <- 0 until slots if counts(i) != 0) {
+          total += counts(i)
+          f.println(f"0x${base + 2 * i}%08x\t${counts(i)}")
+        }
+        f.println(s"# total_retired\t$total")
+        f.println(s"# outside_window\t$outside")
+        f.close()
+        println(s"retire-histo: $total retires, $outside outside window -> $path")
+      }
     }
 
     // Things to enable when we want to collect traces

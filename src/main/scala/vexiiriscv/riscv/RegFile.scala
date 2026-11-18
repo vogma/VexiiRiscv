@@ -24,6 +24,18 @@ object IntRegFile extends RegfileSpec with AreaObject {
     key = key,
     resources = List(RS1, RS2, RS3, RD).map(this -> _)
   )
+  def TypeR_RDS(key : MaskedLiteral) = SingleDecoding(
+    key = key,
+    resources = List(RS1, RS2, RDS, RD).map(this -> _)
+  )
+  def TypeR_RDS_RS3(key : MaskedLiteral) = SingleDecoding(
+    key = key,
+    resources = List(RS1, RS2, RDS, RS3, RD).map(this -> _)
+  )
+  def TypeI_RDS(key : MaskedLiteral) = SingleDecoding(
+    key = key,
+    resources = List(RS1, RDS, RD).map(this -> _)
+  )
   def TypeI(key : MaskedLiteral) = SingleDecoding(
     key = key,
     resources = List(RS1, RD).map(this -> _)
